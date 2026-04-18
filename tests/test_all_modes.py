@@ -22,15 +22,16 @@ from tqdm import tqdm
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
-from src.config import LABEL_LIST, PROMPT_TEMPLATE
 from src.data.csv_loader import CSVLabeledLoader
+
+from src.config import LABEL_LIST, PROMPT_TEMPLATE
+from src.llm_scorer import LLMScorer
 from src.models.fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
+from src.retrieval.retrieval import KnowledgeAugmentedRetriever
 from src.training.fusion_trainer import (  # Re-use helper
     _build_retrieval_features,
     _normalize_label_to_id,
 )
-from src.llm_scorer import LLMScorer
-from src.retrieval.retrieval import KnowledgeAugmentedRetriever
 from src.utils import normalize_text
 
 # Label mapping for metrics
@@ -110,7 +111,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Test LoRA and Fusion models in all modes"
     )
-    parser.add_argument("--csv", type=str, required=True, help="Path to test CSV")
+    parser.add_argument(
+        "--csv", type=str, required=True, help="Path to test CSV or JSON/JSONL"
+    )
     parser.add_argument(
         "--lora_model", type=str, required=True, help="Path to LoRA adapter"
     )
@@ -143,34 +146,80 @@ def main():
 
     # 1. Load Data
     logger.info(f"Loading data from {args.csv}...")
-    df = CSVLabeledLoader(args.csv).load()
-    if args.limit:
-        df = df.head(args.limit)
-        logger.info(f"Limited to {args.limit} samples")
-
-    texts = df["text"].tolist()
-    gold_evidences = df["evidence"].tolist()
-    labels = [_normalize_label_to_id(v) for v in df["label"].tolist()]
-
-    # Build Knowledge Base for Retrieval
-    # Deduplicate documents from evidence column using normalization (match train_fusion.py)
-
+    gold_evidences = []
     unique_docs = {}
-    for evidence in gold_evidences:
-        if pd.isna(evidence):
-            continue
-        parts = str(evidence).split("|||")
-        for part in parts:
-            part = part.strip()
-            if len(part) > 10:
-                # Normalize for deduplication key, but store original text
-                norm_key = normalize_text(part)
 
-                if norm_key not in unique_docs:
-                    unique_docs[norm_key] = {
-                        "text": part,
-                        "timestamp": None,
-                    }
+    if args.csv.endswith(".json") or args.csv.endswith(".jsonl"):
+        import json
+
+        with open(args.csv, "r", encoding="utf-8") as f:
+            if args.csv.endswith(".jsonl"):
+                data = [json.loads(line) for line in f if line.strip()]
+            else:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    data = [data]
+
+        if args.limit:
+            data = data[: args.limit]
+            logger.info(f"Limited to {args.limit} samples")
+
+        texts = [d["claim"] for d in data]
+        labels = [_normalize_label_to_id(d["label"]) for d in data]
+
+        # Build Knowledge Base for Retrieval
+        for d in data:
+            evs = d.get("evidence", [])
+            parts = []
+            for ev in evs:
+                if isinstance(ev, dict) and "content" in ev:
+                    content = ev["content"]
+                    timestamp = ev.get("timestamp", None)
+                    parts.append(content)
+
+                    if content.strip() and len(content.strip()) > 10:
+                        norm_key = normalize_text(content.strip())
+                        if norm_key not in unique_docs:
+                            unique_docs[norm_key] = {
+                                "text": content.strip(),
+                                "timestamp": timestamp,
+                            }
+                elif isinstance(ev, str):
+                    parts.append(ev)
+                    if ev.strip() and len(ev.strip()) > 10:
+                        norm_key = normalize_text(ev.strip())
+                        if norm_key not in unique_docs:
+                            unique_docs[norm_key] = {
+                                "text": ev.strip(),
+                                "timestamp": None,
+                            }
+            gold_evidences.append("|||".join(parts))
+
+    else:
+        df = CSVLabeledLoader(args.csv).load()
+        if args.limit:
+            df = df.head(args.limit)
+            logger.info(f"Limited to {args.limit} samples")
+
+        texts = df["text"].tolist()
+        raw_evidences = df["evidence"].tolist()
+        labels = [_normalize_label_to_id(v) for v in df["label"].tolist()]
+
+        # Build Knowledge Base for Retrieval
+        for evidence in raw_evidences:
+            gold_evidences.append(evidence)
+            if pd.isna(evidence):
+                continue
+            parts = str(evidence).split("|||")
+            for part in parts:
+                part = part.strip()
+                if len(part) > 10:
+                    norm_key = normalize_text(part)
+                    if norm_key not in unique_docs:
+                        unique_docs[norm_key] = {
+                            "text": part,
+                            "timestamp": None,
+                        }
 
     kb_docs = list(unique_docs.values())
     logger.info(

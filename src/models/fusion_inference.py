@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import perf_counter
@@ -520,11 +522,137 @@ class FusionClaimVerifier:
             rrf_k=rrf_k,
         )
 
+    # ------------------------------------------------------------------
+    # Claims index
+    # ------------------------------------------------------------------
+    @property
+    def _claims_kb(self) -> "OpenSearchKB":
+        """Lazy OpenSearchKB pointing to the 'claims' index."""
+        if not hasattr(self, "_claims_kb_instance"):
+            claims_index = os.getenv("OPENSEARCH_CLAIMS_INDEX", "claims")
+            self._claims_kb_instance = OpenSearchKB(
+                index_name=claims_index,
+                embedding_dim=self.retriever.embedding_dim,
+            )
+        return self._claims_kb_instance
+
+    def _log_claims_to_opensearch(self, claims_data: List[Dict]) -> None:
+        """
+        Lưu danh sách claims vào OpenSearch index 'claims' (upsert).
+
+        Mỗi doc cần có _id; ở đây dùng SHA-1 của claim text để claim
+        giống nhau sẽ upsert thay vì duplicate.
+
+        claims_data: list of dict với ít nhất key 'claim' và các meta
+                     tuỳ ý (verdict, confidence, checked_at, …).
+        """
+        if not claims_data:
+            return
+
+        def _make_id(text: str) -> str:
+            return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+
+        docs = []
+        for item in claims_data:
+            doc = dict(item)
+            if "_id" not in doc and "id" not in doc:
+                doc["_id"] = _make_id(str(doc.get("claim", "")))
+            docs.append(doc)
+
+        try:
+            result = self._claims_kb.insert_many(docs, upsert=True)
+            if self.debug:
+                logger.info(
+                    f"[fusion_inference] claims_logged | inserted={result.get('inserted')} | errors={result.get('errors')}"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"[fusion_inference] Failed to log claims to OpenSearch: {exc}"
+            )
+
+    # ------------------------------------------------------------------
+    # Claim splitting
+    # ------------------------------------------------------------------
+    def split_long_claim(self, claim: str) -> List[str]:
+        """
+        Tách claim dài thành các claim nhỏ.
+        (Để trống logic để user tự điền)
+        """
+        # TODO: Implement rule to split long claim into smaller claims.
+        return [claim]
+
     def predict(self, claim: str) -> ClaimPrediction:
         t0 = perf_counter()
         text = str(claim).strip()
         if not text:
             raise ValueError("Claim is empty.")
+
+        sub_claims = self.split_long_claim(text)
+        if len(sub_claims) > 1:
+            if self.debug:
+                logger.info(
+                    f"[fusion_inference] splitting claim into {len(sub_claims)} sub-claims"
+                )
+
+            sub_preds = self.predict_batch(sub_claims)
+
+            has_sai = False
+            has_chua_chac_chan = False
+            all_evidence = []
+            all_source_links = []
+
+            avg_conf = (
+                sum(p.confidence for p in sub_preds) / len(sub_preds)
+                if sub_preds
+                else 0.0
+            )
+
+            for p in sub_preds:
+                if p.verdict == "Sai":
+                    has_sai = True
+                elif p.verdict == "Chưa chắc chắn":
+                    has_chua_chac_chan = True
+
+                all_evidence.extend(p.evidence)
+                for link in p.source_links:
+                    if link not in all_source_links:
+                        all_source_links.append(link)
+
+            if has_sai:
+                final_verdict = "Sai"
+                final_label = "Sai"
+                final_label_id = (
+                    self.label_list.index("Sai") if "Sai" in self.label_list else 1
+                )
+            elif has_chua_chac_chan:
+                final_verdict = "Chưa chắc chắn"
+                final_label = "Chưa chắc chắn"
+                final_label_id = (
+                    self.label_list.index("Chưa chắc chắn")
+                    if "Chưa chắc chắn" in self.label_list
+                    else 2
+                )
+            else:
+                final_verdict = "Đúng"
+                final_label = "Đúng"
+                final_label_id = (
+                    self.label_list.index("Đúng") if "Đúng" in self.label_list else 0
+                )
+
+            if self.debug:
+                logger.info(
+                    f"[fusion_inference] done predict (aggregated) | verdict={final_verdict!r} | confidence={avg_conf:.6f} | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
+                )
+
+            return ClaimPrediction(
+                claim=text,
+                verdict=final_verdict,
+                label=final_label,
+                label_id=final_label_id,
+                confidence=avg_conf,
+                evidence=all_evidence[: self.llm_evidence_top_k * len(sub_claims)],
+                source_links=all_source_links,
+            )
 
         now_utc = datetime.now(timezone.utc)
         if self.debug:
@@ -702,7 +830,7 @@ class FusionClaimVerifier:
             if url and url not in source_links:
                 source_links.append(url)
 
-        return ClaimPrediction(
+        prediction = ClaimPrediction(
             claim=text,
             verdict=verdict,
             label=pred_label,
@@ -711,6 +839,23 @@ class FusionClaimVerifier:
             evidence=llm_evidence,
             source_links=source_links,
         )
+
+        # Log claim to OpenSearch 'claims' index (fire-and-forget)
+        threading.Thread(
+            target=self._log_claims_to_opensearch,
+            args=(
+                [
+                    {
+                        "claim": text,
+                        "verdict": verdict,
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ],
+            ),
+            daemon=True,
+        ).start()
+
+        return prediction
 
     def predict_batch(self, claims: List[str]) -> List[ClaimPrediction]:
         t0 = perf_counter()
@@ -816,7 +961,25 @@ class FusionClaimVerifier:
                 f"[fusion_inference] batch done | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
             )
 
-        return [r for r in results if r is not None]
+        final_results = [r for r in results if r is not None]
+
+        # Log all claims to OpenSearch 'claims' index (fire-and-forget)
+        threading.Thread(
+            target=self._log_claims_to_opensearch,
+            args=(
+                [
+                    {
+                        "claim": p.claim,
+                        "verdict": p.verdict,
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    for p in final_results
+                ],
+            ),
+            daemon=True,
+        ).start()
+
+        return final_results
 
 
 _VERIFIER_CACHE: Dict[str, FusionClaimVerifier] = {}

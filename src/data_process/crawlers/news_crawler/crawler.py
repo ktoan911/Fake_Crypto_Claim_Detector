@@ -58,6 +58,11 @@ URLS_TO_CRAWL = [
     "https://www.shb.com.vn/category/tin-tuc/",  # Đã cập nhật
     "https://www.seabank.com.vn/tin-tuc",  # Đã cập nhật
     # --- Báo chí ---
+    "https://cafef.vn/xa-hoi.chn",
+    "https://cafef.vn/doanh-nghiep.chn",
+    "https://cafef.vn/vi-mo-dau-tu.chn",
+    "https://cafef.vn/thi-truong.chn",
+    "https://cafef.vn/smart-money.chn",
     "https://cafef.vn/tai-chinh-ngan-hang.chn",
     "https://vneconomy.vn/tai-chinh.htm",
     "https://vietnambiz.vn/tai-chinh/ngan-hang.htm",
@@ -74,6 +79,9 @@ URLS_TO_CRAWL = [
     "https://znews.vn/tai-chinh.html",
     "https://vtv.vn/tai-chinh-ngan-hang.html",  # Đã cập nhật
     "https://vov.vn/kinh-te/tai-chinh/",
+    "https://www.vietcombank.com.vn/vi-VN/Trang-thong-tin-dien-tu/Tin-tuc-va-su-kien#ArticleSubCategories=T%C3%A0i%20ch%C3%ADnh%20ng%C3%A2n%20h%C3%A0ng",
+    "https://www.vietcombank.com.vn/vi-VN/Trang-thong-tin-dien-tu/Tin-tuc-va-su-kien#ArticleSubCategories=Tin%20Vietcombank",
+
     # --- Cảnh báo ---
     "https://tinnhiemmang.vn/tin-tuc",
     "https://vnexpress.net/chu-de/lua-dao-4730",
@@ -82,6 +90,7 @@ URLS_TO_CRAWL = [
 
 
     #chứng khoản
+    "https://cafef.vn/thi-truong-chung-khoan.chn",
     "https://fiingroup.vn/vi/tin-tuc.html",
     "https://ssc.gov.vn/webcenter/portal/ubck/pages_r/m/tintc-skin/dnhngmcututhumuasmcng",
     "https://ssc.gov.vn/webcenter/portal/ubck/pages_r/m/tintc-skin/hotngphthnh",
