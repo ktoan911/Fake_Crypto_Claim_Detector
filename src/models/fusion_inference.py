@@ -529,7 +529,7 @@ class FusionClaimVerifier:
     def _claims_kb(self) -> "OpenSearchKB":
         """Lazy OpenSearchKB pointing to the 'claims' index."""
         if not hasattr(self, "_claims_kb_instance"):
-            claims_index = os.getenv("OPENSEARCH_CLAIMS_INDEX", "claims")
+            claims_index = os.getenv("OP_CLAIMS_INDEX", "claims")
             self._claims_kb_instance = OpenSearchKB(
                 index_name=claims_index,
                 embedding_dim=self.retriever.embedding_dim,

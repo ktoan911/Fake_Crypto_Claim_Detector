@@ -1,7 +1,7 @@
 import os
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -107,132 +107,60 @@ def verify_claim(request: ClaimRequest, http_request: Request):
 # ── Claims dashboard ────────────────────────────────────────────────────────
 
 
-def _get_claims_kb() -> OpenSearchKB:
-    """Return an OpenSearchKB pointed at the 'claims' index."""
+def _get_stats_kb() -> OpenSearchKB:
+    """Return an OpenSearchKB pointed at the 'stats' index."""
     return OpenSearchKB(
-        index_name=os.getenv("OPENSEARCH_CLAIMS_INDEX", "claims"),
+        index_name=os.getenv("OP_STATS_INDEX", "stats"),
         embedding_dim=1,  # không dùng vector search ở đây
     )
 
 
 @app.get("/claims/stats")
-def claims_stats():
+def claims_stats(date: str = None):
     """
-    Trả về dashboard thống kê cho index 'claims':
-      - recent_claims   : 10 claims gần nhất (sort by checked_at desc)
-      - stats_24h       : đếm + % theo verdict trong 24h qua
-      - daily_total     : tổng claims mỗi ngày trong 7 ngày qua
-      - daily_false     : claims 'Sai' mỗi ngày trong 7 ngày qua
-
-    Giả định: checked_at lưu dưới dạng ISO-8601 UTC string.
+    Đọc dữ liệu dashboard thống kê từ index 'stats'.
+    - Input: `date` định dạng YYYY-MM-DD. Nếu không cung cấp, mặc định là ngày hôm nay theo giờ UTC.
     """
     try:
-        kb = _get_claims_kb()
-        client = kb.client
-        index = kb.index
+        stats_kb = _get_stats_kb()
+        client = stats_kb.client
+        index = stats_kb.index
 
-        now_utc = datetime.now(timezone.utc)
-        cutoff_24h = (now_utc - timedelta(hours=24)).isoformat()
-        # 7 ngày bao gồm hôm nay và 6 ngày trước
-        cutoff_7d = (now_utc - timedelta(days=6)).isoformat()
+        if date is None:
+            # mặc định lấy theo ngày hiện tại UTC
+            target_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        else:
+            target_date = date
 
-        # epoch ms — format-agnostic, safe for all OpenSearch date params
-        def _ms(dt: datetime) -> int:
-            return int(dt.timestamp() * 1000)
+        if not client.indices.exists(index=index):
+            return {
+                "status": "error",
+                "error": f"Index '{index}' not found. Please run calculate_claims_stats.py first.",
+            }
 
-        now_ms = _ms(now_utc)
-        cutoff_7d_ms = _ms(now_utc - timedelta(days=6))
-
-        # ── 1. 10 claims gần nhất ───────────────────────────────────────────
-        recent_resp = client.search(
-            index=index,
-            body={
-                "size": 10,
-                "sort": [{"checked_at": {"order": "desc"}}],
-                "_source": ["claim", "verdict", "checked_at"],
-            },
-        )
-        recent_claims = [
-            h["_source"] for h in recent_resp.get("hits", {}).get("hits", [])
-        ]
-
-        # ── 2 & 3. Thống kê 24h qua — dùng terms aggregation ───────────────
-        stats_resp = client.search(
-            index=index,
-            body={
-                "size": 0,
-                "query": {"range": {"checked_at": {"gte": cutoff_24h}}},
-                "aggs": {
-                    # đếm theo verdict
-                    "by_verdict": {
-                        "terms": {
-                            "field": "verdict.keyword",
-                            "size": 10,
-                        }
-                    }
+        try:
+            resp = client.get(index=index, id=target_date)
+            return resp.get("_source", {})
+        except Exception:
+            # Nếu không tìm thấy bằng id (404), có thể do ngày chưa được tính thì ưu tiên lấy cái lớn nhất hiện có
+            logger.warning(
+                f"Stats for date {target_date} not found. Looking for the most recent stats..."
+            )
+            search_resp = client.search(
+                index=index,
+                body={
+                    "size": 1,
+                    "sort": [{"date": {"order": "desc"}}],
                 },
-            },
-        )
-        verdict_buckets = (
-            stats_resp.get("aggregations", {}).get("by_verdict", {}).get("buckets", [])
-        )
-        counts = {b["key"]: b["doc_count"] for b in verdict_buckets}
-        total_24h = sum(counts.values()) or 1  # tránh chia 0
-
-        dung = counts.get("Đúng", 0)
-        sai = counts.get("Sai", 0)
-        ccc = counts.get("Chưa chắc chắn", 0)
-
-        stats_24h = {
-            "đúng": dung,
-            "sai": sai,
-            "chưa chắc chắn": ccc,
-            "percent_đúng": round(dung / total_24h * 100, 2),
-            "percent_sai": round(sai / total_24h * 100, 2),
-        }
-
-        daily_histogram = {
-            "field": "checked_at",
-            "calendar_interval": "day",
-            "format": "yyyy-MM-dd",
-            "time_zone": "UTC",
-            "min_doc_count": 0,
-            "extended_bounds": {"min": cutoff_7d_ms, "max": now_ms},
-        }
-
-        daily_resp = client.search(
-            index=index,
-            body={
-                "size": 0,
-                "query": {"range": {"checked_at": {"gte": cutoff_7d}}},
-                "aggs": {
-                    "daily_total": {"date_histogram": daily_histogram},
-                    "daily_false": {
-                        "filter": {"term": {"verdict.keyword": "Sai"}},
-                        "aggs": {"by_day": {"date_histogram": daily_histogram}},
-                    },
-                },
-            },
-        )
-
-        aggs = daily_resp.get("aggregations", {})
-
-        daily_total: dict = {
-            b["key_as_string"]: b["doc_count"]
-            for b in aggs.get("daily_total", {}).get("buckets", [])
-        }
-
-        daily_false: dict = {
-            b["key_as_string"]: b["doc_count"]
-            for b in aggs.get("daily_false", {}).get("by_day", {}).get("buckets", [])
-        }
-
-        return {
-            "recent_claims": recent_claims,
-            "stats_24h": stats_24h,
-            "daily_total": daily_total,
-            "daily_false": daily_false,
-        }
+            )
+            hits = search_resp.get("hits", {}).get("hits", [])
+            if hits:
+                return hits[0]["_source"]
+            else:
+                return {
+                    "status": "error",
+                    "error": f"No stats data available in index '{index}'.",
+                }
 
     except Exception as e:
         import traceback

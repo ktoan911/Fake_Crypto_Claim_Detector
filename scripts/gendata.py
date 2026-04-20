@@ -1,10 +1,13 @@
 import json
-import time
-import random
 import os
-from tqdm import tqdm
-from openai import OpenAI
+import random
+import time
 
+from dotenv import load_dotenv
+from openai import OpenAI
+from tqdm import tqdm
+
+load_dotenv()
 # ======================
 # CONFIG
 # ======================
@@ -12,14 +15,13 @@ N_SAMPLES = 120
 BASE_SLEEP = 2
 MAX_RETRIES = 6
 TIMEOUT_PER_CALL = 30
-
 LABELS = ["đúng", "sai", "thiếu thông tin"]
 
 # map label -> filename
 LABEL_FILE_MAP = {
     "đúng": "dataset_dung.json",
     "sai": "dataset_sai.json",
-    "thiếu thông tin": "dataset_thieu_thong_tin.json"
+    "thiếu thông tin": "dataset_thieu_thong_tin.json",
 }
 
 FINAL_OUTPUT = "dataset_all.json"
@@ -62,7 +64,12 @@ Quy tắc theo label:
 # ======================
 # Client
 # ======================
-client = None
+client = OpenAI(
+    api_key=os.getenv("OPENAI_KEY"),
+    base_url="https://senator-gigolo-stark.ngrok-free.dev/v1",
+)
+
+
 # Utils
 # ======================
 def load_existing(file):
@@ -71,9 +78,11 @@ def load_existing(file):
             return json.load(f)
     return []
 
+
 def save_json(file, data):
     with open(file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 # ======================
 # Generate
@@ -97,12 +106,13 @@ def generate_sample(target_label):
             return content
 
         except Exception as e:
-            wait = (2 ** attempt) + random.uniform(1, 3)
-            print(f"⚠️ API lỗi ({attempt+1}/{MAX_RETRIES}): {e}")
+            wait = (2**attempt) + random.uniform(1, 3)
+            print(f"⚠️ API lỗi ({attempt + 1}/{MAX_RETRIES}): {e}")
             print(f"⏳ Sleep {wait:.2f}s...")
             time.sleep(wait)
 
     return None
+
 
 # ======================
 # Parse
@@ -134,6 +144,7 @@ def parse_sample(text):
         print("❌ Parse fail:", e)
         return None
 
+
 # ======================
 # Build dataset
 # ======================
@@ -161,7 +172,6 @@ def build_dataset(n_samples=N_SAMPLES):
 
         with tqdm(total=per_label, initial=count) as pbar:
             while count < per_label:
-
                 raw = generate_sample(label)
 
                 if raw is None:

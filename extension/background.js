@@ -51,3 +51,8 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         args: [text]
     });
 });
+
+chrome.action.onClicked.addListener((tab) => {
+    // Đổi link này thành tên miền bạn muốn nhảy tới
+    chrome.tabs.create({ url: "https://www.google.com/" });
+});

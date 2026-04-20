@@ -3,6 +3,20 @@
   "name": "Fake Crypto Claim Detector",
   "version": "1.0",
   "description": "Bôi đen nội dung (claim) để kiểm tra xem đúng hay sai.",
+  "icons": {
+    "16": "icon_extension.png",
+    "32": "icon_extension.png",
+    "48": "icon_extension.png",
+    "128": "icon_extension.png"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icon_extension.png",
+      "32": "icon_extension.png",
+      "48": "icon_extension.png",
+      "128": "icon_extension.png"
+    }
+  },
   "permissions": [
     "contextMenus",
     "scripting"
