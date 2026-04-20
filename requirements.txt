@@ -4,10 +4,9 @@ pydantic
 numpy
 scipy
 pandas
-scikit-learn
 sentence-transformers
 rank-bm25
-torch
+torch==2.1.0+cpu
 transformers
 peft
 opensearch-py
