@@ -7,7 +7,7 @@ pandas
 sentence-transformers
 rank-bm25
 --find-links https://download.pytorch.org/whl/torch_stable.html
-torch==2.2.2+cpu
+torch==2.4.1+cpu
 transformers
 peft
 opensearch-py
