@@ -1,13 +1,13 @@
 fastapi
 uvicorn
 pydantic
-numpy
+numpy<2
 scipy
 pandas
 sentence-transformers
 rank-bm25
 --find-links https://download.pytorch.org/whl/torch_stable.html
-torch==2.1.0+cpu
+torch==2.2.2+cpu
 transformers
 peft
 opensearch-py
