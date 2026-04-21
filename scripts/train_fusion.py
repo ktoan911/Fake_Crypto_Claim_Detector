@@ -8,9 +8,12 @@ import argparse
 import os
 
 from loguru import logger
-
 from src.data.csv_loader import CSVLabeledLoader
-from src.training.fusion_trainer import FusionTrainingConfig, train_fusion_from_dataframe
+
+from src.training.fusion_trainer import (
+    FusionTrainingConfig,
+    train_fusion_from_dataframe,
+)
 from src.utils import normalize_text
 
 
@@ -64,43 +67,103 @@ def main():
     args = parser.parse_args()
 
     logger.info(f"Loading labeled data from {args.labeled_csv}...")
-    labeled_df = CSVLabeledLoader(args.labeled_csv).load()
-    logger.info(f"Labeled data: {len(labeled_df)} samples")
+    file_ext = os.path.splitext(args.labeled_csv)[1].lower()
 
-    # Extract evidence and timestamps from dataframe
-    evidences = labeled_df["evidence"].tolist()
-    timestamps = (
-        labeled_df["timestamp"].tolist()
-        if "timestamp" in labeled_df.columns
-        else [None] * len(evidences)
-    )
-
-    # Use dict to deduplicate by normalized text, keeping original text
     unique_docs = {}
+    import pandas as pd
 
-    for evidence, ts in zip(evidences, timestamps):
-        # Split evidence into individual articles
-        # Evidence articles are separated by |||
-        evidence_str = str(evidence)
-        articles = evidence_str.split("|||")
+    if file_ext in [".json", ".jsonl"]:
+        import json
+        from datetime import datetime, timezone
 
-        for article in articles:
-            article = article.strip()
-            if len(article) > 10:  # Filter out empty or very short strings
-                # Normalize for deduplication key, but store original text
-                norm_key = normalize_text(article)
+        with open(args.labeled_csv, "r", encoding="utf-8") as f:
+            if file_ext == ".jsonl":
+                data = [json.loads(line) for line in f if line.strip()]
+            else:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    data = [data]
 
-                if norm_key not in unique_docs:
-                    unique_docs[norm_key] = {
-                        "text": article,  # Keep original text
-                        "timestamp": ts,
-                        "source": "csv",
-                    }
-                else:
-                    # If duplicate, keep the document with non-None timestamp
-                    if ts is not None and unique_docs[norm_key]["timestamp"] is None:
-                        unique_docs[norm_key]["timestamp"] = ts
+        df_rows = []
+        for d in data:
+            claim = d.get("claim", "")
+            label = d.get("label", "")
+            evs = d.get("evidence", [])
+            parts = []
 
+            for ev in evs:
+                if isinstance(ev, dict) and "content" in ev:
+                    content = ev["content"]
+                    raw_ts = ev.get("timestamp", None)
+                    timestamp = None
+                    if raw_ts:
+                        try:
+                            timestamp = datetime.fromisoformat(
+                                str(raw_ts).replace("Z", "+00:00")
+                            )
+                            if timestamp.tzinfo is None:
+                                timestamp = timestamp.replace(tzinfo=timezone.utc)
+                        except Exception:
+                            timestamp = datetime.now(timezone.utc)
+
+                    parts.append(content)
+
+                    if content.strip() and len(content.strip()) > 10:
+                        norm_key = normalize_text(content.strip())
+                        if norm_key not in unique_docs:
+                            unique_docs[norm_key] = {
+                                "text": content.strip(),
+                                "timestamp": timestamp,
+                                "source": "json",
+                            }
+                elif isinstance(ev, str):
+                    parts.append(ev)
+                    if ev.strip() and len(ev.strip()) > 10:
+                        norm_key = normalize_text(ev.strip())
+                        if norm_key not in unique_docs:
+                            unique_docs[norm_key] = {
+                                "text": ev.strip(),
+                                "timestamp": None,
+                                "source": "json",
+                            }
+
+            evidence_str = "|||".join(parts)
+            df_rows.append({"text": claim, "label": label, "evidence": evidence_str})
+
+        labeled_df = pd.DataFrame(df_rows)
+    else:
+        labeled_df = CSVLabeledLoader(args.labeled_csv).load()
+
+        evidences = labeled_df["evidence"].tolist()
+        timestamps = (
+            labeled_df["timestamp"].tolist()
+            if "timestamp" in labeled_df.columns
+            else [None] * len(evidences)
+        )
+
+        for evidence, ts in zip(evidences, timestamps):
+            evidence_str = str(evidence)
+            articles = evidence_str.split("|||")
+
+            for article in articles:
+                article = article.strip()
+                if len(article) > 10:
+                    norm_key = normalize_text(article)
+
+                    if norm_key not in unique_docs:
+                        unique_docs[norm_key] = {
+                            "text": article,
+                            "timestamp": ts,
+                            "source": "csv",
+                        }
+                    else:
+                        if (
+                            ts is not None
+                            and unique_docs[norm_key]["timestamp"] is None
+                        ):
+                            unique_docs[norm_key]["timestamp"] = ts
+
+    logger.info(f"Labeled data: {len(labeled_df)} samples")
     kb_docs = list(unique_docs.values())
     logger.info(
         f"Knowledge base built: {len(kb_docs)} unique documents (deduplicated from {len(evidences)} evidence entries)"

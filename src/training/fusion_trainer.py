@@ -13,8 +13,8 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from src.config import LABEL_LIST, LABEL_TO_ID, PROMPT_TEMPLATE
-from src.models.fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
 from src.llm_scorer import LLMScorer
+from src.models.fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
 from src.retrieval.retrieval import KnowledgeAugmentedRetriever
 
 
@@ -225,7 +225,9 @@ def train_fusion_from_dataframe(
                 retriever, t, config.top_k
             )
             batch_feats.append(feats)
-            batch_retrieved_evidences.append(retrieved_evidence)
+            batch_retrieved_evidences.append(
+                retrieved_evidence[:3]
+            )  # Cắt xuống đúng 3 top evidence để huấn luyện không bị nhiễu LM
 
         all_retrieval_features.extend(batch_feats)
 
