@@ -315,7 +315,7 @@ def parse_args():
     parser.add_argument(
         "--evidence_mode",
         type=str,
-        default="retrieved",
+        default="gold",
         choices=["retrieved", "gold"],
         help="Evidence mode used during LLM scoring.",
     )

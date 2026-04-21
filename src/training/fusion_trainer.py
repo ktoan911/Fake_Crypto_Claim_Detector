@@ -41,7 +41,7 @@ class FusionTrainingConfig:
     lambda_reg: float = 0.01  # Only used in fusion layer, not doubled
     max_length: int = 2048
     evidence_mode: str = (
-        "retrieved"  # "gold" or "retrieved" - per paper, should be "retrieved"
+        "gold"  # "gold" or "retrieved"
     )
     label_list: List[str] = field(default_factory=lambda: LABEL_LIST)
     retriever_model: str = "bge-vi-base"
