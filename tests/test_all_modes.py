@@ -90,6 +90,7 @@ def load_fusion_model(model_path, device, num_classes=None):
             )
 
     checkpoint = torch.load(model_path, map_location=device)
+    fusion_state = checkpoint["fusion"]
 
     # Load config from checkpoint if available, else standard
     saved_config = checkpoint.get("config", {})
@@ -103,16 +104,30 @@ def load_fusion_model(model_path, device, num_classes=None):
         output_dim=64,
     ).to(device)
 
+    has_adaptive_state = any(k.startswith("beta_gate.") for k in fusion_state.keys())
+    saved_adaptive = bool(saved_config.get("adaptive_beta", has_adaptive_state))
+    if saved_adaptive != has_adaptive_state:
+        logger.warning(
+            "adaptive_beta in config and fusion state_dict are inconsistent. "
+            f"config={saved_adaptive}, state_has_beta_gate={has_adaptive_state}. "
+            "Using state_dict architecture for safe loading."
+        )
+    effective_adaptive_beta = has_adaptive_state
+
     fusion = ConfidenceAwareFusion(
         retrieval_input_dim=64,
         hidden_dim=128,
         num_classes=num_classes,
         initial_beta=saved_config.get("initial_beta", 0.5),
+        lambda_reg=float(saved_config.get("lambda_reg", 0.01)),
+        normalize_branch_logits=bool(
+            saved_config.get("normalize_branch_logits", False)
+        ),
+        adaptive_beta=effective_adaptive_beta,
     ).to(device)
 
     retrieval_encoder.load_state_dict(checkpoint["retrieval_encoder"])
-    fusion.load_state_dict(checkpoint["fusion"])
-    fusion.beta.data = torch.tensor(checkpoint["beta"]).to(device)
+    fusion.load_state_dict(fusion_state)
 
     retrieval_encoder.eval()
     fusion.eval()

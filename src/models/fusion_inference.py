@@ -431,6 +431,20 @@ class FusionClaimVerifier:
             fusion_model_path, map_location=torch.device("cpu")
         )
         self.saved_config = self.checkpoint.get("config", {})
+        fusion_state = self.checkpoint.get("fusion", {})
+        has_adaptive_state = any(
+            str(k).startswith("beta_gate.") for k in fusion_state.keys()
+        )
+        saved_adaptive = bool(
+            self.saved_config.get("adaptive_beta", has_adaptive_state)
+        )
+        if saved_adaptive != has_adaptive_state:
+            logger.warning(
+                "[fusion_inference] adaptive_beta mismatch between saved_config "
+                f"({saved_adaptive}) and checkpoint fusion state ({has_adaptive_state}). "
+                "Using fusion state architecture for safe loading."
+            )
+        effective_adaptive_beta = has_adaptive_state
 
         self.top_k = int(self.saved_config.get("top_k", 10))
         if llm_evidence_top_k is None:
@@ -477,7 +491,7 @@ class FusionClaimVerifier:
             normalize_branch_logits=bool(
                 self.saved_config.get("normalize_branch_logits", False)
             ),
-            adaptive_beta=bool(self.saved_config.get("adaptive_beta", False)),
+            adaptive_beta=effective_adaptive_beta,
         ).to(self.device)
 
         self.retrieval_encoder.load_state_dict(self.checkpoint["retrieval_encoder"])
