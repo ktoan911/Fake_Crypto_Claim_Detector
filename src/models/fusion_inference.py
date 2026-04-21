@@ -17,7 +17,7 @@ from src.database.opensearch import OpenSearchKB
 from src.retrieval.retrieval import QueryExpander, RetrievalResult, TemporalScorer
 
 
-def _resolve_fusion_model_path(path_or_repo: str, filename: str = "model.pt") -> str:
+def _resolve_fusion_model_path(path_or_repo: str, filename: str = "fusion_model.pt") -> str:
     if os.path.isfile(path_or_repo):
         return path_or_repo
     try:
@@ -1027,7 +1027,7 @@ def verify_claim_true_false(
 
     # Resolve fusion model: env FUSION_MODEL overrides default local path
     resolved_fusion_path = _resolve_fusion_model_path(
-        os.getenv("FUSION_MODEL", "models/fusion_model.pt")
+        os.getenv("FUSION_MODEL")
     )
     # Resolve LLM: env LLM_FINETUNE overrides saved config
     resolved_llm_path = llm_model_path or os.getenv("LLM_FINETUNE")
@@ -1096,7 +1096,7 @@ def verify_claims_true_false(
 
     # Resolve fusion model: env FUSION_MODEL overrides default local path
     resolved_fusion_path = _resolve_fusion_model_path(
-        fusion_model_path or os.getenv("FUSION_MODEL", "models/fusion_model.pt")
+        fusion_model_path or os.getenv("FUSION_MODEL")
     )
     # Resolve LLM: env LLM_FINETUNE overrides saved config
     resolved_llm_path = llm_model_path or os.getenv("LLM_FINETUNE")

@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
     logger.info("[startup] Pre-warming FusionClaimVerifier …")
     try:
         fusion_path = _resolve_fusion_model_path(
-            os.getenv("FUSION_MODEL", "models/fusion_model.pt")
+            os.getenv("FUSION_MODEL")
         )
         _verifier = FusionClaimVerifier(
             fusion_model_path=fusion_path,

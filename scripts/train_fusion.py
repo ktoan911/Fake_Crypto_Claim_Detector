@@ -59,7 +59,7 @@ def main():
     parser.add_argument(
         "--save_path",
         type=str,
-        default=os.getenv("FUSION_OUTPUT_PATH", "models/fusion_model.pt"),
+        default=os.getenv("FUSION_OUTPUT_PATH"),
         help="Path to save the fusion model",
     )
     parser.add_argument(
