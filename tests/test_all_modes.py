@@ -362,7 +362,9 @@ def main():
         for j in range(0, len(batch_texts), args.llm_batch_size):
             sub_texts = batch_texts[j : j + args.llm_batch_size]
             sub_evs = batch_retrieved_evidences[j : j + args.llm_batch_size]
-            sub_logits_ret.append(llm.score_logits(sub_texts, sub_evs))
+            # Truncate each retrieved evidence list to top 3 to reduce context noise (matches fusion_inference.py)
+            sub_evs_truncated = [ev[:3] for ev in sub_evs]
+            sub_logits_ret.append(llm.score_logits(sub_texts, sub_evs_truncated))
 
         if sub_logits_ret:
             logits_retrieval.append(torch.cat(sub_logits_ret, dim=0))
