@@ -148,8 +148,15 @@ def train_fusion_from_dataframe(
         config.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     logger.info(f"Training fusion on device: {config.device}")
+    logger.info(f"fusion_trainer source: {__file__}")
     logger.info(f"Evidence mode: {config.evidence_mode}")
     logger.info(f"Retriever model: {config.retriever_model}")
+    logger.info(
+        "Trainer flags: "
+        f"normalize_branch_logits={config.normalize_branch_logits}, "
+        f"save_best_checkpoint={config.save_best_checkpoint}, "
+        f"beta_lr_multiplier={config.beta_lr_multiplier}"
+    )
 
     if labeled_df is None or labeled_df.empty:
         raise ValueError("Labeled DataFrame is empty.")
