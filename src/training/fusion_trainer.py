@@ -54,6 +54,9 @@ class FusionTrainingConfig:
     normalize_branch_logits: bool = (
         True  # Standardize LLM/retrieval logits before weighted fusion.
     )
+    adaptive_beta: bool = (
+        True  # Learn per-sample beta offsets from branch confidence patterns.
+    )
     save_best_checkpoint: bool = (
         True  # Save best epoch on training-set metrics instead of last epoch only.
     )
@@ -220,6 +223,7 @@ def train_fusion_from_dataframe(
                     "retriever_model",
                     "evidence_mode",
                     "normalize_branch_logits",
+                    "adaptive_beta",
                 )
                 for key in runtime_keys:
                     checkpoint_value = resume_config.get(key)
@@ -283,6 +287,7 @@ def train_fusion_from_dataframe(
         initial_beta=config.initial_beta,
         lambda_reg=config.lambda_reg,  # Regularization only here, not doubled
         normalize_branch_logits=bool(config.normalize_branch_logits),
+        adaptive_beta=bool(config.adaptive_beta),
     ).to(config.device)
 
     if resume_payload is not None:
@@ -316,9 +321,10 @@ def train_fusion_from_dataframe(
         logger.info("Loaded resume checkpoint weights into fusion components.")
 
     # Optimizer for fusion components only (LLM is frozen)
-    base_params = list(retrieval_encoder.parameters()) + list(
-        fusion.retrieval_mlp.parameters()
-    )
+    fusion_non_beta_params = [
+        p for name, p in fusion.named_parameters() if name != "_beta_logit"
+    ]
+    base_params = list(retrieval_encoder.parameters()) + fusion_non_beta_params
     beta_lr = config.learning_rate * max(float(config.beta_lr_multiplier), 0.0)
     optimizer_groups = [
         {"params": base_params, "lr": config.learning_rate, "weight_decay": 0.01}
@@ -633,6 +639,7 @@ def train_fusion_from_dataframe(
                 "evidence_mode": config.evidence_mode,
                 "label_list": config.label_list,
                 "normalize_branch_logits": bool(config.normalize_branch_logits),
+                "adaptive_beta": bool(config.adaptive_beta),
                 "save_best_checkpoint": bool(config.save_best_checkpoint),
             },
         },

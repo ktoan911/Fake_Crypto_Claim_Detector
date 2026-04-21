@@ -92,6 +92,8 @@ if TORCH_AVAILABLE:
             lambda_reg: float = 0.01,
             learn_beta: bool = True,
             normalize_branch_logits: bool = False,
+            adaptive_beta: bool = False,
+            beta_hidden_dim: int = 16,
         ):
             super().__init__()
 
@@ -99,6 +101,7 @@ if TORCH_AVAILABLE:
             self.lambda_reg = lambda_reg
             self.is_binary = num_classes == 2
             self.normalize_branch_logits = normalize_branch_logits
+            self.adaptive_beta = adaptive_beta
 
             # Trainable gating parameter β
             # We use a logit parameter and apply sigmoid in forward() to ensure β ∈ [0, 1]
@@ -116,9 +119,24 @@ if TORCH_AVAILABLE:
                 output_dim=mlp_output_dim,
             )
 
+            # Optional per-sample gate: β_i = sigmoid(β_global_logit + g(features_i))
+            # This lets fusion trust different branches for different claims.
+            if self.adaptive_beta:
+                gate_input_dim = (self.num_classes * 2) + 2
+                self.beta_gate = nn.Sequential(
+                    nn.Linear(gate_input_dim, beta_hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(beta_hidden_dim, 1),
+                )
+            else:
+                self.beta_gate = None
+
             activation_type = "sigmoid" if self.is_binary else "softmax"
             logger.info(
-                f"ConfidenceAwareFusion initialized: β={initial_beta}, λ={lambda_reg}, num_classes={num_classes}, activation={activation_type}, normalize_branch_logits={normalize_branch_logits}"
+                "ConfidenceAwareFusion initialized: "
+                f"β={initial_beta}, λ={lambda_reg}, num_classes={num_classes}, "
+                f"activation={activation_type}, normalize_branch_logits={normalize_branch_logits}, "
+                f"adaptive_beta={adaptive_beta}"
             )
 
         def _inverse_sigmoid(self, x: float) -> float:
@@ -137,6 +155,30 @@ if TORCH_AVAILABLE:
             scale = centered.std(dim=-1, keepdim=True, unbiased=False).clamp_min(eps)
             return centered / scale
 
+        def _normalized_entropy(self, probs: torch.Tensor) -> torch.Tensor:
+            eps = 1e-8
+            entropy = -(probs * torch.log(probs.clamp_min(eps))).sum(dim=-1, keepdim=True)
+            max_entropy = np.log(max(2, self.num_classes))
+            return entropy / max(max_entropy, eps)
+
+        def _compute_beta_for_batch(
+            self, lm_logits: torch.Tensor, retrieval_logits_label_space: torch.Tensor
+        ) -> torch.Tensor:
+            if not self.adaptive_beta or self.beta_gate is None:
+                return self.beta
+
+            lm_probs = torch.softmax(lm_logits, dim=-1)
+            retrieval_probs = torch.softmax(retrieval_logits_label_space, dim=-1)
+            lm_entropy = self._normalized_entropy(lm_probs)
+            retrieval_entropy = self._normalized_entropy(retrieval_probs)
+
+            gate_input = torch.cat(
+                [lm_probs, retrieval_probs, lm_entropy, retrieval_entropy], dim=-1
+            )
+            beta_delta = self.beta_gate(gate_input)
+            # Broadcast-ready shape [B, 1]
+            return torch.sigmoid(self._beta_logit + beta_delta)
+
         def forward(
             self, lm_logits: torch.Tensor, retrieval_features: torch.Tensor
         ) -> FusionOutput:
@@ -147,6 +189,7 @@ if TORCH_AVAILABLE:
 
             # Project retrieval features to label space
             retrieval_logits = self.retrieval_mlp(retrieval_features)
+            retrieval_logits_label_space = retrieval_logits
 
             if self.is_binary:
                 # Binary classification: treat as 2-class softmax (same as multi-class)
@@ -165,15 +208,18 @@ if TORCH_AVAILABLE:
                 retrieval_logits_2 = torch.cat(
                     [retrieval_logits, -retrieval_logits], dim=-1
                 )  # [B, 2]
+                retrieval_logits_label_space = retrieval_logits_2
 
                 if self.normalize_branch_logits:
                     lm_logits = self._normalize_logits(lm_logits)
-                    retrieval_logits_2 = self._normalize_logits(retrieval_logits_2)
+                    retrieval_logits_label_space = self._normalize_logits(
+                        retrieval_logits_label_space
+                    )
 
-                # Fuse: β·pLM + (1-β)·MLP(pret)
-                fused_logits = (
-                    beta * lm_logits + (1 - beta) * retrieval_logits_2
-                )  # [B, 2]
+                beta = self._compute_beta_for_batch(
+                    lm_logits, retrieval_logits_label_space
+                )
+                fused_logits = beta * lm_logits + (1 - beta) * retrieval_logits_label_space
 
                 # Apply softmax to get probabilities
                 final_probs = torch.softmax(fused_logits, dim=-1)  # [B, 2]
@@ -191,16 +237,21 @@ if TORCH_AVAILABLE:
 
                 if self.normalize_branch_logits:
                     lm_logits = self._normalize_logits(lm_logits)
-                    retrieval_logits = self._normalize_logits(retrieval_logits)
+                    retrieval_logits_label_space = self._normalize_logits(
+                        retrieval_logits_label_space
+                    )
 
-                fused_logits = beta * lm_logits + (1 - beta) * retrieval_logits
+                beta = self._compute_beta_for_batch(
+                    lm_logits, retrieval_logits_label_space
+                )
+                fused_logits = beta * lm_logits + (1 - beta) * retrieval_logits_label_space
                 final_probs = torch.softmax(fused_logits, dim=-1)
 
             return FusionOutput(
                 final_probs=final_probs,
                 fused_logits=fused_logits,
-                lm_weight=beta.detach(),
-                retrieval_weight=(1 - beta).detach(),
+                lm_weight=beta.detach().mean(),
+                retrieval_weight=(1 - beta).detach().mean(),
             )
 
         def compute_contrastive_loss(

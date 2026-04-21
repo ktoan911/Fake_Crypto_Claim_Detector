@@ -334,6 +334,11 @@ def parse_args():
         action="store_true",
         help="Disable branch-logit normalization inside fusion layer.",
     )
+    parser.add_argument(
+        "--disable_adaptive_beta",
+        action="store_true",
+        help="Disable per-sample beta gating and use only global beta.",
+    )
     return parser.parse_args()
 
 
@@ -372,6 +377,7 @@ def main():
         evidence_mode=args.evidence_mode,
         align_runtime_with_resume_checkpoint=not args.disable_resume_runtime_alignment,
         normalize_branch_logits=not args.disable_logit_normalization,
+        adaptive_beta=not args.disable_adaptive_beta,
     )
 
     output_path = train_fusion_from_dataframe(

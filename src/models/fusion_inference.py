@@ -477,6 +477,7 @@ class FusionClaimVerifier:
             normalize_branch_logits=bool(
                 self.saved_config.get("normalize_branch_logits", False)
             ),
+            adaptive_beta=bool(self.saved_config.get("adaptive_beta", False)),
         ).to(self.device)
 
         self.retrieval_encoder.load_state_dict(self.checkpoint["retrieval_encoder"])
