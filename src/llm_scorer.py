@@ -54,20 +54,32 @@ class LLMScorer:
         def _resolve_model_source(path_or_repo: str) -> str:
             import os
 
-            if os.path.isdir(path_or_repo):
-                return path_or_repo
+            candidate = str(path_or_repo).strip()
+            expanded = os.path.expanduser(candidate)
+
+            if os.path.isdir(expanded):
+                return expanded
+
+            # Treat explicit filesystem paths as local-only sources.
+            # This avoids sending paths like "/foo/bar/model" to HF repo-id validators.
+            path_like = os.path.isabs(expanded) or expanded.startswith(("./", "../"))
+            if path_like and not os.path.isdir(expanded):
+                raise FileNotFoundError(
+                    f"Local model directory does not exist: {expanded}. "
+                    "Provide a valid local folder or a Hugging Face repo id like 'namespace/repo_name'."
+                )
 
             if not HF_HUB_AVAILABLE:
-                return path_or_repo
+                return candidate
 
             # Prefer local snapshot if already cached, then fallback to online snapshot.
             try:
-                return snapshot_download(repo_id=path_or_repo, local_files_only=True)
+                return snapshot_download(repo_id=candidate, local_files_only=True)
             except Exception:
                 try:
-                    return snapshot_download(repo_id=path_or_repo)
+                    return snapshot_download(repo_id=candidate)
                 except Exception:
-                    return path_or_repo
+                    return candidate
 
         def _load_tokenizer(model_path: str):
             # NOTE:

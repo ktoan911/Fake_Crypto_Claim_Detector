@@ -207,6 +207,19 @@ def train_fusion_from_dataframe(
                     checkpoint_value = resume_config.get(key)
                     if checkpoint_value is None:
                         continue
+
+                    # Skip unusable absolute local paths baked into another runtime/container.
+                    if isinstance(checkpoint_value, str):
+                        expanded_value = os.path.expanduser(checkpoint_value)
+                        if os.path.isabs(expanded_value) and not os.path.exists(
+                            expanded_value
+                        ):
+                            logger.warning(
+                                f"Skipping resume override for {key}='{checkpoint_value}' "
+                                "because the absolute local path does not exist in this environment."
+                            )
+                            continue
+
                     current_value = getattr(config, key, None)
                     if current_value != checkpoint_value:
                         logger.warning(
