@@ -1,5 +1,7 @@
+import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from loguru import logger
@@ -12,7 +14,7 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-from src.config import LABEL_LIST, LABEL_TO_ID, PROMPT_TEMPLATE
+from src.config import LABEL_LIST, PROMPT_TEMPLATE
 from src.llm_scorer import LLMScorer
 from src.models.fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
 from src.retrieval.retrieval import KnowledgeAugmentedRetriever
@@ -73,10 +75,10 @@ def _normalize_label_to_id(label_value) -> int:
         raise ValueError(f"Unknown integer label: {label_value}. Expected 0, 1, or 2.")
 
     label_upper = str(label_value).upper().strip()
-    if label_upper in ("TRUE", "ĐÚNG", "DUNG", "SUPPORTED", "LEGIT", "0"):
-        return LABEL_TO_ID["Đúng"]
-    if label_upper in ("FALSE", "SAI", "REFUTED", "SCAM", "FAKE", "1"):
-        return LABEL_TO_ID["Sai"]
+    if label_upper in ("TRUE", "ĐÚNG", "DUNG", "SUPPORTED", "LEGIT", "0", "A"):
+        return 0
+    if label_upper in ("FALSE", "SAI", "REFUTED", "SCAM", "FAKE", "1", "B"):
+        return 1
     if label_upper in (
         "NEI",
         "THIEU",
@@ -84,8 +86,15 @@ def _normalize_label_to_id(label_value) -> int:
         "NOT ENOUGH INFORMATION",
         "INSUFFICIENT",
         "2",
+        "C",
+        "THIẾU THÔNG TIN",
+        "CHƯA CHẮC CHẮN",
     ):
-        return LABEL_TO_ID["Thiếu"]
+        return 2
+
+    if "THIẾU" in label_upper or "THIEU" in label_upper:
+        return 2
+
     raise ValueError(
         f"Unknown label string '{label_value}'. "
         "Expected one of: true, false, nei (or integer 0/1/2)."
@@ -97,6 +106,8 @@ def train_fusion_from_dataframe(
     labeled_df,
     config: Optional[FusionTrainingConfig] = None,
     save_path: str = "models/fusion_model.pt",
+    resume_checkpoint_path: Optional[str] = None,
+    resume_strict: bool = False,
 ) -> str:
     """
     Train fusion MLP + beta from a labeled pandas DataFrame.
@@ -109,6 +120,8 @@ def train_fusion_from_dataframe(
         labeled_df: DataFrame with text, evidence, label columns
         config: Training configuration
         save_path: Where to save trained model
+        resume_checkpoint_path: Optional path to an existing fusion checkpoint (.pt)
+        resume_strict: Whether to strictly enforce checkpoint key matching
 
     evidence_mode options:
         - "retrieved": Use evidence from retriever (paper-accurate)
@@ -128,6 +141,59 @@ def train_fusion_from_dataframe(
 
     if labeled_df is None or labeled_df.empty:
         raise ValueError("Labeled DataFrame is empty.")
+
+    # Optionally resume from an existing fusion checkpoint.
+    resume_payload: Optional[Dict[str, Any]] = None
+    if resume_checkpoint_path:
+        if not os.path.isfile(resume_checkpoint_path):
+            raise FileNotFoundError(
+                f"Resume checkpoint not found: {resume_checkpoint_path}"
+            )
+        logger.info(f"Resuming fusion training from: {resume_checkpoint_path}")
+        resume_payload = torch.load(resume_checkpoint_path, map_location="cpu")
+        if not isinstance(resume_payload, dict):
+            raise ValueError(
+                "Resume checkpoint format is invalid. Expected a dictionary payload."
+            )
+
+        resume_config = resume_payload.get("config", {})
+        if isinstance(resume_config, dict):
+            # Keep architecture-compatible values to avoid shape mismatch on load.
+            checkpoint_top_k = resume_config.get("top_k")
+            if checkpoint_top_k is not None and int(checkpoint_top_k) != int(config.top_k):
+                logger.warning(
+                    f"Overriding top_k from {config.top_k} -> {checkpoint_top_k} "
+                    "to match resume checkpoint architecture."
+                )
+                config.top_k = int(checkpoint_top_k)
+
+            checkpoint_labels = resume_config.get("label_list")
+            if checkpoint_labels is not None:
+                checkpoint_labels = [str(x) for x in checkpoint_labels]
+                if checkpoint_labels != [str(x) for x in config.label_list]:
+                    raise ValueError(
+                        "Label list mismatch between current config and resume checkpoint. "
+                        f"Current={config.label_list}, checkpoint={checkpoint_labels}"
+                    )
+
+            checkpoint_num_classes = resume_config.get("num_classes")
+            if checkpoint_num_classes is not None and int(checkpoint_num_classes) != len(
+                config.label_list
+            ):
+                raise ValueError(
+                    "num_classes mismatch between config and resume checkpoint. "
+                    f"Current={len(config.label_list)}, checkpoint={checkpoint_num_classes}"
+                )
+
+            checkpoint_lambda_reg = resume_config.get("lambda_reg")
+            if checkpoint_lambda_reg is not None and float(
+                checkpoint_lambda_reg
+            ) != float(config.lambda_reg):
+                logger.warning(
+                    f"Overriding lambda_reg from {config.lambda_reg} -> {checkpoint_lambda_reg} "
+                    "to continue with checkpoint regularization."
+                )
+                config.lambda_reg = float(checkpoint_lambda_reg)
 
     # Initialize retriever with RRF hybrid
     retriever = KnowledgeAugmentedRetriever(
@@ -167,6 +233,36 @@ def train_fusion_from_dataframe(
         lambda_reg=config.lambda_reg,  # Regularization only here, not doubled
     ).to(config.device)
 
+    if resume_payload is not None:
+        retrieval_state = resume_payload.get("retrieval_encoder")
+        fusion_state = resume_payload.get("fusion")
+        if retrieval_state is None or fusion_state is None:
+            raise ValueError(
+                "Resume checkpoint missing required keys: "
+                "'retrieval_encoder' and/or 'fusion'."
+            )
+
+        retrieval_load = retrieval_encoder.load_state_dict(
+            retrieval_state, strict=resume_strict
+        )
+        fusion_load = fusion.load_state_dict(fusion_state, strict=resume_strict)
+
+        if not resume_strict:
+            if retrieval_load.missing_keys or retrieval_load.unexpected_keys:
+                logger.warning(
+                    "retrieval_encoder checkpoint mismatch "
+                    f"(missing={retrieval_load.missing_keys}, "
+                    f"unexpected={retrieval_load.unexpected_keys})"
+                )
+            if fusion_load.missing_keys or fusion_load.unexpected_keys:
+                logger.warning(
+                    "fusion checkpoint mismatch "
+                    f"(missing={fusion_load.missing_keys}, "
+                    f"unexpected={fusion_load.unexpected_keys})"
+                )
+
+        logger.info("Loaded resume checkpoint weights into fusion components.")
+
     # Optimizer for fusion components only (LLM is frozen)
     params = list(retrieval_encoder.parameters()) + list(fusion.parameters())
     optimizer = torch.optim.AdamW(params, lr=config.learning_rate, weight_decay=0.01)
@@ -190,8 +286,18 @@ def train_fusion_from_dataframe(
         f"Label distribution: { {config.label_list[i]: int(label_counts[i]) for i in range(num_classes)} }"
     )
     if config.use_class_weights:
-        weights = len(labels) / (num_classes * label_counts.astype(np.float32))
+        # Avoid inf weights when a class is absent in the current training split.
+        missing_classes = np.where(label_counts == 0)[0].tolist()
+        safe_counts = np.where(label_counts > 0, label_counts, 1).astype(np.float32)
+        weights = len(labels) / (num_classes * safe_counts)
+        weights = np.where(label_counts > 0, weights, 0.0)
         class_weights = torch.tensor(weights, dtype=torch.float32).to(config.device)
+        if missing_classes:
+            missing_names = [config.label_list[i] for i in missing_classes]
+            logger.warning(
+                f"Missing classes in training set: {missing_names}. "
+                "Set their class weight to 0.0 to avoid divide-by-zero."
+            )
         logger.info(
             f"Class weights (inverse-freq): { {config.label_list[i]: round(float(class_weights[i]), 3) for i in range(num_classes)} }"
         )
@@ -209,8 +315,11 @@ def train_fusion_from_dataframe(
     for p in llm.model.parameters():
         p.requires_grad_(False)
 
-    # Use micro-batch size for LLM to save memory (fusion batch size can be larger)
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # Use CUDA AMP only on CUDA device.
+    use_cuda_amp = str(config.device).startswith("cuda") and torch.cuda.is_available()
+    amp_dtype = (
+        torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    ) if use_cuda_amp else None
 
     # Process in batches for pre-computation
     for i in range(0, len(texts), config.batch_size):
@@ -240,7 +349,12 @@ def train_fusion_from_dataframe(
         # Micro-batching for LLM inference
         batch_logits_list = []
         with torch.inference_mode():
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+            amp_context = (
+                torch.autocast(device_type="cuda", dtype=amp_dtype)
+                if use_cuda_amp
+                else nullcontext()
+            )
+            with amp_context:
                 for j in range(0, len(batch_texts), config.llm_batch_size):
                     sub_texts = batch_texts[j : j + config.llm_batch_size]
                     sub_evidences = batch_evidences[j : j + config.llm_batch_size]
@@ -364,8 +478,6 @@ def train_fusion_from_dataframe(
         scheduler.step()
 
     # Save model
-    import os
-
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(
         {

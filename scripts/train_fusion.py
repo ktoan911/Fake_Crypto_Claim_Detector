@@ -6,15 +6,20 @@ Required CSV columns: text/claim, evidence, label
 
 import argparse
 import os
+import sys
+
+# Ensure project root is in PYTHONPATH
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from loguru import logger
-from src.data.csv_loader import CSVLabeledLoader
+from src.data_process.csv_loader import CSVLabeledLoader
 
 from src.training.fusion_trainer import (
     FusionTrainingConfig,
     train_fusion_from_dataframe,
 )
 from src.utils import normalize_text
+
 
 
 def main():
@@ -39,7 +44,7 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default=os.getenv("LORA_MODEL_PATH", "models/lora_llm"),
+        default=os.getenv("LORA_MODEL_PATH", "ktoan911/fact-check-Qwen3-4B-finetune"),
         help="Path to the LoRA-trained model (default: models/lora_llm)",
     )
     parser.add_argument(
@@ -166,7 +171,7 @@ def main():
     logger.info(f"Labeled data: {len(labeled_df)} samples")
     kb_docs = list(unique_docs.values())
     logger.info(
-        f"Knowledge base built: {len(kb_docs)} unique documents (deduplicated from {len(evidences)} evidence entries)"
+        f"Knowledge base built: {len(kb_docs)} unique documents (deduplicated from {len(labeled_df)} labeled samples)"
     )
 
     fusion_config = FusionTrainingConfig(
