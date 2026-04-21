@@ -54,6 +54,9 @@ class FusionTrainingConfig:
     normalize_branch_logits: bool = (
         True  # Standardize LLM/retrieval logits before weighted fusion.
     )
+    save_best_checkpoint: bool = (
+        True  # Save best epoch on training-set metrics instead of last epoch only.
+    )
 
 
 def _build_retrieval_features(
@@ -461,6 +464,10 @@ def train_fusion_from_dataframe(
 
     dataset_size = len(texts)
     indices = torch.randperm(dataset_size)
+    best_epoch = -1
+    best_accuracy = float("-inf")
+    best_loss = float("inf")
+    best_state: Optional[Dict[str, Any]] = None
 
     for epoch in range(config.epochs):
         # Shuffle indices at the start of each epoch
@@ -514,9 +521,13 @@ def train_fusion_from_dataframe(
         accuracy = correct / total if total > 0 else 0
         beta_val = fusion.beta.item()
 
-        # Per-class accuracy for debugging (helps detect majority-class collapse)
+        # Per-class and branch-wise accuracy for debugging (helps detect branch collapse)
+        fusion.eval()
+        retrieval_encoder.eval()
         all_preds = []
         all_targets = []
+        all_llm_preds = []
+        all_retrieval_preds = []
         with torch.no_grad():
             for i in range(0, dataset_size, config.batch_size):
                 batch_indices = indices[i : i + config.batch_size]
@@ -528,31 +539,83 @@ def train_fusion_from_dataframe(
                 preds_eval = torch.argmax(output_eval.final_probs, dim=-1).cpu()
                 all_preds.append(preds_eval)
                 all_targets.append(b_labels_eval)
+
+                llm_preds_eval = torch.argmax(b_llm_logits, dim=-1).cpu()
+                all_llm_preds.append(llm_preds_eval)
+
+                retrieval_logits_eval = fusion.retrieval_mlp(retrieval_features_eval)
+                if fusion.is_binary:
+                    retrieval_logits_eval = torch.cat(
+                        [retrieval_logits_eval, -retrieval_logits_eval], dim=-1
+                    )
+                if fusion.normalize_branch_logits:
+                    retrieval_logits_eval = fusion._normalize_logits(retrieval_logits_eval)
+                retrieval_preds_eval = torch.argmax(retrieval_logits_eval, dim=-1).cpu()
+                all_retrieval_preds.append(retrieval_preds_eval)
         all_preds = torch.cat(all_preds)
         all_targets = torch.cat(all_targets)
+        all_llm_preds = torch.cat(all_llm_preds)
+        all_retrieval_preds = torch.cat(all_retrieval_preds)
         per_class_acc = [
             ((all_preds == i) & (all_targets == i)).sum().item()
             / max(1, (all_targets == i).sum().item())
             for i in range(num_classes)
         ]
+        llm_acc_epoch = (all_llm_preds == all_targets).float().mean().item()
+        retrieval_acc_epoch = (all_retrieval_preds == all_targets).float().mean().item()
         per_class_str = ", ".join(
             f"{config.label_list[i]}: {per_class_acc[i]:.3f}"
             for i in range(num_classes)
         )
+        fusion.train()
+        retrieval_encoder.train()
+
+        is_better = (accuracy > best_accuracy) or (
+            np.isclose(accuracy, best_accuracy) and avg_loss < best_loss
+        )
+        if is_better:
+            best_accuracy = accuracy
+            best_loss = avg_loss
+            best_epoch = epoch + 1
+            best_state = {
+                "retrieval_encoder": {
+                    k: v.detach().cpu().clone()
+                    for k, v in retrieval_encoder.state_dict().items()
+                },
+                "fusion": {
+                    k: v.detach().cpu().clone() for k, v in fusion.state_dict().items()
+                },
+                "beta": float(fusion.beta.detach().cpu().item()),
+            }
+            logger.info(
+                f"New best epoch: {best_epoch} (acc={best_accuracy:.4f}, loss={best_loss:.4f})"
+            )
 
         current_lr = scheduler.get_last_lr()[0]
         logger.info(
-            f"Epoch {epoch + 1}/{config.epochs} - loss: {avg_loss:.4f} - acc: {accuracy:.4f} - β: {beta_val:.4f} - lr: {current_lr:.2e} - per_class: [{per_class_str}]"
+            f"Epoch {epoch + 1}/{config.epochs} - loss: {avg_loss:.4f} - acc: {accuracy:.4f} - llm_acc: {llm_acc_epoch:.4f} - retrieval_acc: {retrieval_acc_epoch:.4f} - β: {beta_val:.4f} - lr: {current_lr:.2e} - per_class: [{per_class_str}]"
         )
         scheduler.step()
+
+    state_to_save = {
+        "retrieval_encoder": retrieval_encoder.state_dict(),
+        "fusion": fusion.state_dict(),
+        "beta": fusion.beta.item(),
+    }
+    if config.save_best_checkpoint and best_state is not None:
+        logger.info(
+            f"Saving best checkpoint from epoch {best_epoch}/{config.epochs} "
+            f"(acc={best_accuracy:.4f}, loss={best_loss:.4f})"
+        )
+        state_to_save = best_state
 
     # Save model
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(
         {
-            "retrieval_encoder": retrieval_encoder.state_dict(),
-            "fusion": fusion.state_dict(),
-            "beta": fusion.beta.item(),
+            "retrieval_encoder": state_to_save["retrieval_encoder"],
+            "fusion": state_to_save["fusion"],
+            "beta": state_to_save["beta"],
             "config": {
                 "model_name": config.model_name,
                 "retriever_model": config.retriever_model,
@@ -563,6 +626,7 @@ def train_fusion_from_dataframe(
                 "evidence_mode": config.evidence_mode,
                 "label_list": config.label_list,
                 "normalize_branch_logits": bool(config.normalize_branch_logits),
+                "save_best_checkpoint": bool(config.save_best_checkpoint),
             },
         },
         save_path,
