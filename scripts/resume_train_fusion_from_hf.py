@@ -329,6 +329,11 @@ def parse_args():
         action="store_true",
         help="Do not override model/retriever/evidence settings from checkpoint config.",
     )
+    parser.add_argument(
+        "--disable_logit_normalization",
+        action="store_true",
+        help="Disable branch-logit normalization inside fusion layer.",
+    )
     return parser.parse_args()
 
 
@@ -366,6 +371,7 @@ def main():
         top_k=args.top_k,
         evidence_mode=args.evidence_mode,
         align_runtime_with_resume_checkpoint=not args.disable_resume_runtime_alignment,
+        normalize_branch_logits=not args.disable_logit_normalization,
     )
 
     output_path = train_fusion_from_dataframe(

@@ -91,12 +91,14 @@ if TORCH_AVAILABLE:
             initial_beta: float = 0.5,
             lambda_reg: float = 0.01,
             learn_beta: bool = True,
+            normalize_branch_logits: bool = False,
         ):
             super().__init__()
 
             self.num_classes = num_classes
             self.lambda_reg = lambda_reg
             self.is_binary = num_classes == 2
+            self.normalize_branch_logits = normalize_branch_logits
 
             # Trainable gating parameter β
             # We use a logit parameter and apply sigmoid in forward() to ensure β ∈ [0, 1]
@@ -116,7 +118,7 @@ if TORCH_AVAILABLE:
 
             activation_type = "sigmoid" if self.is_binary else "softmax"
             logger.info(
-                f"ConfidenceAwareFusion initialized: β={initial_beta}, λ={lambda_reg}, num_classes={num_classes}, activation={activation_type}"
+                f"ConfidenceAwareFusion initialized: β={initial_beta}, λ={lambda_reg}, num_classes={num_classes}, activation={activation_type}, normalize_branch_logits={normalize_branch_logits}"
             )
 
         def _inverse_sigmoid(self, x: float) -> float:
@@ -128,6 +130,12 @@ if TORCH_AVAILABLE:
         def beta(self) -> torch.Tensor:
             """Get the current gating parameter β. Guaranteed to be in [0, 1]."""
             return torch.sigmoid(self._beta_logit)
+
+        def _normalize_logits(self, logits: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            """Per-sample standardization to avoid scale mismatch between fusion branches."""
+            centered = logits - logits.mean(dim=-1, keepdim=True)
+            scale = centered.std(dim=-1, keepdim=True, unbiased=False).clamp_min(eps)
+            return centered / scale
 
         def forward(
             self, lm_logits: torch.Tensor, retrieval_features: torch.Tensor
@@ -158,6 +166,10 @@ if TORCH_AVAILABLE:
                     [retrieval_logits, -retrieval_logits], dim=-1
                 )  # [B, 2]
 
+                if self.normalize_branch_logits:
+                    lm_logits = self._normalize_logits(lm_logits)
+                    retrieval_logits_2 = self._normalize_logits(retrieval_logits_2)
+
                 # Fuse: β·pLM + (1-β)·MLP(pret)
                 fused_logits = (
                     beta * lm_logits + (1 - beta) * retrieval_logits_2
@@ -176,6 +188,10 @@ if TORCH_AVAILABLE:
                 assert retrieval_logits.size() == (batch_size, self.num_classes), (
                     f"retrieval_logits shape mismatch: expected [{batch_size}, {self.num_classes}], got {retrieval_logits.shape}"
                 )
+
+                if self.normalize_branch_logits:
+                    lm_logits = self._normalize_logits(lm_logits)
+                    retrieval_logits = self._normalize_logits(retrieval_logits)
 
                 fused_logits = beta * lm_logits + (1 - beta) * retrieval_logits
                 final_probs = torch.softmax(fused_logits, dim=-1)

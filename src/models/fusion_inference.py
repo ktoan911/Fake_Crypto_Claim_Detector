@@ -474,6 +474,9 @@ class FusionClaimVerifier:
             num_classes=int(self.saved_config.get("num_classes", len(self.label_list))),
             initial_beta=float(self.saved_config.get("initial_beta", 0.8)),
             lambda_reg=float(self.saved_config.get("lambda_reg", 0.01)),
+            normalize_branch_logits=bool(
+                self.saved_config.get("normalize_branch_logits", False)
+            ),
         ).to(self.device)
 
         self.retrieval_encoder.load_state_dict(self.checkpoint["retrieval_encoder"])

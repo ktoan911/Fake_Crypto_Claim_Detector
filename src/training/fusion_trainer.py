@@ -51,6 +51,9 @@ class FusionTrainingConfig:
     align_runtime_with_resume_checkpoint: bool = (
         True  # Keep LLM/retriever/evidence settings consistent with resumed checkpoint.
     )
+    normalize_branch_logits: bool = (
+        True  # Standardize LLM/retrieval logits before weighted fusion.
+    )
 
 
 def _build_retrieval_features(
@@ -202,7 +205,12 @@ def train_fusion_from_dataframe(
                 config.lambda_reg = float(checkpoint_lambda_reg)
 
             if config.align_runtime_with_resume_checkpoint:
-                runtime_keys = ("model_name", "retriever_model", "evidence_mode")
+                runtime_keys = (
+                    "model_name",
+                    "retriever_model",
+                    "evidence_mode",
+                    "normalize_branch_logits",
+                )
                 for key in runtime_keys:
                     checkpoint_value = resume_config.get(key)
                     if checkpoint_value is None:
@@ -264,6 +272,7 @@ def train_fusion_from_dataframe(
         num_classes=num_classes,
         initial_beta=config.initial_beta,
         lambda_reg=config.lambda_reg,  # Regularization only here, not doubled
+        normalize_branch_logits=bool(config.normalize_branch_logits),
     ).to(config.device)
 
     if resume_payload is not None:
@@ -430,6 +439,11 @@ def train_fusion_from_dataframe(
     )
     tensor_llm_logits = torch.cat(all_llm_logits, dim=0)
     tensor_labels = torch.tensor(labels, dtype=torch.long)
+    llm_baseline_preds = torch.argmax(tensor_llm_logits, dim=-1)
+    llm_baseline_acc = (llm_baseline_preds == tensor_labels).float().mean().item()
+    logger.info(
+        f"LLM baseline (argmax on pre-computed logits) acc: {llm_baseline_acc:.4f}"
+    )
 
     logger.info("Pre-computation complete. Unloading LLM...")
 
@@ -548,6 +562,7 @@ def train_fusion_from_dataframe(
                 "lambda_reg": config.lambda_reg,
                 "evidence_mode": config.evidence_mode,
                 "label_list": config.label_list,
+                "normalize_branch_logits": bool(config.normalize_branch_logits),
             },
         },
         save_path,
