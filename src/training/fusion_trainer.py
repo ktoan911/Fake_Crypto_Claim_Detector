@@ -155,8 +155,8 @@ def train_fusion_from_dataframe(
 
     logger.info(f"Training fusion on device: {config.device}")
     logger.info(f"fusion_trainer source: {__file__}")
-    logger.info(f"Evidence mode: {config.evidence_mode}")
-    logger.info(f"Retriever model: {config.retriever_model}")
+    logger.info(f"Evidence mode (requested): {config.evidence_mode}")
+    logger.info(f"Retriever model (requested): {config.retriever_model}")
     logger.info(
         "Trainer flags: "
         f"normalize_branch_logits={config.normalize_branch_logits}, "
@@ -226,7 +226,6 @@ def train_fusion_from_dataframe(
                 runtime_keys = (
                     "model_name",
                     "retriever_model",
-                    "evidence_mode",
                     "normalize_branch_logits",
                     "adaptive_beta",
                     "retrieval_aux_loss_weight",
@@ -255,6 +254,13 @@ def train_fusion_from_dataframe(
                             "to match resume checkpoint runtime."
                         )
                         setattr(config, key, checkpoint_value)
+
+    logger.info(
+        "Effective runtime after resume-merge: "
+        f"evidence_mode={config.evidence_mode}, "
+        f"model_name={config.model_name}, "
+        f"retriever_model={config.retriever_model}"
+    )
 
     # Initialize retriever with RRF hybrid
     retriever = KnowledgeAugmentedRetriever(
