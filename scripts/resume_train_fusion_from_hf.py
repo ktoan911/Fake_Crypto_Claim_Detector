@@ -339,6 +339,12 @@ def parse_args():
         action="store_true",
         help="Disable per-sample beta gating and use only global beta.",
     )
+    parser.add_argument(
+        "--retrieval_aux_loss_weight",
+        type=float,
+        default=0.5,
+        help="Auxiliary CE loss weight on retrieval branch logits.",
+    )
     return parser.parse_args()
 
 
@@ -378,6 +384,7 @@ def main():
         align_runtime_with_resume_checkpoint=not args.disable_resume_runtime_alignment,
         normalize_branch_logits=not args.disable_logit_normalization,
         adaptive_beta=not args.disable_adaptive_beta,
+        retrieval_aux_loss_weight=args.retrieval_aux_loss_weight,
     )
 
     output_path = train_fusion_from_dataframe(

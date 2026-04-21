@@ -57,6 +57,9 @@ class FusionTrainingConfig:
     adaptive_beta: bool = (
         True  # Learn per-sample beta offsets from branch confidence patterns.
     )
+    retrieval_aux_loss_weight: float = (
+        0.5  # Extra supervision on retrieval branch to avoid chance-level collapse.
+    )
     save_best_checkpoint: bool = (
         True  # Save best epoch on training-set metrics instead of last epoch only.
     )
@@ -157,6 +160,8 @@ def train_fusion_from_dataframe(
     logger.info(
         "Trainer flags: "
         f"normalize_branch_logits={config.normalize_branch_logits}, "
+        f"adaptive_beta={config.adaptive_beta}, "
+        f"retrieval_aux_loss_weight={config.retrieval_aux_loss_weight}, "
         f"save_best_checkpoint={config.save_best_checkpoint}, "
         f"beta_lr_multiplier={config.beta_lr_multiplier}"
     )
@@ -224,6 +229,7 @@ def train_fusion_from_dataframe(
                     "evidence_mode",
                     "normalize_branch_logits",
                     "adaptive_beta",
+                    "retrieval_aux_loss_weight",
                 )
                 for key in runtime_keys:
                     checkpoint_value = resume_config.get(key)
@@ -487,6 +493,7 @@ def train_fusion_from_dataframe(
         indices = torch.randperm(dataset_size)
 
         total_loss = 0.0
+        total_retrieval_aux_loss = 0.0
         correct = 0
         total = 0
         num_batches = 0
@@ -511,9 +518,24 @@ def train_fusion_from_dataframe(
                 output.fused_logits, b_labels, weight=class_weights
             )
 
+            retrieval_logits_aux = fusion.retrieval_mlp(retrieval_features)
+            if fusion.is_binary:
+                retrieval_logits_aux = torch.cat(
+                    [retrieval_logits_aux, -retrieval_logits_aux], dim=-1
+                )
+            if fusion.normalize_branch_logits:
+                retrieval_logits_aux = fusion._normalize_logits(retrieval_logits_aux)
+            retrieval_aux_loss = F.cross_entropy(
+                retrieval_logits_aux, b_labels, weight=class_weights
+            )
+
             # Add beta regularization (L = CE + λ||β||²)
             beta_reg = fusion.lambda_reg * (fusion.beta**2)
-            loss = ce_loss + beta_reg
+            loss = (
+                ce_loss
+                + float(config.retrieval_aux_loss_weight) * retrieval_aux_loss
+                + beta_reg
+            )
 
             # Backward pass
             optimizer.zero_grad()
@@ -522,6 +544,7 @@ def train_fusion_from_dataframe(
 
             # Track metrics
             total_loss += loss.item()
+            total_retrieval_aux_loss += retrieval_aux_loss.item()
 
             # Get predictions using argmax (works for both binary and multi-class)
             preds = torch.argmax(output.final_probs, dim=-1)
@@ -531,6 +554,7 @@ def train_fusion_from_dataframe(
             num_batches += 1
 
         avg_loss = total_loss / max(1, num_batches)
+        avg_retrieval_aux_loss = total_retrieval_aux_loss / max(1, num_batches)
         accuracy = correct / total if total > 0 else 0
         beta_val = fusion.beta.item()
 
@@ -606,7 +630,7 @@ def train_fusion_from_dataframe(
 
         current_lr = scheduler.get_last_lr()[0]
         logger.info(
-            f"Epoch {epoch + 1}/{config.epochs} - loss: {avg_loss:.4f} - acc: {accuracy:.4f} - llm_acc: {llm_acc_epoch:.4f} - retrieval_acc: {retrieval_acc_epoch:.4f} - β: {beta_val:.4f} - lr: {current_lr:.2e} - per_class: [{per_class_str}]"
+            f"Epoch {epoch + 1}/{config.epochs} - loss: {avg_loss:.4f} - retrieval_loss: {avg_retrieval_aux_loss:.4f} - acc: {accuracy:.4f} - llm_acc: {llm_acc_epoch:.4f} - retrieval_acc: {retrieval_acc_epoch:.4f} - β: {beta_val:.4f} - lr: {current_lr:.2e} - per_class: [{per_class_str}]"
         )
         scheduler.step()
 
@@ -640,6 +664,7 @@ def train_fusion_from_dataframe(
                 "label_list": config.label_list,
                 "normalize_branch_logits": bool(config.normalize_branch_logits),
                 "adaptive_beta": bool(config.adaptive_beta),
+                "retrieval_aux_loss_weight": float(config.retrieval_aux_loss_weight),
                 "save_best_checkpoint": bool(config.save_best_checkpoint),
             },
         },
