@@ -28,6 +28,9 @@ class FusionTrainingConfig:
     llm_batch_size: int = 4
     epochs: int = 3
     learning_rate: float = 1e-4
+    beta_lr_multiplier: float = (
+        5.0  # Let scalar gate β adapt faster than full MLP blocks.
+    )
     top_k: int = 10
     alpha: float = 0.7
     lambda_decay: float = 0.1
@@ -44,6 +47,9 @@ class FusionTrainingConfig:
     retriever_model: str = "bge-vi-base"
     use_class_weights: bool = (
         True  # Address class imbalance with inverse-frequency weighting
+    )
+    align_runtime_with_resume_checkpoint: bool = (
+        True  # Keep LLM/retriever/evidence settings consistent with resumed checkpoint.
     )
 
 
@@ -195,6 +201,20 @@ def train_fusion_from_dataframe(
                 )
                 config.lambda_reg = float(checkpoint_lambda_reg)
 
+            if config.align_runtime_with_resume_checkpoint:
+                runtime_keys = ("model_name", "retriever_model", "evidence_mode")
+                for key in runtime_keys:
+                    checkpoint_value = resume_config.get(key)
+                    if checkpoint_value is None:
+                        continue
+                    current_value = getattr(config, key, None)
+                    if current_value != checkpoint_value:
+                        logger.warning(
+                            f"Overriding {key} from {current_value} -> {checkpoint_value} "
+                            "to match resume checkpoint runtime."
+                        )
+                        setattr(config, key, checkpoint_value)
+
     # Initialize retriever with RRF hybrid
     retriever = KnowledgeAugmentedRetriever(
         embedding_model=config.retriever_model,
@@ -264,10 +284,32 @@ def train_fusion_from_dataframe(
         logger.info("Loaded resume checkpoint weights into fusion components.")
 
     # Optimizer for fusion components only (LLM is frozen)
-    params = list(retrieval_encoder.parameters()) + list(fusion.parameters())
-    optimizer = torch.optim.AdamW(params, lr=config.learning_rate, weight_decay=0.01)
+    base_params = list(retrieval_encoder.parameters()) + list(
+        fusion.retrieval_mlp.parameters()
+    )
+    beta_lr = config.learning_rate * max(float(config.beta_lr_multiplier), 0.0)
+    optimizer_groups = [
+        {"params": base_params, "lr": config.learning_rate, "weight_decay": 0.01}
+    ]
+    if fusion._beta_logit.requires_grad:
+        optimizer_groups.append(
+            {
+                "params": [fusion._beta_logit],
+                "lr": beta_lr if beta_lr > 0 else config.learning_rate,
+                "weight_decay": 0.0,
+            }
+        )
+    optimizer = torch.optim.AdamW(optimizer_groups)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.epochs, eta_min=1e-6
+    )
+    beta_group_lr = (
+        optimizer.param_groups[1]["lr"]
+        if len(optimizer.param_groups) > 1
+        else optimizer.param_groups[0]["lr"]
+    )
+    logger.info(
+        f"Optimizer LRs -> base: {config.learning_rate:.2e}, beta: {beta_group_lr:.2e}"
     )
 
     # Prepare data

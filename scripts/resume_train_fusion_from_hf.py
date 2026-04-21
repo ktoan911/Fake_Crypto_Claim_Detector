@@ -274,6 +274,12 @@ def parse_args():
         "--learning_rate", type=float, default=1e-4, help="Fusion learning rate."
     )
     parser.add_argument(
+        "--beta_lr_multiplier",
+        type=float,
+        default=5.0,
+        help="Multiply beta gate learning rate relative to --learning_rate.",
+    )
+    parser.add_argument(
         "--top_k",
         type=int,
         default=10,
@@ -318,6 +324,11 @@ def parse_args():
         action="store_true",
         help="Strictly enforce checkpoint keys when loading resume checkpoint.",
     )
+    parser.add_argument(
+        "--disable_resume_runtime_alignment",
+        action="store_true",
+        help="Do not override model/retriever/evidence settings from checkpoint config.",
+    )
     return parser.parse_args()
 
 
@@ -351,8 +362,10 @@ def main():
         llm_batch_size=args.llm_batch_size,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
+        beta_lr_multiplier=args.beta_lr_multiplier,
         top_k=args.top_k,
         evidence_mode=args.evidence_mode,
+        align_runtime_with_resume_checkpoint=not args.disable_resume_runtime_alignment,
     )
 
     output_path = train_fusion_from_dataframe(
