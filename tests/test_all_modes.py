@@ -19,18 +19,16 @@ from loguru import logger
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from tqdm import tqdm
 
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-
-from src.data.csv_loader import CSVLabeledLoader
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import LABEL_LIST, PROMPT_TEMPLATE
+from src.data_process.csv_loader import CSVLabeledLoader
 from src.llm_scorer import LLMScorer
 from src.models.fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
 from src.retrieval.retrieval import KnowledgeAugmentedRetriever
 from src.training.fusion_trainer import (  # Re-use helper
     _build_retrieval_features,
-    _normalize_label_to_id,
 )
 from src.utils import normalize_text
 
@@ -38,7 +36,7 @@ from src.utils import normalize_text
 LABEL_MAP = {idx: label for idx, label in enumerate(LABEL_LIST)}
 
 
-def calculate_metrics(y_true, y_pred, mode_name):
+def calculate_metrics(y_true, y_pred, mode_name, label_list=LABEL_LIST):
     """Calculate and print metrics."""
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, average="macro", zero_division=0)
@@ -50,7 +48,7 @@ def calculate_metrics(y_true, y_pred, mode_name):
         y_pred,
         average=None,
         zero_division=0,
-        labels=list(range(len(LABEL_LIST))),
+        labels=list(range(len(label_list))),
     )
 
     logger.info(f"--- Results for {mode_name} ---")
@@ -59,7 +57,7 @@ def calculate_metrics(y_true, y_pred, mode_name):
     logger.info(f"Recall:    {rec:.4f}")
     logger.info(f"F1 Macro:  {f1_macro:.4f}")
     logger.info(f"F1 Weighted: {f1_weighted:.4f}")
-    for idx, label_name in enumerate(LABEL_LIST):
+    for idx, label_name in enumerate(label_list):
         logger.info(f"F1 {label_name}: {per_class_f1[idx]:.4f}")
 
     metrics = {
@@ -70,18 +68,33 @@ def calculate_metrics(y_true, y_pred, mode_name):
         "F1_Macro": f1_macro,
         "F1_Weighted": f1_weighted,
     }
-    for idx, label_name in enumerate(LABEL_LIST):
+    for idx, label_name in enumerate(label_list):
         metrics[f"F1_{label_name}"] = per_class_f1[idx]
 
     return metrics
 
 
-def load_fusion_model(model_path, device, num_classes=len(LABEL_LIST)):
+def load_fusion_model(model_path, device, num_classes=None):
     """Load trained fusion model components."""
+    import os
+
+    if not os.path.isfile(model_path):
+        try:
+            from huggingface_hub import hf_hub_download
+
+            logger.info(f"Downloading fusion model from HF repo {model_path}...")
+            model_path = hf_hub_download(repo_id=model_path, filename="model.pt")
+        except Exception as exc:
+            raise FileNotFoundError(
+                f"Cannot resolve fusion model path '{model_path}': {exc}"
+            )
+
     checkpoint = torch.load(model_path, map_location=device)
 
     # Load config from checkpoint if available, else standard
     saved_config = checkpoint.get("config", {})
+    if num_classes is None:
+        num_classes = saved_config.get("num_classes", len(LABEL_LIST))
 
     retrieval_encoder = RetrievalFeatureEncoder(
         num_retrieved=saved_config.get("top_k", 10),
@@ -144,6 +157,49 @@ def main():
 
     logger.info(f"Testing on device: {args.device}")
 
+    # Fusion Model
+    retrieval_encoder, fusion_layer, fusion_config = load_fusion_model(
+        args.fusion_model, args.device
+    )
+    top_k = fusion_config.get("top_k", 10)
+    retriever_model = args.retriever_model or fusion_config.get(
+        "retriever_model", "bge-vi-base"
+    )
+
+    # Extract dynamic label properties
+    dynamic_label_list = fusion_config.get(
+        "label_list", ["Đúng", "Sai", "Chưa chắc chắn"]
+    )
+
+    def local_normalize_label_to_id(val):
+        v = str(val).lower().strip()
+        if v in ["true", "đúng", "dung", "supported", "legit", "0"]:
+            return (
+                dynamic_label_list.index("Đúng") if "Đúng" in dynamic_label_list else 0
+            )
+        if v in ["false", "sai", "refuted", "scam", "fake", "1"]:
+            return dynamic_label_list.index("Sai") if "Sai" in dynamic_label_list else 1
+        if v in [
+            "nei",
+            "thieu",
+            "thiếu",
+            "thiếu thông tin",
+            "chưa chắc chắn",
+            "chua chac chan",
+            "not enough info",
+            "insufficient",
+            "2",
+        ]:
+            if "Chưa chắc chắn" in dynamic_label_list:
+                return dynamic_label_list.index("Chưa chắc chắn")
+            if "Thiếu" in dynamic_label_list:
+                return dynamic_label_list.index("Thiếu")
+            return 2
+        for idx, lbl in enumerate(dynamic_label_list):
+            if v == lbl.lower().strip():
+                return idx
+        return 0
+
     # 1. Load Data
     logger.info(f"Loading data from {args.csv}...")
     gold_evidences = []
@@ -165,16 +221,28 @@ def main():
             logger.info(f"Limited to {args.limit} samples")
 
         texts = [d["claim"] for d in data]
-        labels = [_normalize_label_to_id(d["label"]) for d in data]
+        labels = [local_normalize_label_to_id(d["label"]) for d in data]
 
         # Build Knowledge Base for Retrieval
+        from datetime import datetime, timezone
+
         for d in data:
             evs = d.get("evidence", [])
             parts = []
             for ev in evs:
                 if isinstance(ev, dict) and "content" in ev:
                     content = ev["content"]
-                    timestamp = ev.get("timestamp", None)
+                    raw_ts = ev.get("timestamp", None)
+                    timestamp = None
+                    if raw_ts:
+                        try:
+                            timestamp = datetime.fromisoformat(
+                                str(raw_ts).replace("Z", "+00:00")
+                            )
+                            if timestamp.tzinfo is None:
+                                timestamp = timestamp.replace(tzinfo=timezone.utc)
+                        except Exception:
+                            timestamp = datetime.now(timezone.utc)
                     parts.append(content)
 
                     if content.strip() and len(content.strip()) > 10:
@@ -203,7 +271,7 @@ def main():
 
         texts = df["text"].tolist()
         raw_evidences = df["evidence"].tolist()
-        labels = [_normalize_label_to_id(v) for v in df["label"].tolist()]
+        labels = [local_normalize_label_to_id(v) for v in df["label"].tolist()]
 
         # Build Knowledge Base for Retrieval
         for evidence in raw_evidences:
@@ -226,13 +294,9 @@ def main():
         f"Built temporary KB with {len(kb_docs)} unique documents from test set evidence (deduplicated)"
     )
 
-    # Fusion Model
-    retrieval_encoder, fusion_layer, fusion_config = load_fusion_model(
-        args.fusion_model, args.device
-    )
-    top_k = fusion_config.get("top_k", 10)
-    retriever_model = args.retriever_model or fusion_config.get(
-        "retriever_model", "bge-vi-base"
+    kb_docs = list(unique_docs.values())
+    logger.info(
+        f"Built temporary KB with {len(kb_docs)} unique documents from test set evidence (deduplicated)"
     )
 
     # 2. Initialize Components
@@ -246,7 +310,7 @@ def main():
         model_name=args.lora_model,
         device=args.device,
         max_length=2048,
-        labels=LABEL_LIST,
+        labels=dynamic_label_list,
         prompt_template=PROMPT_TEMPLATE,
     )
 
@@ -322,12 +386,16 @@ def main():
     # Preds = argmax(logits)
     preds_lora_retrieval = torch.argmax(tensor_logits_retrieval, dim=1).cpu().numpy()
     results_summary.append(
-        calculate_metrics(labels, preds_lora_retrieval, "LoRA + Retrieval")
+        calculate_metrics(
+            labels, preds_lora_retrieval, "LoRA + Retrieval", dynamic_label_list
+        )
     )
 
     # --- Mode 2: LoRA + Gold ---
     preds_lora_gold = torch.argmax(tensor_logits_gold, dim=1).cpu().numpy()
-    results_summary.append(calculate_metrics(labels, preds_lora_gold, "LoRA + Gold"))
+    results_summary.append(
+        calculate_metrics(labels, preds_lora_gold, "LoRA + Gold", dynamic_label_list)
+    )
 
     # --- Mode 3: Fusion + Retrieval ---
     # Fusion(logits_retrieval, features_retrieval)
@@ -341,7 +409,9 @@ def main():
         )
 
     results_summary.append(
-        calculate_metrics(labels, preds_fusion_retrieval, "Fusion + Retrieval")
+        calculate_metrics(
+            labels, preds_fusion_retrieval, "Fusion + Retrieval", dynamic_label_list
+        )
     )
 
     # --- Mode 4: Fusion + Gold ---
@@ -357,7 +427,9 @@ def main():
         )
 
     results_summary.append(
-        calculate_metrics(labels, preds_fusion_gold, "Fusion + Gold")
+        calculate_metrics(
+            labels, preds_fusion_gold, "Fusion + Gold", dynamic_label_list
+        )
     )
 
     # Summary Table
@@ -365,7 +437,7 @@ def main():
     headers = [f"{'Mode':<18}"] + [
         f"{h:<8}"
         for h in ["Acc", "Prec", "Rec", "F1_Mac", "F1_W"]
-        + [f"F1_{l}" for l in LABEL_LIST]
+        + [f"F1_{l}" for l in dynamic_label_list]
     ]
     print(" | ".join(headers))
     print("-" * 110)
@@ -379,7 +451,7 @@ def main():
                 f"{res['F1_Macro']:<8.4f}",
                 f"{res['F1_Weighted']:<8.4f}",
             ]
-            + [f"{res[f'F1_{l}']:<8.4f}" for l in LABEL_LIST]
+            + [f"{res[f'F1_{l}']:<8.4f}" for l in dynamic_label_list]
         )
         print(" | ".join(row))
     print("=" * 110 + "\n")
