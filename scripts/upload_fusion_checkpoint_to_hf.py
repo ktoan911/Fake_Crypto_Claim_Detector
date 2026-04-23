@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--path_in_repo",
         type=str,
-        default="fusion_model.pt",
+        default="model.pt",
         help="Target file path inside HF repo.",
     )
     parser.add_argument(

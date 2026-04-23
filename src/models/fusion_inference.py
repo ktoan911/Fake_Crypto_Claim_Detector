@@ -17,7 +17,7 @@ from src.database.opensearch import OpenSearchKB
 from src.retrieval.retrieval import QueryExpander, RetrievalResult, TemporalScorer
 
 
-def _resolve_fusion_model_path(path_or_repo: str, filename: str = "fusion_model.pt") -> str:
+def _resolve_fusion_model_path(path_or_repo: str, filename: str = "model.pt") -> str:
     if os.path.isfile(path_or_repo):
         return path_or_repo
     try:
@@ -591,13 +591,231 @@ class FusionClaimVerifier:
     # ------------------------------------------------------------------
     # Claim splitting
     # ------------------------------------------------------------------
-    def split_long_claim(self, claim: str) -> List[str]:
+    def split_long_claim(self, claim: str) -> Optional[List[str]]:
         """
-        Tách claim dài thành các claim nhỏ.
-        (Để trống logic để user tự điền)
+        TODO: Implement logic tách claim thành các ý nhỏ.
+        Bạn có thể trả về:
+        - List[str]: danh sách sub-claim
+        - None / []: để dùng fallback mặc định (không tách)
         """
-        # TODO: Implement rule to split long claim into smaller claims.
-        return [claim]
+        pass
+
+    def _prepare_sub_claims(self, claim: str) -> List[str]:
+        """
+        Chuẩn hoá output từ splitter và fallback về claim gốc nếu splitter
+        chưa được implement hoặc trả về dữ liệu không hợp lệ.
+        """
+        text = str(claim).strip()
+        if not text:
+            return []
+
+        try:
+            raw_sub_claims = self.split_long_claim(text)
+        except Exception as exc:
+            logger.warning(
+                f"[fusion_inference] split_long_claim failed, fallback to original claim: {exc}"
+            )
+            return [text]
+
+        if raw_sub_claims is None:
+            return [text]
+
+        if isinstance(raw_sub_claims, str):
+            candidates = [raw_sub_claims]
+        else:
+            try:
+                candidates = list(raw_sub_claims)
+            except TypeError:
+                candidates = [str(raw_sub_claims)]
+
+        normalized: List[str] = []
+        seen = set()
+        for item in candidates:
+            part = str(item).strip()
+            if not part or part in seen:
+                continue
+            seen.add(part)
+            normalized.append(part)
+
+        return normalized or [text]
+
+    def _aggregate_sub_claim_predictions(
+        self, claim: str, sub_preds: List[ClaimPrediction], sub_claim_count: int
+    ) -> ClaimPrediction:
+        has_sai = False
+        has_chua_chac_chan = False
+        all_evidence: List[str] = []
+        all_source_links: List[str] = []
+
+        avg_conf = (
+            sum(p.confidence for p in sub_preds) / len(sub_preds) if sub_preds else 0.0
+        )
+
+        for p in sub_preds:
+            if p.verdict == "Sai":
+                has_sai = True
+            elif p.verdict == "Chưa chắc chắn":
+                has_chua_chac_chan = True
+
+            all_evidence.extend(p.evidence)
+            for link in p.source_links:
+                if link not in all_source_links:
+                    all_source_links.append(link)
+
+        if has_sai:
+            final_verdict = "Sai"
+            final_label = "Sai"
+            final_label_id = self.label_list.index("Sai") if "Sai" in self.label_list else 1
+        elif has_chua_chac_chan:
+            final_verdict = "Chưa chắc chắn"
+            final_label = "Chưa chắc chắn"
+            final_label_id = (
+                self.label_list.index("Chưa chắc chắn")
+                if "Chưa chắc chắn" in self.label_list
+                else 2
+            )
+        else:
+            final_verdict = "Đúng"
+            final_label = "Đúng"
+            final_label_id = self.label_list.index("Đúng") if "Đúng" in self.label_list else 0
+
+        max_evidence = self.llm_evidence_top_k * max(1, int(sub_claim_count))
+        return ClaimPrediction(
+            claim=claim,
+            verdict=final_verdict,
+            label=final_label,
+            label_id=final_label_id,
+            confidence=avg_conf,
+            evidence=all_evidence[:max_evidence],
+            source_links=all_source_links,
+        )
+
+    def _log_predictions_to_claims_index(
+        self, predictions: List[ClaimPrediction]
+    ) -> None:
+        if not predictions:
+            return
+
+        threading.Thread(
+            target=self._log_claims_to_opensearch,
+            args=(
+                [
+                    {
+                        "claim": p.claim,
+                        "verdict": p.verdict,
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    for p in predictions
+                ],
+            ),
+            daemon=True,
+        ).start()
+
+    def _predict_batch_without_split(self, claims: List[str]) -> List[ClaimPrediction]:
+        t0 = perf_counter()
+        if not claims:
+            return []
+
+        now_utc = datetime.now(timezone.utc)
+        if self.debug:
+            logger.info(
+                f"[fusion_inference] start _predict_batch_without_split | batch_size={len(claims)} | now_utc={now_utc.isoformat()}"
+            )
+
+        all_retrieval_features = []
+        all_llm_evidences = []
+        all_source_links = []
+        valid_indices = []
+        valid_claims = []
+        results: List[Optional[ClaimPrediction]] = [None] * len(claims)
+
+        for i, claim in enumerate(claims):
+            text = str(claim).strip()
+            if not text:
+                continue
+
+            valid_indices.append(i)
+            valid_claims.append(text)
+
+            feat, retrieved_evidence, retrieval_results = (
+                _build_retrieval_features_train_compatible(
+                    self.retriever, text, self.top_k
+                )
+            )
+            all_retrieval_features.append(feat)
+            all_llm_evidences.append(retrieved_evidence[: self.llm_evidence_top_k])
+
+            links = []
+            for r in retrieval_results[: self.llm_evidence_top_k]:
+                meta = r.metadata or {}
+                url = str(
+                    meta.get("article_url")
+                    or meta.get("url")
+                    or meta.get("link")
+                    or meta.get("source_url")
+                    or ""
+                ).strip()
+                if url and url not in links:
+                    links.append(url)
+            all_source_links.append(links)
+
+        if not valid_claims:
+            return []
+
+        retrieval_features = torch.tensor(
+            np.stack(all_retrieval_features), dtype=torch.float32, device=self.device
+        )
+
+        with torch.inference_mode():
+            t_llm0 = perf_counter()
+            llm_logits = self.llm.score_logits(valid_claims, all_llm_evidences).to(
+                self.device
+            )
+            t_llm1 = perf_counter()
+
+            if self.debug:
+                logger.info(
+                    f"[fusion_inference] batch llm_done | elapsed_ms={1000.0 * (t_llm1 - t_llm0):.2f}"
+                )
+
+            retrieval_encoded = self.retrieval_encoder(retrieval_features)
+            fusion_output = self.fusion(llm_logits, retrieval_encoded)
+
+            probs_batch = fusion_output.final_probs
+            pred_ids = torch.argmax(probs_batch, dim=-1).cpu().numpy()
+            confidences = torch.max(probs_batch, dim=-1)[0].cpu().numpy()
+
+        for v_idx, text, llm_ev, links, pred_id, conf in zip(
+            valid_indices,
+            valid_claims,
+            all_llm_evidences,
+            all_source_links,
+            pred_ids,
+            confidences,
+        ):
+            pred_label = self.label_list[pred_id]
+            if pred_id == 0:
+                verdict = "Đúng"
+            elif pred_id == 1:
+                verdict = "Sai"
+            else:
+                verdict = "Chưa chắc chắn"
+            results[v_idx] = ClaimPrediction(
+                claim=text,
+                verdict=verdict,
+                label=pred_label,
+                label_id=int(pred_id),
+                confidence=float(conf),
+                evidence=llm_ev,
+                source_links=links,
+            )
+
+        if self.debug:
+            logger.info(
+                f"[fusion_inference] _predict_batch_without_split done | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
+            )
+
+        return [r for r in results if r is not None]
 
     def predict(self, claim: str) -> ClaimPrediction:
         t0 = perf_counter()
@@ -605,83 +823,41 @@ class FusionClaimVerifier:
         if not text:
             raise ValueError("Claim is empty.")
 
-        sub_claims = self.split_long_claim(text)
+        sub_claims = self._prepare_sub_claims(text)
         if len(sub_claims) > 1:
             if self.debug:
                 logger.info(
                     f"[fusion_inference] splitting claim into {len(sub_claims)} sub-claims"
                 )
-
-            sub_preds = self.predict_batch(sub_claims)
-
-            has_sai = False
-            has_chua_chac_chan = False
-            all_evidence = []
-            all_source_links = []
-
-            avg_conf = (
-                sum(p.confidence for p in sub_preds) / len(sub_preds)
-                if sub_preds
-                else 0.0
+            sub_preds = self._predict_batch_without_split(sub_claims)
+            aggregated = self._aggregate_sub_claim_predictions(
+                text, sub_preds, sub_claim_count=len(sub_claims)
             )
-
-            for p in sub_preds:
-                if p.verdict == "Sai":
-                    has_sai = True
-                elif p.verdict == "Chưa chắc chắn":
-                    has_chua_chac_chan = True
-
-                all_evidence.extend(p.evidence)
-                for link in p.source_links:
-                    if link not in all_source_links:
-                        all_source_links.append(link)
-
-            if has_sai:
-                final_verdict = "Sai"
-                final_label = "Sai"
-                final_label_id = (
-                    self.label_list.index("Sai") if "Sai" in self.label_list else 1
-                )
-            elif has_chua_chac_chan:
-                final_verdict = "Chưa chắc chắn"
-                final_label = "Chưa chắc chắn"
-                final_label_id = (
-                    self.label_list.index("Chưa chắc chắn")
-                    if "Chưa chắc chắn" in self.label_list
-                    else 2
-                )
-            else:
-                final_verdict = "Đúng"
-                final_label = "Đúng"
-                final_label_id = (
-                    self.label_list.index("Đúng") if "Đúng" in self.label_list else 0
-                )
 
             if self.debug:
                 logger.info(
-                    f"[fusion_inference] done predict (aggregated) | verdict={final_verdict!r} | confidence={avg_conf:.6f} | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
+                    f"[fusion_inference] done predict (aggregated) | verdict={aggregated.verdict!r} | confidence={aggregated.confidence:.6f} | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
                 )
 
-            return ClaimPrediction(
-                claim=text,
-                verdict=final_verdict,
-                label=final_label,
-                label_id=final_label_id,
-                confidence=avg_conf,
-                evidence=all_evidence[: self.llm_evidence_top_k * len(sub_claims)],
-                source_links=all_source_links,
-            )
+            self._log_predictions_to_claims_index([aggregated])
+            return aggregated
+
+        model_text = sub_claims[0]
 
         now_utc = datetime.now(timezone.utc)
         if self.debug:
             logger.info(
                 f"[fusion_inference] start predict | now_utc={now_utc.isoformat()} | top_k={self.top_k} | llm_evidence_top_k={self.llm_evidence_top_k} | labels={self.label_list}"
             )
-            logger.info(f"[fusion_inference] claim_input={text!r}")
+            logger.info(f"[fusion_inference] claim_input={model_text!r}")
+            if model_text != text:
+                logger.info(f"[fusion_inference] original_claim={text!r}")
 
         t_retrieval0 = perf_counter()
         retrieval_features_np, retrieved_evidence, retrieval_results = (
-            _build_retrieval_features_train_compatible(self.retriever, text, self.top_k)
+            _build_retrieval_features_train_compatible(
+                self.retriever, model_text, self.top_k
+            )
         )
         t_retrieval1 = perf_counter()
 
@@ -756,7 +932,9 @@ class FusionClaimVerifier:
 
         with torch.inference_mode():
             t_llm0 = perf_counter()
-            llm_logits = self.llm.score_logits([text], [llm_evidence]).to(self.device)
+            llm_logits = self.llm.score_logits([model_text], [llm_evidence]).to(
+                self.device
+            )
             t_llm1 = perf_counter()
 
             if self.debug:
@@ -858,20 +1036,7 @@ class FusionClaimVerifier:
             source_links=source_links,
         )
 
-        # Log claim to OpenSearch 'claims' index (fire-and-forget)
-        threading.Thread(
-            target=self._log_claims_to_opensearch,
-            args=(
-                [
-                    {
-                        "claim": text,
-                        "verdict": verdict,
-                        "checked_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                ],
-            ),
-            daemon=True,
-        ).start()
+        self._log_predictions_to_claims_index([prediction])
 
         return prediction
 
@@ -880,98 +1045,58 @@ class FusionClaimVerifier:
         if not claims:
             return []
 
-        now_utc = datetime.now(timezone.utc)
-        if self.debug:
-            logger.info(
-                f"[fusion_inference] start predict_batch | batch_size={len(claims)} | now_utc={now_utc.isoformat()}"
-            )
-
-        all_retrieval_features = []
-        all_llm_evidences = []
-        all_source_links = []
-        valid_indices = []
-        valid_claims = []
-        results: List[Optional[ClaimPrediction]] = [None] * len(claims)
+        expanded: List[tuple[int, str, List[str]]] = []
+        flat_sub_claims: List[str] = []
+        total_sub_claims = 0
 
         for i, claim in enumerate(claims):
             text = str(claim).strip()
             if not text:
                 continue
+            sub_claims = self._prepare_sub_claims(text)
+            expanded.append((i, text, sub_claims))
+            flat_sub_claims.extend(sub_claims)
+            total_sub_claims += len(sub_claims)
 
-            valid_indices.append(i)
-            valid_claims.append(text)
-
-            feat, retrieved_evidence, retrieval_results = (
-                _build_retrieval_features_train_compatible(
-                    self.retriever, text, self.top_k
-                )
-            )
-            all_retrieval_features.append(feat)
-            all_llm_evidences.append(retrieved_evidence[: self.llm_evidence_top_k])
-
-            links = []
-            for r in retrieval_results[: self.llm_evidence_top_k]:
-                meta = r.metadata or {}
-                url = str(
-                    meta.get("article_url")
-                    or meta.get("url")
-                    or meta.get("link")
-                    or meta.get("source_url")
-                    or ""
-                ).strip()
-                if url and url not in links:
-                    links.append(url)
-            all_source_links.append(links)
-
-        if not valid_claims:
+        if not expanded:
             return []
 
-        retrieval_features = torch.tensor(
-            np.stack(all_retrieval_features), dtype=torch.float32, device=self.device
-        )
-
-        with torch.inference_mode():
-            t_llm0 = perf_counter()
-            llm_logits = self.llm.score_logits(valid_claims, all_llm_evidences).to(
-                self.device
+        if self.debug:
+            now_utc = datetime.now(timezone.utc)
+            split_count = sum(1 for _, _, subs in expanded if len(subs) > 1)
+            logger.info(
+                f"[fusion_inference] start predict_batch | batch_size={len(claims)} | valid_claims={len(expanded)} | split_claims={split_count} | total_sub_claims={total_sub_claims} | now_utc={now_utc.isoformat()}"
             )
-            t_llm1 = perf_counter()
 
-            if self.debug:
-                logger.info(
-                    f"[fusion_inference] batch llm_done | elapsed_ms={1000.0 * (t_llm1 - t_llm0):.2f}"
+        sub_predictions = self._predict_batch_without_split(flat_sub_claims)
+        results: List[Optional[ClaimPrediction]] = [None] * len(claims)
+        cursor = 0
+        for original_idx, original_claim, sub_claims in expanded:
+            count = len(sub_claims)
+            group_preds = sub_predictions[cursor : cursor + count]
+            cursor += count
+            if not group_preds:
+                continue
+
+            if count == 1:
+                p = group_preds[0]
+                results[original_idx] = ClaimPrediction(
+                    claim=original_claim,
+                    verdict=p.verdict,
+                    label=p.label,
+                    label_id=p.label_id,
+                    confidence=p.confidence,
+                    evidence=list(p.evidence),
+                    source_links=list(p.source_links),
+                )
+            else:
+                results[original_idx] = self._aggregate_sub_claim_predictions(
+                    original_claim, group_preds, sub_claim_count=count
                 )
 
-            retrieval_encoded = self.retrieval_encoder(retrieval_features)
-            fusion_output = self.fusion(llm_logits, retrieval_encoded)
-
-            probs_batch = fusion_output.final_probs
-            pred_ids = torch.argmax(probs_batch, dim=-1).cpu().numpy()
-            confidences = torch.max(probs_batch, dim=-1)[0].cpu().numpy()
-
-        for v_idx, text, llm_ev, links, pred_id, conf in zip(
-            valid_indices,
-            valid_claims,
-            all_llm_evidences,
-            all_source_links,
-            pred_ids,
-            confidences,
-        ):
-            pred_label = self.label_list[pred_id]
-            if pred_id == 0:
-                verdict = "Đúng"
-            elif pred_id == 1:
-                verdict = "Sai"
-            else:
-                verdict = "Chưa chắc chắn"
-            results[v_idx] = ClaimPrediction(
-                claim=text,
-                verdict=verdict,
-                label=pred_label,
-                label_id=int(pred_id),
-                confidence=float(conf),
-                evidence=llm_ev,
-                source_links=links,
+        if cursor != len(sub_predictions):
+            logger.warning(
+                f"[fusion_inference] predict_batch regroup mismatch: consumed={cursor}, produced={len(sub_predictions)}"
             )
 
         if self.debug:
@@ -980,22 +1105,7 @@ class FusionClaimVerifier:
             )
 
         final_results = [r for r in results if r is not None]
-
-        # Log all claims to OpenSearch 'claims' index (fire-and-forget)
-        threading.Thread(
-            target=self._log_claims_to_opensearch,
-            args=(
-                [
-                    {
-                        "claim": p.claim,
-                        "verdict": p.verdict,
-                        "checked_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    for p in final_results
-                ],
-            ),
-            daemon=True,
-        ).start()
+        self._log_predictions_to_claims_index(final_results)
 
         return final_results
 

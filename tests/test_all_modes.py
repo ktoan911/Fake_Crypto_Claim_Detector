@@ -83,7 +83,7 @@ def load_fusion_model(model_path, device, num_classes=None):
             from huggingface_hub import hf_hub_download
 
             logger.info(f"Downloading fusion model from HF repo {model_path}...")
-            model_path = hf_hub_download(repo_id=model_path, filename="fusion_model.pt")
+            model_path = hf_hub_download(repo_id=model_path, filename="model.pt")
         except Exception as exc:
             raise FileNotFoundError(
                 f"Cannot resolve fusion model path '{model_path}': {exc}"
