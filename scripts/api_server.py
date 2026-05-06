@@ -1,5 +1,10 @@
+import asyncio
+import hashlib
 import os
 import sys
+import threading
+import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -13,19 +18,51 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.database.opensearch import OpenSearchKB
 from src.models.fusion_inference import FusionClaimVerifier, _resolve_fusion_model_path
 
-# ── Global verifier (pre-warmed at startup) ─────────────────────────────────
+
+class _TTLCache:
+    """Thread-safe LRU cache với TTL, không cần thư viện ngoài."""
+
+    def __init__(self, maxsize: int = 500, ttl: float = 3600.0):
+        self._cache: OrderedDict = OrderedDict()
+        self._maxsize = maxsize
+        self._ttl = ttl
+        self._lock = threading.Lock()
+
+    def get(self, key: str):
+        with self._lock:
+            if key not in self._cache:
+                return None
+            value, ts = self._cache[key]
+            if time.monotonic() - ts > self._ttl:
+                del self._cache[key]
+                return None
+            self._cache.move_to_end(key)
+            return value
+
+    def set(self, key: str, value) -> None:
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+            elif len(self._cache) >= self._maxsize:
+                self._cache.popitem(last=False)
+            self._cache[key] = (value, time.monotonic())
+
+
+# ── Global state (khởi tạo trong lifespan) ──────────────────────────────────
 _verifier: FusionClaimVerifier | None = None
+_inference_sem: asyncio.Semaphore | None = None
+_claim_cache: _TTLCache = _TTLCache(maxsize=500, ttl=3600.0)
+_stats_kb: OpenSearchKB | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load the model once at container startup so requests never cold-start."""
-    global _verifier
+    """Load model và khởi tạo tài nguyên dùng chung một lần khi startup."""
+    global _verifier, _inference_sem, _stats_kb
+
     logger.info("[startup] Pre-warming FusionClaimVerifier …")
     try:
-        fusion_path = _resolve_fusion_model_path(
-            os.getenv("FUSION_MODEL")
-        )
+        fusion_path = _resolve_fusion_model_path(os.getenv("FUSION_MODEL"))
         _verifier = FusionClaimVerifier(
             fusion_model_path=fusion_path,
             opensearch_index=os.getenv("OPENSEARCH_INDEX_NAME")
@@ -43,9 +80,20 @@ async def lifespan(app: FastAPI):
         import traceback
 
         logger.error(f"[startup] Failed to load verifier:\n{traceback.format_exc()}")
-        # Keep _verifier = None; requests will return a clear error instead of hanging.
+        # _verifier = None; requests sẽ trả lỗi rõ ràng thay vì treo.
+
+    max_concurrent = int(os.getenv("MAX_CONCURRENT_INFERENCES", "1"))
+    _inference_sem = asyncio.Semaphore(max_concurrent)
+    logger.info(f"[startup] Inference semaphore: max_concurrent={max_concurrent}")
+
+    _stats_kb = OpenSearchKB(
+        index_name=os.getenv("OP_STATS_INDEX", "stats"),
+        embedding_dim=1,
+    )
+    logger.info("[startup] Stats OpenSearchKB connection ready ✓")
+
     yield
-    # shutdown: nothing to clean up
+
     logger.info("[shutdown] API server stopping.")
 
 
@@ -71,26 +119,49 @@ def health(request: Request):
 
 
 @app.post("/verify")
-def verify_claim(request: ClaimRequest, http_request: Request):
+async def verify_claim(request: ClaimRequest, http_request: Request):
     if _verifier is None:
-        import traceback
-
         return {
             "verdict": "Lỗi xử lý",
             "status": "error",
             "error": "Verifier chưa được khởi tạo (xem log startup để biết lý do).",
         }
+
+    domain = http_request.headers.get("host", "unknown")
+    logger.info(f"[verify] domain={domain} claim={request.claim!r}")
+
+    cache_key = hashlib.sha1(
+        request.claim.encode("utf-8", errors="replace")
+    ).hexdigest()
+
+    cached = _claim_cache.get(cache_key)
+    if cached is not None:
+        logger.info(f"[verify] cache_hit key={cache_key[:8]}…")
+        return cached
+
     try:
-        domain = http_request.headers.get("host", "unknown")
-        logger.info(f"[verify] domain={domain} claim={request.claim!r}")
-        prediction = _verifier.predict(request.claim)
-        return {
+        async with _inference_sem:
+            # Double-check sau khi lấy semaphore: request trước có thể đã cache rồi.
+            cached = _claim_cache.get(cache_key)
+            if cached is not None:
+                logger.info(f"[verify] cache_hit (post-sem) key={cache_key[:8]}…")
+                return cached
+
+            loop = asyncio.get_event_loop()
+            prediction = await loop.run_in_executor(
+                None, _verifier.predict, request.claim
+            )
+
+        result = {
             "verdict": prediction.verdict,
             "status": "success",
             "evidence": prediction.evidence,
             "source_links": prediction.source_links,
             "confidence": prediction.confidence,
         }
+        _claim_cache.set(cache_key, result)
+        return result
+
     except Exception as e:
         import traceback
 
@@ -104,33 +175,20 @@ def verify_claim(request: ClaimRequest, http_request: Request):
         }
 
 
-# ── Claims dashboard ────────────────────────────────────────────────────────
-
-
-def _get_stats_kb() -> OpenSearchKB:
-    """Return an OpenSearchKB pointed at the 'stats' index."""
-    return OpenSearchKB(
-        index_name=os.getenv("OP_STATS_INDEX", "stats"),
-        embedding_dim=1,  # không dùng vector search ở đây
-    )
-
-
 @app.get("/claims/stats")
-def claims_stats(date: str = None):
+async def claims_stats(date: str = None):
     """
     Đọc dữ liệu dashboard thống kê từ index 'stats'.
     - Input: `date` định dạng YYYY-MM-DD. Nếu không cung cấp, mặc định là ngày hôm nay theo giờ UTC.
     """
     try:
-        stats_kb = _get_stats_kb()
-        client = stats_kb.client
-        index = stats_kb.index
+        client = _stats_kb.client
+        index = _stats_kb.index
 
-        if date is None:
-            # mặc định lấy theo ngày hiện tại UTC
-            target_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        else:
-            target_date = date
+        target_date = (
+            date if date is not None
+            else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        )
 
         if not client.indices.exists(index=index):
             return {
@@ -142,25 +200,20 @@ def claims_stats(date: str = None):
             resp = client.get(index=index, id=target_date)
             return resp.get("_source", {})
         except Exception:
-            # Nếu không tìm thấy bằng id (404), có thể do ngày chưa được tính thì ưu tiên lấy cái lớn nhất hiện có
             logger.warning(
                 f"Stats for date {target_date} not found. Looking for the most recent stats..."
             )
             search_resp = client.search(
                 index=index,
-                body={
-                    "size": 1,
-                    "sort": [{"date": {"order": "desc"}}],
-                },
+                body={"size": 1, "sort": [{"date": {"order": "desc"}}]},
             )
             hits = search_resp.get("hits", {}).get("hits", [])
             if hits:
                 return hits[0]["_source"]
-            else:
-                return {
-                    "status": "error",
-                    "error": f"No stats data available in index '{index}'.",
-                }
+            return {
+                "status": "error",
+                "error": f"No stats data available in index '{index}'.",
+            }
 
     except Exception as e:
         import traceback

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any, List, Optional
 
 from loguru import logger
@@ -205,11 +206,9 @@ class LLMScorer:
             logger.debug(f"Label '{label}' -> token_id {tokens[0]}")
 
         self.prompt_template = prompt_template or PROMPT_TEMPLATE
+        self._inference_lock = threading.Lock()
         logger.info(f"LLMScorer initialized with model: {model_name}")
         logger.info(f"Label token IDs: {self.label_token_ids}")
-
-    def _build_prompt(self, text: str, evidence: str = "") -> str:
-        return self.prompt_template.format(claim=text, evidence=evidence)
 
     def score_logits(
         self, texts: List[str], evidences: Optional[List[Any]] = None
@@ -333,7 +332,9 @@ class LLMScorer:
             padded_attention_mask, dtype=torch.long, device=self.device
         )
 
-        with torch.no_grad():
+        # Lock serialises forward passes: _pre_hook/_post_hook mutate module.weight.data
+        # in-place (bf16 <-> fp32 upcast), which is not safe to run concurrently.
+        with self._inference_lock, torch.no_grad():
             outputs = self.model(input_ids=input_tensor, attention_mask=mask_tensor)
             # outputs.logits: [batch, seq_len, vocab_size]
 

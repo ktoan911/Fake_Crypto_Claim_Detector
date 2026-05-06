@@ -1,6 +1,7 @@
 # Datasets & crawled data
 data/
 results/
+docs/
 
 # Model weights
 models/lora_llm/
@@ -12,6 +13,7 @@ models/*.safetensors
 *.pth
 *.bin
 *.safetensors
+*.tex
 
 # Python
 __pycache__/

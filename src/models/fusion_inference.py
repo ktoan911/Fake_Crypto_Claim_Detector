@@ -14,6 +14,7 @@ from loguru import logger
 
 from src.config import LABEL_LIST, PROMPT_TEMPLATE
 from src.database.opensearch import OpenSearchKB
+from src.llm_call import split_claim
 from src.retrieval.retrieval import QueryExpander, RetrievalResult, TemporalScorer
 
 
@@ -246,7 +247,9 @@ class OpenSearchHybridRetriever:
         debug = _env_flag("FUSION_INFERENCE_DEBUG", default=False) or _env_flag(
             "FUSION_INFERENCE_LOG_ALL", default=False
         )
-        self.temporal_scorer.reference_date = datetime.now(timezone.utc)
+        # Do NOT set self.temporal_scorer.reference_date here — the property
+        # already returns datetime.now(timezone.utc) when _reference_date is None,
+        # and mutating a shared attribute is a race condition under concurrent requests.
 
         normalized_query = _normalize_query_text(query)
         if not normalized_query:
@@ -450,6 +453,15 @@ class FusionClaimVerifier:
         if llm_evidence_top_k is None:
             llm_evidence_top_k = int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "3"))
         self.llm_evidence_top_k = max(1, int(llm_evidence_top_k))
+        llm_batch_env = os.getenv("FUSION_LLM_INFER_BATCH_SIZE", "1")
+        try:
+            llm_infer_batch_size = int(llm_batch_env)
+        except ValueError:
+            llm_infer_batch_size = 1
+            logger.warning(
+                f"[fusion_inference] Invalid FUSION_LLM_INFER_BATCH_SIZE={llm_batch_env!r}, fallback to 1"
+            )
+        self.llm_infer_batch_size = max(1, llm_infer_batch_size)
         self.label_list = list(self.saved_config.get("label_list", LABEL_LIST))
         log_all = _env_flag("FUSION_INFERENCE_LOG_ALL", default=False)
         self.debug = (
@@ -592,13 +604,8 @@ class FusionClaimVerifier:
     # Claim splitting
     # ------------------------------------------------------------------
     def split_long_claim(self, claim: str) -> Optional[List[str]]:
-        """
-        TODO: Implement logic tách claim thành các ý nhỏ.
-        Bạn có thể trả về:
-        - List[str]: danh sách sub-claim
-        - None / []: để dùng fallback mặc định (không tách)
-        """
-        pass
+        return split_claim(claim)
+        # return [claim]
 
     def _prepare_sub_claims(self, claim: str) -> List[str]:
         """
@@ -665,7 +672,9 @@ class FusionClaimVerifier:
         if has_sai:
             final_verdict = "Sai"
             final_label = "Sai"
-            final_label_id = self.label_list.index("Sai") if "Sai" in self.label_list else 1
+            final_label_id = (
+                self.label_list.index("Sai") if "Sai" in self.label_list else 1
+            )
         elif has_chua_chac_chan:
             final_verdict = "Chưa chắc chắn"
             final_label = "Chưa chắc chắn"
@@ -677,7 +686,9 @@ class FusionClaimVerifier:
         else:
             final_verdict = "Đúng"
             final_label = "Đúng"
-            final_label_id = self.label_list.index("Đúng") if "Đúng" in self.label_list else 0
+            final_label_id = (
+                self.label_list.index("Đúng") if "Đúng" in self.label_list else 0
+            )
 
         max_evidence = self.llm_evidence_top_k * max(1, int(sub_claim_count))
         return ClaimPrediction(
@@ -719,100 +730,115 @@ class FusionClaimVerifier:
         now_utc = datetime.now(timezone.utc)
         if self.debug:
             logger.info(
-                f"[fusion_inference] start _predict_batch_without_split | batch_size={len(claims)} | now_utc={now_utc.isoformat()}"
+                f"[fusion_inference] start _predict_batch_without_split | batch_size={len(claims)} | llm_infer_batch_size={self.llm_infer_batch_size} | now_utc={now_utc.isoformat()}"
             )
 
-        all_retrieval_features = []
-        all_llm_evidences = []
-        all_source_links = []
-        valid_indices = []
-        valid_claims = []
+        valid_items: List[tuple[int, str]] = []
         results: List[Optional[ClaimPrediction]] = [None] * len(claims)
 
         for i, claim in enumerate(claims):
             text = str(claim).strip()
             if not text:
                 continue
+            valid_items.append((i, text))
 
-            valid_indices.append(i)
-            valid_claims.append(text)
-
-            feat, retrieved_evidence, retrieval_results = (
-                _build_retrieval_features_train_compatible(
-                    self.retriever, text, self.top_k
-                )
-            )
-            all_retrieval_features.append(feat)
-            all_llm_evidences.append(retrieved_evidence[: self.llm_evidence_top_k])
-
-            links = []
-            for r in retrieval_results[: self.llm_evidence_top_k]:
-                meta = r.metadata or {}
-                url = str(
-                    meta.get("article_url")
-                    or meta.get("url")
-                    or meta.get("link")
-                    or meta.get("source_url")
-                    or ""
-                ).strip()
-                if url and url not in links:
-                    links.append(url)
-            all_source_links.append(links)
-
-        if not valid_claims:
+        if not valid_items:
             return []
 
-        retrieval_features = torch.tensor(
-            np.stack(all_retrieval_features), dtype=torch.float32, device=self.device
-        )
+        total_llm_ms = 0.0
 
         with torch.inference_mode():
-            t_llm0 = perf_counter()
-            llm_logits = self.llm.score_logits(valid_claims, all_llm_evidences).to(
-                self.device
-            )
-            t_llm1 = perf_counter()
+            for start in range(0, len(valid_items), self.llm_infer_batch_size):
+                batch = valid_items[start : start + self.llm_infer_batch_size]
+                valid_indices = []
+                valid_claims = []
+                all_retrieval_features = []
+                all_llm_evidences = []
+                all_source_links = []
 
-            if self.debug:
-                logger.info(
-                    f"[fusion_inference] batch llm_done | elapsed_ms={1000.0 * (t_llm1 - t_llm0):.2f}"
+                for idx, text in batch:
+                    valid_indices.append(idx)
+                    valid_claims.append(text)
+
+                    feat, retrieved_evidence, retrieval_results = (
+                        _build_retrieval_features_train_compatible(
+                            self.retriever, text, self.top_k
+                        )
+                    )
+                    all_retrieval_features.append(feat)
+                    all_llm_evidences.append(
+                        retrieved_evidence[: self.llm_evidence_top_k]
+                    )
+
+                    links = []
+                    for r in retrieval_results[: self.llm_evidence_top_k]:
+                        meta = r.metadata or {}
+                        url = str(
+                            meta.get("article_url")
+                            or meta.get("url")
+                            or meta.get("link")
+                            or meta.get("source_url")
+                            or ""
+                        ).strip()
+                        if url and url not in links:
+                            links.append(url)
+                    all_source_links.append(links)
+
+                retrieval_features = torch.tensor(
+                    np.stack(all_retrieval_features),
+                    dtype=torch.float32,
+                    device=self.device,
                 )
 
-            retrieval_encoded = self.retrieval_encoder(retrieval_features)
-            fusion_output = self.fusion(llm_logits, retrieval_encoded)
+                t_llm0 = perf_counter()
+                llm_logits = self.llm.score_logits(valid_claims, all_llm_evidences).to(
+                    self.device
+                )
+                t_llm1 = perf_counter()
+                total_llm_ms += 1000.0 * (t_llm1 - t_llm0)
 
-            probs_batch = fusion_output.final_probs
-            pred_ids = torch.argmax(probs_batch, dim=-1).cpu().numpy()
-            confidences = torch.max(probs_batch, dim=-1)[0].cpu().numpy()
+                retrieval_encoded = self.retrieval_encoder(retrieval_features)
+                fusion_output = self.fusion(llm_logits, retrieval_encoded)
 
-        for v_idx, text, llm_ev, links, pred_id, conf in zip(
-            valid_indices,
-            valid_claims,
-            all_llm_evidences,
-            all_source_links,
-            pred_ids,
-            confidences,
-        ):
-            pred_label = self.label_list[pred_id]
-            if pred_id == 0:
-                verdict = "Đúng"
-            elif pred_id == 1:
-                verdict = "Sai"
-            else:
-                verdict = "Chưa chắc chắn"
-            results[v_idx] = ClaimPrediction(
-                claim=text,
-                verdict=verdict,
-                label=pred_label,
-                label_id=int(pred_id),
-                confidence=float(conf),
-                evidence=llm_ev,
-                source_links=links,
-            )
+                probs_batch = fusion_output.final_probs
+                pred_ids = torch.argmax(probs_batch, dim=-1).cpu().tolist()
+                confidences = torch.max(probs_batch, dim=-1)[0].cpu().tolist()
+
+                for v_idx, text, llm_ev, links, pred_id, conf in zip(
+                    valid_indices,
+                    valid_claims,
+                    all_llm_evidences,
+                    all_source_links,
+                    pred_ids,
+                    confidences,
+                ):
+                    pred_id_int = int(pred_id)
+                    pred_label = self.label_list[pred_id_int]
+                    if pred_id_int == 0:
+                        verdict = "Đúng"
+                    elif pred_id_int == 1:
+                        verdict = "Sai"
+                    else:
+                        verdict = "Chưa chắc chắn"
+                    results[v_idx] = ClaimPrediction(
+                        claim=text,
+                        verdict=verdict,
+                        label=pred_label,
+                        label_id=pred_id_int,
+                        confidence=float(conf),
+                        evidence=llm_ev,
+                        source_links=links,
+                    )
+
+                del retrieval_features
+                del llm_logits
+                del retrieval_encoded
+                del fusion_output
+                del probs_batch
 
         if self.debug:
             logger.info(
-                f"[fusion_inference] _predict_batch_without_split done | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
+                f"[fusion_inference] _predict_batch_without_split done | llm_elapsed_ms={total_llm_ms:.2f} | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
             )
 
         return [r for r in results if r is not None]
@@ -1150,9 +1176,7 @@ def verify_claim_true_false(
     )
 
     # Resolve fusion model: env FUSION_MODEL overrides default local path
-    resolved_fusion_path = _resolve_fusion_model_path(
-        os.getenv("FUSION_MODEL")
-    )
+    resolved_fusion_path = _resolve_fusion_model_path(os.getenv("FUSION_MODEL"))
     # Resolve LLM: env LLM_FINETUNE overrides saved config
     resolved_llm_path = llm_model_path or os.getenv("LLM_FINETUNE")
 

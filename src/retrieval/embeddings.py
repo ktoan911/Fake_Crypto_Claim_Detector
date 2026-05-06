@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from typing import Dict, List, Union
 
 import numpy as np
@@ -23,15 +22,6 @@ try:
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
-
-
-@dataclass
-class TripletSample:
-    """Container for triplet training sample"""
-
-    anchor: str  # Query
-    positive: str  # Matching scam pattern
-    negatives: List[str]  # List of non-matching samples (hard + random)
 
 
 # PyTorch-based classes (only available if torch is installed)

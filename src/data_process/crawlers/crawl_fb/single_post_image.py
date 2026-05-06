@@ -1,7 +1,6 @@
 import requests
 import json
 import os
-import uuid
 import time
 from dotenv import load_dotenv
 

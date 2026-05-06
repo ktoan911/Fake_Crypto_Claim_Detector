@@ -44,6 +44,8 @@ URLS_TO_CRAWL = [
     "https://mof.gov.vn/webcenter/portal/btc/r/tc/ttsk",
     "https://cic.gov.vn",
     # --- Ngân hàng (Cập nhật link mới) ---
+    "https://tapchinganhang.gov.vn/",
+    "https://thoibaonganhang.vn/",
     "https://www.vietinbank.vn/vn/tin-tuc/",
     "https://bidv.com.vn/vn/tin-tuc-su-kien",
     "https://www.agribank.com.vn/vn/ve-agribank/tin-tuc-su-kien",
@@ -174,13 +176,6 @@ def normalize_article_url(raw_url: str) -> str:
     parsed = urlparse(raw_url)
     cleaned = parsed._replace(fragment="")
     return cleaned.geturl()
-
-
-def should_skip_href(href: str) -> bool:
-    href_lower = href.lower().strip()
-    if not href_lower:
-        return True
-    return href_lower.startswith(("mailto:", "tel:", "#"))
 
 
 def extract_link_candidates(link, base_url: str) -> list[str]:

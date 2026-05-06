@@ -230,10 +230,6 @@ def _resolve_lora_target_modules(model) -> List[str]:
     )
 
 
-def _build_prompt(claim: str, evidence: str, template: str) -> str:
-    return template.format(claim=claim, evidence=evidence)
-
-
 def _normalize_label(label_value) -> str:
     if isinstance(label_value, (int, float)):
         idx = int(label_value)
