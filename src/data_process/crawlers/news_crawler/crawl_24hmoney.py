@@ -13,9 +13,7 @@ Tham số chính
 --workers         : số luồng song song khi tải nội dung bài (mặc định 4)
 --delay           : giây nghỉ giữa mỗi request (mặc định 0.3)
 --timeout         : timeout mỗi request (mặc định 20 giây)
---predict-workers : số luồng song song khi predict + insert OpenSearch (mặc định 2)
-
-Luồng xử lý: cào song song → predict song song (FusionClaimVerifier) → bulk-insert OP_CLAIMS_INDEX
+Luồng xử lý: sitemap → lọc tiêu đề → _predict_batch_without_split (1 lần) → bulk-insert OP_CLAIMS_INDEX
 """
 
 import argparse
@@ -404,15 +402,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Giây nghỉ giữa mỗi request")
     p.add_argument("--timeout", type=int, default=20, metavar="SEC",
                    help="Timeout mỗi request (giây)")
-    p.add_argument("--predict-workers", type=int, default=2, metavar="N",
-                   help="Số luồng song song khi predict và insert vào OpenSearch")
-    # ── Benchmark flags ──────────────────────────────────────────────────────
     p.add_argument("--benchmark", action="store_true",
-                   help="Chạy benchmark tìm workers tối ưu thay vì pipeline thật")
-    p.add_argument("--benchmark-simulate-ms", type=float, default=500, metavar="MS",
-                   help="Độ trễ giả lập mỗi lần predict khi benchmark (ms)")
-    p.add_argument("--benchmark-no-lock", action="store_true",
-                   help="Benchmark predict không dùng lock (upper-bound lý thuyết)")
+                   help="Chạy benchmark tìm crawl workers tối ưu thay vì pipeline thật")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -430,8 +421,6 @@ def main() -> None:
         run_benchmark(
             hours_back=args.hours_back,
             limit=args.limit if args.limit > 0 else 20,
-            simulate_ms=args.benchmark_simulate_ms,
-            no_lock=args.benchmark_no_lock,
         )
         return
 
@@ -445,7 +434,7 @@ def main() -> None:
 
     articles = crawler.crawl()
 
-    result = predict_and_index(articles, predict_workers=args.predict_workers)
+    result = predict_and_index(articles)
     print(
         f"\nKết quả: insert {result.get('inserted', 0)} / {len(articles)} bài "
         f"vào OpenSearch (lỗi: {result.get('errors', 0)})."
