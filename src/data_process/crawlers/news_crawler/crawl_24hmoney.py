@@ -270,8 +270,8 @@ def _load_verifier():
 
 def predict_and_index(articles: list[dict]) -> dict:
     """
-    Gọi _predict_batch_without_split trên toàn bộ tiêu đề một lần,
-    rồi bulk-insert kết quả vào OP_CLAIMS_INDEX.
+    Xử lý theo mini-batch (llm_infer_batch_size): predict xong batch nào
+    thì insert ngay batch đó vào OP_CLAIMS_INDEX, không chờ toàn bộ.
     """
     from src.database.opensearch import OpenSearchKB  # noqa: PLC0415
 
@@ -281,44 +281,54 @@ def predict_and_index(articles: list[dict]) -> dict:
         return {"inserted": 0, "errors": 0}
 
     verifier = _load_verifier()
-
-    arts, titles = zip(*valid)
-    LOGGER.info("Predict batch %d tiêu đề ...", len(titles))
-    preds = verifier._predict_batch_without_split(list(titles))
-
-    checked_at = datetime.now(timezone.utc).isoformat()
-    docs = [
-        {
-            "id": str(uuid.uuid4()),
-            "claim": title,
-            "verdict": pred.verdict,
-            "confidence": pred.confidence,
-            "evidence": pred.evidence,
-            "source_links": pred.source_links,
-            "checked_at": checked_at,
-            "source": "24hmoney",
-            "url": art.get("url", ""),
-            "published_at": art.get("published_at"),
-        }
-        for art, title, pred in zip(arts, titles, preds)
-        if pred is not None
-    ]
-
-    LOGGER.info("Predict xong: %d / %d tiêu đề có kết quả.", len(docs), len(titles))
-
-    if not docs:
-        LOGGER.warning("Không có doc nào để insert vào OpenSearch.")
-        return {"inserted": 0, "errors": 0}
-
     kb = OpenSearchKB(index_name=os.getenv("OP_CLAIMS_INDEX", "claims"), embedding_dim=1)
-    result = kb.insert_many(docs, upsert=True)
-    LOGGER.info(
-        "Đã insert %d docs vào index '%s'. Lỗi: %d.",
-        result.get("inserted", 0),
-        kb.index,
-        result.get("errors", 0),
-    )
-    return result
+    batch_size = getattr(verifier, "llm_infer_batch_size", 4)
+
+    total_inserted = 0
+    total_errors = 0
+
+    for start in range(0, len(valid), batch_size):
+        mini = valid[start : start + batch_size]
+        mini_arts, mini_titles = zip(*mini)
+
+        LOGGER.info(
+            "Predict mini-batch %d–%d / %d ...",
+            start + 1, start + len(mini), len(valid),
+        )
+        preds = verifier._predict_batch_without_split(list(mini_titles))
+
+        checked_at = datetime.now(timezone.utc).isoformat()
+        docs = [
+            {
+                "id": str(uuid.uuid4()),
+                "claim": title,
+                "verdict": pred.verdict,
+                "confidence": pred.confidence,
+                "evidence": pred.evidence,
+                "source_links": pred.source_links,
+                "checked_at": checked_at,
+                "source": "24hmoney",
+                "url": art.get("url", ""),
+                "published_at": art.get("published_at"),
+            }
+            for art, title, pred in zip(mini_arts, mini_titles, preds)
+            if pred is not None
+        ]
+
+        if not docs:
+            continue
+
+        result = kb.insert_many(docs, upsert=True)
+        ins = result.get("inserted", 0)
+        err = result.get("errors", 0)
+        total_inserted += ins
+        total_errors += err
+        LOGGER.info(
+            "Batch %d–%d: inserted=%d errors=%d",
+            start + 1, start + len(mini), ins, err,
+        )
+
+    return {"inserted": total_inserted, "errors": total_errors}
 
 
 _CRAWL_WORKER_OPTIONS = [1, 2, 4, 8, 12]

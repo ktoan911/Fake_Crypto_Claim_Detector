@@ -143,13 +143,19 @@ def _token_overlap_ratio(query_text: str, doc_text: str) -> float:
 
 
 def _build_retrieval_features_train_compatible(
-    retriever: Any, text: str, top_k: int, rrf_top_k: int = 100
+    retriever: Any,
+    text: str,
+    top_k: int,
+    rrf_top_k: int = 100,
+    precomputed_vector: Optional[List[float]] = None,
 ) -> tuple[np.ndarray, List[str], List[RetrievalResult]]:
     """
     Same feature construction used in training:
     [score, rrf_score, recency_score, cyclicity_score] for top_k docs.
     """
-    results = retriever.retrieve(text, top_k=top_k, rrf_top_k=rrf_top_k)
+    results = retriever.retrieve(
+        text, top_k=top_k, rrf_top_k=rrf_top_k, precomputed_vector=precomputed_vector
+    )
     features = []
     evidence_texts = []
 
@@ -236,6 +242,17 @@ class OpenSearchHybridRetriever:
         )[0]
         return vector.astype(np.float32).tolist()
 
+    def batch_encode(self, queries: List[str]) -> List[List[float]]:
+        """Encode nhiều queries trong một lần gọi — nhanh hơn N lần gọi đơn lẻ."""
+        vectors = self.encoder.encode(
+            queries,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+            show_progress_bar=False,
+            batch_size=min(len(queries), 32),
+        )
+        return [v.astype(np.float32).tolist() for v in vectors]
+
     def retrieve(
         self,
         query: str,
@@ -244,6 +261,7 @@ class OpenSearchHybridRetriever:
         expand_query: bool = True,
         use_semantic: bool = True,
         rrf_top_k: int = 20,
+        precomputed_vector: Optional[List[float]] = None,
     ) -> List[RetrievalResult]:
         debug = _env_flag("FUSION_INFERENCE_DEBUG", default=False) or _env_flag(
             "FUSION_INFERENCE_LOG_ALL", default=False
@@ -287,7 +305,11 @@ class OpenSearchHybridRetriever:
 
         vector_hits = []
         if semantic_enabled:
-            query_vec = self._encode_query(expanded_query)
+            query_vec = (
+                precomputed_vector
+                if precomputed_vector is not None
+                else self._encode_query(expanded_query)
+            )
             vector_hits = self.kb.search_vector(
                 query_vector=query_vec,
                 k=search_pool_k,
@@ -757,12 +779,18 @@ class FusionClaimVerifier:
                 all_llm_evidences = []
                 all_source_links = []
 
+                # Pre-batch encode tất cả queries trong một lần gọi SentenceTransformer
+                batch_texts_list = [text for _, text in batch]
+                batch_vectors = self.retriever.batch_encode(batch_texts_list)
+                vec_map: dict[str, List[float]] = dict(zip(batch_texts_list, batch_vectors))
+
                 def _retrieve_one(
                     item: Tuple[int, str],
                 ) -> Tuple[int, str, Any, List[str], List[str]]:
                     _idx, _text = item
                     _feat, _evidence, _results = _build_retrieval_features_train_compatible(
-                        self.retriever, _text, self.top_k
+                        self.retriever, _text, self.top_k,
+                        precomputed_vector=vec_map.get(_text),
                     )
                     _links: List[str] = []
                     for _r in _results[: self.llm_evidence_top_k]:
