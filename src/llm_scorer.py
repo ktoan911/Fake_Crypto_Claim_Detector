@@ -83,20 +83,29 @@ class LLMScorer:
                     return candidate
 
         def _load_tokenizer(model_path: str):
-            # NOTE:
-            # transformers>=5 with some fast tokenizers (e.g. Qwen2) may still call
-            # Hub APIs during tokenizer init (model_info), even when local files exist.
-            # Force slow tokenizer to keep CPU/offline inference stable.
-            kwargs = {"trust_remote_code": False, "use_fast": False}
-            try:
-                return AutoTokenizer.from_pretrained(model_path, **kwargs)
-            except Exception as exc:
-                logger.warning(
-                    f"Tokenizer online load failed ({exc}). Retrying with local cache only."
-                )
-                return AutoTokenizer.from_pretrained(
-                    model_path, local_files_only=True, **kwargs
-                )
+            # Try slow tokenizer first (avoids some Hub API calls at init time).
+            # Qwen2/Qwen3 repos often only ship tokenizer.json (fast only) and
+            # lack vocab.json, causing vocab_file=None with use_fast=False → TypeError.
+            # Fall back to fast tokenizer in that case.
+            for use_fast in (False, True):
+                kwargs = {"trust_remote_code": False, "use_fast": use_fast}
+                try:
+                    return AutoTokenizer.from_pretrained(model_path, **kwargs)
+                except TypeError:
+                    # vocab_file=None → Qwen2/Qwen3 slow tokenizer not supported
+                    if not use_fast:
+                        continue
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        f"Tokenizer load failed (use_fast={use_fast}, {exc}). "
+                        f"{'Retrying with fast tokenizer.' if not use_fast else 'Retrying with local cache.'}"
+                    )
+                    if not use_fast:
+                        continue
+                    return AutoTokenizer.from_pretrained(
+                        model_path, local_files_only=True, **kwargs
+                    )
 
         def _load_causal_lm(model_path: str):
 
