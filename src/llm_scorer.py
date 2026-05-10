@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any, List, Optional
 
@@ -83,16 +84,30 @@ class LLMScorer:
                     return candidate
 
         def _load_tokenizer(model_path: str):
-            # Try slow tokenizer first (avoids some Hub API calls at init time).
-            # Qwen2/Qwen3 repos often only ship tokenizer.json (fast only) and
-            # lack vocab.json, causing vocab_file=None with use_fast=False → TypeError.
-            # Fall back to fast tokenizer in that case.
+            import json as _json
+
+            # transformers ≥ 4.47 expects extra_special_tokens to be a dict.
+            # Some fine-tuned Qwen repos serialise it as a list → AttributeError on .keys().
+            # Patch the cached tokenizer_config.json in-place once.
+            _tcfg = os.path.join(model_path, "tokenizer_config.json")
+            if os.path.isfile(_tcfg):
+                try:
+                    with open(_tcfg) as _f:
+                        _cfg = _json.load(_f)
+                    if isinstance(_cfg.get("extra_special_tokens"), list):
+                        _cfg["extra_special_tokens"] = {}
+                        with open(_tcfg, "w") as _f:
+                            _json.dump(_cfg, _f, indent=2)
+                except Exception:
+                    pass
+
+            # Try slow tokenizer first; fall back to fast for Qwen2/Qwen3 which
+            # ship only tokenizer.json and lack vocab.json (vocab_file=None → TypeError).
             for use_fast in (False, True):
                 kwargs = {"trust_remote_code": False, "use_fast": use_fast}
                 try:
                     return AutoTokenizer.from_pretrained(model_path, **kwargs)
                 except TypeError:
-                    # vocab_file=None → Qwen2/Qwen3 slow tokenizer not supported
                     if not use_fast:
                         continue
                     raise
