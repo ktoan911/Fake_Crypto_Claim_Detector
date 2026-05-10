@@ -23,11 +23,10 @@ import logging
 import os
 import re
 import sys
-import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -235,16 +234,17 @@ class Crawl24HMoneyV2:
             LOGGER.warning("Không có bài nào phù hợp với bộ lọc.")
             return []
 
-        LOGGER.info("Tải nội dung %d bài với %d luồng song song ...", len(candidates), self.workers)
-        articles: list[dict] = []
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            futures = {executor.submit(self._fetch_article, entry): entry for entry in candidates}
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    articles.append(result)
+        articles = [
+            {
+                "title": (entry.get("title") or entry["url"]).strip(),
+                "url": entry["url"],
+                "published_at": entry.get("published_at"),
+            }
+            for entry in candidates
+            if (entry.get("title") or "").strip()
+        ]
 
-        LOGGER.info("Crawl hoàn thành: %d bài viết hợp lệ", len(articles))
+        LOGGER.info("Crawl hoàn thành: %d tiêu đề từ sitemap", len(articles))
         return articles
 
 
@@ -267,65 +267,49 @@ def _load_verifier():
     )
 
 
-def _predict_one(verifier, lock: threading.Lock, article: dict) -> Optional[dict]:
-    """Predict một bài, trả về doc sẵn sàng insert hoặc None nếu lỗi."""
-    claim_text = (article.get("title") or "").strip()
-    if not claim_text:
-        return None
-    with lock:
-        try:
-            pred = verifier.predict(claim_text)
-        except Exception as exc:
-            LOGGER.warning("Lỗi predict '%s…': %s", claim_text[:60], exc)
-            return None
-    return {
-        "id": str(uuid.uuid4()),
-        "claim": claim_text,
-        "verdict": pred.verdict,
-        "confidence": pred.confidence,
-        "evidence": pred.evidence,
-        "source_links": pred.source_links,
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-        "source": "24hmoney",
-        "url": article.get("url", ""),
-        "published_at": article.get("published_at"),
-    }
-
-
-def predict_and_index(articles: list[dict], predict_workers: int = 2) -> dict:
+def predict_and_index(articles: list[dict]) -> dict:
     """
-    Chạy fact-check song song trên danh sách bài đã cào,
-    rồi bulk-insert toàn bộ vào OP_CLAIMS_INDEX.
+    Gọi _predict_batch_without_split trên toàn bộ tiêu đề một lần,
+    rồi bulk-insert kết quả vào OP_CLAIMS_INDEX.
     """
     from src.database.opensearch import OpenSearchKB  # noqa: PLC0415
 
-    if not articles:
-        LOGGER.warning("Danh sách bài rỗng, không có gì để predict.")
+    valid = [(art, art["title"].strip()) for art in articles if (art.get("title") or "").strip()]
+    if not valid:
+        LOGGER.warning("Không có tiêu đề hợp lệ để predict.")
         return {"inserted": 0, "errors": 0}
 
     verifier = _load_verifier()
-    lock = threading.Lock()  # bảo vệ model forward pass khỏi race condition
 
-    docs: list[dict] = []
-    LOGGER.info("Bắt đầu predict %d bài với %d luồng ...", len(articles), predict_workers)
+    arts, titles = zip(*valid)
+    LOGGER.info("Predict batch %d tiêu đề ...", len(titles))
+    preds = verifier._predict_batch_without_split(list(titles))
 
-    with ThreadPoolExecutor(max_workers=predict_workers) as executor:
-        futures = {executor.submit(_predict_one, verifier, lock, art): art for art in articles}
-        for future in as_completed(futures):
-            doc = future.result()
-            if doc:
-                docs.append(doc)
+    checked_at = datetime.now(timezone.utc).isoformat()
+    docs = [
+        {
+            "id": str(uuid.uuid4()),
+            "claim": title,
+            "verdict": pred.verdict,
+            "confidence": pred.confidence,
+            "evidence": pred.evidence,
+            "source_links": pred.source_links,
+            "checked_at": checked_at,
+            "source": "24hmoney",
+            "url": art.get("url", ""),
+            "published_at": art.get("published_at"),
+        }
+        for art, title, pred in zip(arts, titles, preds)
+        if pred is not None
+    ]
 
-    LOGGER.info("Predict xong: %d / %d bài có kết quả.", len(docs), len(articles))
+    LOGGER.info("Predict xong: %d / %d tiêu đề có kết quả.", len(docs), len(titles))
 
     if not docs:
         LOGGER.warning("Không có doc nào để insert vào OpenSearch.")
         return {"inserted": 0, "errors": 0}
 
-    kb = OpenSearchKB(
-        index_name=os.getenv("OP_CLAIMS_INDEX", "claims"),
-        embedding_dim=1,
-    )
+    kb = OpenSearchKB(index_name=os.getenv("OP_CLAIMS_INDEX", "claims"), embedding_dim=1)
     result = kb.insert_many(docs, upsert=True)
     LOGGER.info(
         "Đã insert %d docs vào index '%s'. Lỗi: %d.",
@@ -337,7 +321,6 @@ def predict_and_index(articles: list[dict], predict_workers: int = 2) -> dict:
 
 
 _CRAWL_WORKER_OPTIONS = [1, 2, 4, 8, 12]
-_PREDICT_WORKER_OPTIONS = [1, 2, 4, 6, 8]
 _SEP = "─" * 64
 
 
@@ -384,98 +367,25 @@ def _benchmark_crawl(hours_back: float, limit: int) -> tuple[list[dict], int]:
     return best_articles, best_row[0]
 
 
-def _benchmark_predict(articles: list[dict], simulate_ms: float, use_lock: bool) -> int:
-    """
-    Phase 2: đo thông lượng predict giả lập với từng mức predict_workers.
-
-    use_lock=True  giống _predict_one thực tế (lock bảo vệ model forward pass).
-    use_lock=False upper-bound nếu model hoàn toàn thread-safe.
-    Trả về best_workers.
-    """
-    lock_label = "có lock – thực tế" if use_lock else "không lock – upper-bound"
-    print(f"\n{'═'*64}")
-    print(f"PHASE 2 – Predict workers  (simulate={simulate_ms:.0f} ms/bài, {lock_label})")
-    print(_SEP)
-    print(f"{'Workers':>8} │ {'Predicted':>9} │ {'Time (s)':>9} │ {'Art/s':>8} │ Speedup vs 1")
-    print(_SEP)
-
-    lock = threading.Lock()
-    rows: list[tuple[int, int, float, float]] = []
-
-    for w in _PREDICT_WORKER_OPTIONS:
-        def _task(art: dict, _lock: bool = use_lock) -> dict:
-            doc = {
-                "id": str(uuid.uuid4()),
-                "claim": art.get("title", ""),
-                "verdict": "Chưa chắc chắn",
-                "confidence": 0.5,
-                "evidence": [],
-                "source_links": [],
-                "checked_at": datetime.now(timezone.utc).isoformat(),
-                "source": "24hmoney",
-                "url": art.get("url", ""),
-                "published_at": art.get("published_at"),
-            }
-            if _lock:
-                with lock:
-                    time.sleep(simulate_ms / 1000)
-            else:
-                time.sleep(simulate_ms / 1000)
-            return doc
-
-        t0 = time.perf_counter()
-        docs: list[dict] = []
-        with ThreadPoolExecutor(max_workers=w) as executor:
-            futures = [executor.submit(_task, art) for art in articles]
-            for future in as_completed(futures):
-                docs.append(future.result())
-        elapsed = time.perf_counter() - t0
-        rate = len(docs) / elapsed if elapsed > 0 else 0.0
-
-        baseline = rows[0][3] if rows else rate
-        speedup = rate / baseline if baseline > 0 else 1.0
-        print(f"{w:>8} │ {len(docs):>9} │ {elapsed:>9.2f} │ {rate:>8.2f} │ {speedup:>8.2f}x")
-        rows.append((w, len(docs), elapsed, rate))
-
-    best_row = max(rows, key=lambda r: r[3])
-    note = " (lock tuần tự → 1-2 workers là đủ)" if use_lock else " (song song thực sự)"
-    print(_SEP)
-    print(f"✅ Tối ưu predict: --predict-workers {best_row[0]}  ({best_row[3]:.2f} bài/giây){note}")
-    return best_row[0]
-
-
-def run_benchmark(hours_back: float, limit: int, simulate_ms: float, no_lock: bool) -> None:
-    """Chạy toàn bộ benchmark và in khuyến nghị cuối."""
-    use_lock = not no_lock
+def run_benchmark(hours_back: float, limit: int) -> None:
+    """Benchmark crawl workers và in khuyến nghị."""
     print("=" * 64)
-    print("  BENCHMARK: 24hmoney crawler + predict workers")
-    print(f"  simulate_ms={simulate_ms:.0f}  lock={use_lock}  article_limit={limit}")
+    print("  BENCHMARK: 24hmoney crawl workers")
+    print(f"  hours_back={hours_back}  article_limit={limit}")
     print("=" * 64)
 
-    articles, best_crawl_w = _benchmark_crawl(hours_back, limit)
-
-    if not articles:
-        # Không cào được → dùng dummy để vẫn benchmark predict
-        articles = [
-            {"title": f"Tin tài chính #{i}: cổ phiếu tăng mạnh bất thường", "url": "", "published_at": None}
-            for i in range(max(limit, 10))
-        ]
-        print(f"\n⚠️  Không lấy được bài thực; dùng {len(articles)} dummy articles cho Phase 2.")
-
-    best_predict_w = _benchmark_predict(articles, simulate_ms, use_lock)
+    _, best_crawl_w = _benchmark_crawl(hours_back, limit)
 
     print(f"\n{'═'*64}")
     print("KHUYẾN NGHỊ SỬ DỤNG")
     print(_SEP)
     print("  python -m src.data_process.crawlers.news_crawler.crawl_24hmoney \\")
     print(f"      --workers {best_crawl_w} \\")
-    print(f"      --predict-workers {best_predict_w} \\")
     print("      --hours-back 2")
     print()
     print("Ghi chú:")
-    print("  • Crawl workers  : I/O-bound → nhiều workers = nhanh hơn (đến giới hạn mạng)")
-    print("  • Predict workers: bị lock serializing → 1-2 workers thường là tối ưu")
-    print("  • Chạy lại với --benchmark-no-lock để xem upper-bound nếu model thread-safe")
+    print("  • Crawl workers : I/O-bound → nhiều workers nhanh hơn (đến giới hạn mạng)")
+    print("  • Predict        : batch một lần duy nhất, không có tham số workers")
     print(_SEP)
 
 
