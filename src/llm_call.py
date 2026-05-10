@@ -9,10 +9,18 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
-client = OpenAI(
-    api_key=os.getenv("OPENAI_KEY"),
-    base_url="https://senator-gigolo-stark.ngrok-free.dev/v1",
-)
+
+_client: OpenAI | None = None
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            api_key=os.getenv("OPENAI_KEY"),
+            base_url="https://senator-gigolo-stark.ngrok-free.dev/v1",
+        )
+    return _client
 
 SYSTEM_PROMPT_EXTRACTION = "You are an information extraction expert."
 
@@ -130,7 +138,7 @@ def generate_cluster_content_with_llm(
 
     cluster_all = build_prompt_summary_cluster(cluster_claims, representative_claim)
 
-    response = client.chat.completions.create(
+    response = _get_client().chat.completions.create(
         model="vip",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT_TOPIC},
@@ -165,7 +173,7 @@ def split_claim(claim: str) -> List[str]:
         prompt = build_prompt_extraction(claim)
 
         for attempt in range(3):
-            response = client.chat.completions.create(
+            response = _get_client().chat.completions.create(
                 model="vip",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},
