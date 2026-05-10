@@ -92,7 +92,6 @@ def generate_mock_claims(num_claims=100):
             "claim": random.choice(templates),
             "verdict": random.choice(verdicts),
             "checked_at": past_time.isoformat(),
-            "evidence": ["Nguồn bịa đặt", "Nguồn tham khảo phụ"],
         }
         claims.append(doc)
 

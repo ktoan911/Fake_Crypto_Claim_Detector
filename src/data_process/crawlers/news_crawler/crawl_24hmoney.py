@@ -1,19 +1,56 @@
+"""
+Crawler bài viết 24hmoney.vn (v2)
+----------------------------------
+Nguồn index: sitemap-news.xml
+
+Chỉ lấy tin tức chứng khoán, ngân hàng và tài chính Việt Nam.
+Các danh mục được phép cào cố định trong ALLOWED_CATEGORY_IDS.
+
+Tham số chính
+-------------
+--hours-back      : lấy bài đăng trong N giờ gần nhất (mặc định 2)
+--limit           : tối đa bao nhiêu bài (mặc định 0 = không giới hạn)
+--workers         : số luồng song song khi tải nội dung bài (mặc định 4)
+--delay           : giây nghỉ giữa mỗi request (mặc định 0.3)
+--timeout         : timeout mỗi request (mặc định 20 giây)
+--predict-workers : số luồng song song khi predict + insert OpenSearch (mặc định 2)
+
+Luồng xử lý: cào song song → predict song song (FusionClaimVerifier) → bulk-insert OP_CLAIMS_INDEX
+"""
+
 import argparse
-import json
 import logging
 import os
 import re
-from datetime import datetime
-from typing import Any, Optional
-from urllib.parse import urljoin, urlparse
+import sys
+import threading
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
 
+# Thư mục gốc project (4 cấp trên file này)
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "https://24hmoney.vn/"
+SITEMAP_URL = "https://24hmoney.vn/sitemap-news.xml"
+
+ALLOWED_CATEGORY_IDS: frozenset[str] = frozenset({"1", "4", "27", "30", "50", "81"})
+
+NS = {
+    "sm": "http://www.sitemaps.org/schemas/sitemap/0.9",
+    "news": "http://www.google.com/schemas/sitemap-news/0.9",
+}
+
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,450 +60,486 @@ DEFAULT_HEADERS = {
     "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8",
 }
 
-BLOCKED_PATH_HINTS = {
-    "/dang-nhap",
-    "/dang-ky",
-    "/login",
-    "/register",
-    "/privacy",
-    "/gioi-thieu",
-    "/lien-he",
-    "/rss",
-}
-
-ARTICLE_CONTENT_SELECTORS = [
-    "article",
-    "main article",
+CONTENT_SELECTORS = [
+    ".content-detail",
     ".article-content",
     ".post-content",
-    ".content-detail",
     ".news-content",
-    ".entry-content",
+    "article",
     "main",
 ]
 
-DATE_META_SELECTORS = [
-    "meta[property='article:published_time']",
-    "meta[name='publishdate']",
-    "meta[name='pubdate']",
-    "meta[itemprop='datePublished']",
-    "time[datetime]",
-]
-
-DATE_TEXT_SELECTORS = [
-    "time",
-    ".date",
-    ".post-date",
-    ".publish-date",
-    ".article-date",
-]
-
-TOPIC_META_SELECTORS = [
-    "meta[property='article:section']",
-    "meta[name='news_keywords']",
-    "meta[name='keywords']",
-]
-
-TOPIC_LINK_SELECTORS = [
-    "a[rel='category tag']",
-    ".breadcrumb a",
-    ".tags a",
-    ".post-tags a",
-    ".article-tags a",
-]
-
-DATE_PATTERNS = [
-    re.compile(r"\b(\d{4}-\d{2}-\d{2})\b"),
-    re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b"),
-    re.compile(r"\b(\d{1,2}-\d{1,2}-\d{4})\b"),
-]
+URL_CAT_RE = re.compile(r"/news/[^/]+-c(\d+)a\d+\.html")
 
 
-def _normalize_url(raw_url: str) -> str:
-    parsed = urlparse(raw_url)
-    cleaned = parsed._replace(fragment="")
-    return cleaned.geturl()
+def _extract_category_id(url: str) -> Optional[str]:
+    m = URL_CAT_RE.search(url)
+    return m.group(1) if m else None
 
 
-def _is_same_domain(base_netloc: str, candidate_netloc: str) -> bool:
-    base = base_netloc.lower().replace("www.", "")
-    candidate = candidate_netloc.lower().replace("www.", "")
-    return candidate == base or candidate.endswith(f".{base}")
-
-
-def _looks_like_article(path: str) -> bool:
-    if not path or path == "/":
-        return False
-
-    path_lower = path.lower()
-    if any(hint in path_lower for hint in BLOCKED_PATH_HINTS):
-        return False
-
-    if path_lower.endswith((
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".svg",
-        ".pdf",
-        ".zip",
-        ".css",
-        ".js",
-    )):
-        return False
-
-    segments = [s for s in path_lower.split("/") if s]
-    if not segments:
-        return False
-
-    if len(segments) >= 2:
-        return True
-
-    last = segments[-1]
-    return "-" in last or any(char.isdigit() for char in last)
-
-
-def _parse_date(date_raw: str) -> Optional[str]:
-    text = (date_raw or "").strip()
-    if not text:
+def _parse_iso(date_str: str) -> Optional[datetime]:
+    if not date_str:
+        return None
+    text = date_str.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
         return None
 
-    text = text.replace("Z", "+00:00")
-    text = re.sub(r"\s+", " ", text).strip()
 
-    try:
-        return datetime.fromisoformat(text).isoformat()
-    except ValueError:
-        pass
+def _now_utc() -> datetime:
+    return datetime.now(tz=timezone.utc)
 
-    for fmt in (
-        "%Y-%m-%d",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M:%S.%f",
-        "%d/%m/%Y",
-        "%d-%m-%Y",
-        "%d/%m/%Y %H:%M",
-        "%d-%m-%Y %H:%M",
-        "%d/%m/%Y %H:%M:%S",
-        "%d-%m-%Y %H:%M:%S",
+
+def _to_unix(dt: Optional[datetime]) -> Optional[int]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+class Crawl24HMoneyV2:
+    def __init__(
+        self,
+        hours_back: float = 24.0,
+        limit: int = 50,
+        workers: int = 4,
+        delay: float = 0.3,
+        timeout: int = 20,
     ):
-        try:
-            dt = datetime.strptime(text, fmt)
-            return dt.isoformat()
-        except ValueError:
-            continue
-
-    for pattern in DATE_PATTERNS:
-        match = pattern.search(text)
-        if not match:
-            continue
-        candidate = match.group(1)
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                dt = datetime.strptime(candidate, fmt)
-                return dt.isoformat()
-            except ValueError:
-                continue
-
-    return None
-
-
-def _split_keywords(raw: str) -> list[str]:
-    if not raw:
-        return []
-    parts = re.split(r"[,;|/]", raw)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _as_list(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    return [value]
-
-
-def _normalize_topic_value(value: Any) -> list[str]:
-    topics: list[str] = []
-    for item in _as_list(value):
-        if isinstance(item, dict):
-            name = item.get("name") or item.get("@id") or item.get("headline")
-            if isinstance(name, str):
-                topics.extend(_split_keywords(name))
-        elif isinstance(item, str):
-            topics.extend(_split_keywords(item))
-    return topics
-
-
-class Crawl24HMoney:
-    def __init__(self, base_url: str = DEFAULT_BASE_URL, timeout: int = 20):
-        self.base_url = base_url.rstrip("/") + "/"
+        self.hours_back = hours_back
+        self.limit = limit  # 0 = unlimited
+        self.workers = workers
+        self.delay = delay
         self.timeout = timeout
+
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
-        self.base_netloc = urlparse(self.base_url).netloc
 
-    def _fetch_soup(self, url: str) -> BeautifulSoup:
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
-        response.encoding = response.apparent_encoding
-        return BeautifulSoup(response.text, "html.parser")
+    def _fetch_bytes(self, url: str) -> bytes:
+        resp = self.session.get(url, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.content
 
-    def _extract_article_links(self, soup: BeautifulSoup, link_limit: int) -> list[str]:
-        links: list[str] = []
-        seen: set[str] = set()
+    def _parse_sitemap(self, xml_bytes: bytes) -> list[dict]:
+        root = ET.fromstring(xml_bytes)
+        entries: list[dict] = []
+        for url_el in root.findall("sm:url", NS):
+            loc = url_el.findtext("sm:loc", namespaces=NS) or ""
+            pub_date_raw = url_el.findtext(
+                "news:news/news:publication_date", namespaces=NS
+            ) or ""
+            title = url_el.findtext("news:news/news:title", namespaces=NS) or ""
+            dt = _parse_iso(pub_date_raw)
+            entries.append(
+                {
+                    "url": loc,
+                    "title": title,
+                    "published_at_dt": dt,
+                    "published_at": _to_unix(dt),
+                    "category_id": _extract_category_id(loc),
+                }
+            )
+        return entries
 
-        for anchor in soup.select("a[href]"):
-            href = anchor.get("href", "").strip()
-            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+    def _get_candidate_urls(self) -> list[dict]:
+        LOGGER.info("Đang tải sitemap từ %s", SITEMAP_URL)
+        try:
+            xml_bytes = self._fetch_bytes(SITEMAP_URL)
+        except Exception as exc:
+            LOGGER.error("Không tải được sitemap: %s", exc)
+            return []
+
+        entries = self._parse_sitemap(xml_bytes)
+        LOGGER.info("Sitemap có %d bài viết", len(entries))
+
+        cutoff = _now_utc() - timedelta(hours=self.hours_back)
+        LOGGER.info("Lọc bài đăng sau %s (%.1f giờ gần nhất)", cutoff.isoformat(), self.hours_back)
+
+        filtered: list[dict] = []
+        for entry in entries:
+            dt = entry["published_at_dt"]
+            if dt is None:
                 continue
-
-            full_url = _normalize_url(urljoin(self.base_url, href))
-            parsed = urlparse(full_url)
-
-            if parsed.scheme not in ("http", "https"):
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt < cutoff:
                 continue
-
-            if not _is_same_domain(self.base_netloc, parsed.netloc):
+            if entry["category_id"] not in ALLOWED_CATEGORY_IDS:
                 continue
+            filtered.append(entry)
 
-            if not _looks_like_article(parsed.path):
-                continue
+        filtered.sort(key=lambda e: e["published_at"] or 0, reverse=True)
 
-            if full_url in seen:
-                continue
+        if self.limit > 0:
+            filtered = filtered[: self.limit]
 
-            seen.add(full_url)
-            links.append(full_url)
+        LOGGER.info("Còn %d bài sau khi lọc", len(filtered))
+        return filtered
 
-            if len(links) >= link_limit:
-                break
+    def _fetch_article(self, entry: dict) -> dict:
+        url = entry["url"]
+        time.sleep(self.delay)
+        try:
+            resp = self.session.get(url, timeout=self.timeout)
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            soup = BeautifulSoup(resp.text, "html.parser")
+        except Exception as exc:
+            LOGGER.debug("Lỗi khi tải %s: %s", url, exc)
+            return {}
 
-        return links
+        return {
+            "title": self._extract_title(soup, entry.get("title") or url),
+            "content": self._extract_content(soup),
+            "url": url,
+            "published_at": entry.get("published_at"),
+        }
 
-    def _extract_title(self, soup: BeautifulSoup, fallback_url: str) -> str:
-        og_title = soup.select_one("meta[property='og:title']")
-        if og_title and og_title.get("content"):
-            return og_title.get("content", "").strip()
-
+    def _extract_title(self, soup: BeautifulSoup, fallback: str) -> str:
+        og = soup.select_one("meta[property='og:title']")
+        if og and og.get("content"):
+            return og["content"].strip()
         h1 = soup.select_one("h1")
         if h1:
-            title = h1.get_text(strip=True)
-            if title:
-                return title
-
+            t = h1.get_text(strip=True)
+            if t:
+                return t
         if soup.title and soup.title.string:
             return soup.title.string.strip()
-
-        return fallback_url
-
-    def _extract_json_ld_items(self, soup: BeautifulSoup) -> list[dict]:
-        items: list[dict] = []
-        for node in soup.select("script[type='application/ld+json']"):
-            raw = (node.string or node.get_text() or "").strip()
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
-            if isinstance(data, dict) and isinstance(data.get("@graph"), list):
-                for entry in data["@graph"]:
-                    if isinstance(entry, dict):
-                        items.append(entry)
-                continue
-
-            if isinstance(data, list):
-                for entry in data:
-                    if isinstance(entry, dict):
-                        items.append(entry)
-                continue
-
-            if isinstance(data, dict):
-                items.append(data)
-        return items
-
-    def _extract_published_at(self, soup: BeautifulSoup) -> Optional[str]:
-        json_ld_items = self._extract_json_ld_items(soup)
-        for item in json_ld_items:
-            for key in ("datePublished", "dateModified", "uploadDate", "dateCreated"):
-                raw = item.get(key)
-                if isinstance(raw, str):
-                    parsed = _parse_date(raw)
-                    if parsed:
-                        return parsed
-
-        for selector in DATE_META_SELECTORS:
-            node = soup.select_one(selector)
-            if not node:
-                continue
-
-            raw = (
-                node.get("content")
-                or node.get("datetime")
-                or node.get_text(strip=True)
-            )
-            parsed = _parse_date(raw)
-            if parsed:
-                return parsed
-
-        for selector in DATE_TEXT_SELECTORS:
-            node = soup.select_one(selector)
-            if not node:
-                continue
-            parsed = _parse_date(node.get_text(" ", strip=True))
-            if parsed:
-                return parsed
-
-        return None
-
-    def _extract_topics(self, soup: BeautifulSoup) -> list[str]:
-        topics: list[str] = []
-        seen: set[str] = set()
-
-        def _add(values: list[str]) -> None:
-            for value in values:
-                cleaned = re.sub(r"\s+", " ", value).strip()
-                if not cleaned:
-                    continue
-                key = cleaned.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                topics.append(cleaned)
-
-        json_ld_items = self._extract_json_ld_items(soup)
-        for item in json_ld_items:
-            _add(_normalize_topic_value(item.get("articleSection")))
-            _add(_normalize_topic_value(item.get("keywords")))
-            _add(_normalize_topic_value(item.get("about")))
-            _add(_normalize_topic_value(item.get("genre")))
-
-        for selector in TOPIC_META_SELECTORS:
-            node = soup.select_one(selector)
-            if not node:
-                continue
-            _add(_split_keywords(node.get("content", "")))
-
-        for selector in TOPIC_LINK_SELECTORS:
-            for node in soup.select(selector):
-                text = node.get_text(" ", strip=True)
-                _add(_split_keywords(text))
-
-        filtered: list[str] = []
-        for topic in topics:
-            if len(topic) < 2:
-                continue
-            if topic.lower() in {"home", "trang chủ"}:
-                continue
-            filtered.append(topic)
-
-        return filtered[:10]
+        return fallback
 
     def _extract_content(self, soup: BeautifulSoup) -> str:
-        best_text = ""
-
-        for selector in ARTICLE_CONTENT_SELECTORS:
-            section = soup.select_one(selector)
-            if not section:
+        best = ""
+        for sel in CONTENT_SELECTORS:
+            node = soup.select_one(sel)
+            if not node:
                 continue
-
-            for tag in section(["script", "style", "noscript", "header", "footer", "nav"]):
+            for tag in node(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
                 tag.decompose()
+            text = node.get_text("\n", strip=True)
+            if len(text) > len(best):
+                best = text
 
-            text = section.get_text("\n", strip=True)
-            if len(text) > len(best_text):
-                best_text = text
-
-        if len(best_text) < 150 and soup.body:
-            body = soup.body
-            for tag in body(["script", "style", "noscript", "header", "footer", "nav"]):
+        if len(best) < 200 and soup.body:
+            for tag in soup.body(["script", "style", "noscript", "header", "footer", "nav"]):
                 tag.decompose()
-            best_text = body.get_text("\n", strip=True)
+            best = soup.body.get_text("\n", strip=True)
 
-        best_text = re.sub(r"\n{3,}", "\n\n", best_text).strip()
-        return best_text
+        return re.sub(r"\n{3,}", "\n\n", best).strip()
 
-    def crawl(self, limit: int = 20) -> list[dict]:
-        LOGGER.info("Đang crawl danh sách từ %s", self.base_url)
-        listing_soup = self._fetch_soup(self.base_url)
+    def crawl(self) -> list[dict]:
+        candidates = self._get_candidate_urls()
+        if not candidates:
+            LOGGER.warning("Không có bài nào phù hợp với bộ lọc.")
+            return []
 
-        # Thu rộng hơn để tránh hụt do có nhiều link menu/quảng cáo.
-        candidate_links = self._extract_article_links(listing_soup, link_limit=max(limit * 20, 100))
-        LOGGER.info("Tìm thấy %d link nghi ngờ là bài viết", len(candidate_links))
-
+        LOGGER.info("Tải nội dung %d bài với %d luồng song song ...", len(candidates), self.workers)
         articles: list[dict] = []
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {executor.submit(self._fetch_article, entry): entry for entry in candidates}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    articles.append(result)
 
-        for link in candidate_links:
-            if len(articles) >= limit:
-                break
-
-            try:
-                article_soup = self._fetch_soup(link)
-            except Exception as exc:
-                LOGGER.debug("Bỏ qua link lỗi %s: %s", link, exc)
-                continue
-
-            content = self._extract_content(article_soup)
-            if len(content) < 300:
-                continue
-
-            article = {
-                "source": "24hmoney.vn",
-                "url": link,
-                "title": self._extract_title(article_soup, link),
-                "published_at": self._extract_published_at(article_soup),
-                "topics": self._extract_topics(article_soup),
-                "content": content,
-                "crawled_at": datetime.utcnow().isoformat() + "Z",
-            }
-            articles.append(article)
-
-        LOGGER.info("Crawl thành công %d bài", len(articles))
+        LOGGER.info("Crawl hoàn thành: %d bài viết hợp lệ", len(articles))
         return articles
 
 
-def save_to_json(articles: list[dict], output_path: str) -> None:
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as file_obj:
-        json.dump(articles, file_obj, ensure_ascii=False, indent=2)
+def _load_verifier():
+    """Khởi tạo FusionClaimVerifier từ biến môi trường (giống api_server.py)."""
+    from src.models.fusion_inference import (  # noqa: PLC0415
+        FusionClaimVerifier,
+        _resolve_fusion_model_path,
+    )
+
+    fusion_path = _resolve_fusion_model_path(os.getenv("FUSION_MODEL"))
+    return FusionClaimVerifier(
+        fusion_model_path=fusion_path,
+        opensearch_index=os.getenv("OPENSEARCH_INDEX_NAME") or os.getenv("OP_KB_NAME", "news_kb"),
+        llm_model_path=os.getenv("LLM_FINETUNE"),
+        retriever_model_path=os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding"),
+        device=os.getenv("DEVICE", "cpu"),
+        llm_evidence_top_k=int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "3")),
+        debug=False,
+    )
+
+
+def _predict_one(verifier, lock: threading.Lock, article: dict) -> Optional[dict]:
+    """Predict một bài, trả về doc sẵn sàng insert hoặc None nếu lỗi."""
+    claim_text = (article.get("title") or "").strip()
+    if not claim_text:
+        return None
+    with lock:
+        try:
+            pred = verifier.predict(claim_text)
+        except Exception as exc:
+            LOGGER.warning("Lỗi predict '%s…': %s", claim_text[:60], exc)
+            return None
+    return {
+        "id": str(uuid.uuid4()),
+        "claim": claim_text,
+        "verdict": pred.verdict,
+        "confidence": pred.confidence,
+        "evidence": pred.evidence,
+        "source_links": pred.source_links,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "source": "24hmoney",
+        "url": article.get("url", ""),
+        "published_at": article.get("published_at"),
+    }
+
+
+def predict_and_index(articles: list[dict], predict_workers: int = 2) -> dict:
+    """
+    Chạy fact-check song song trên danh sách bài đã cào,
+    rồi bulk-insert toàn bộ vào OP_CLAIMS_INDEX.
+    """
+    from src.database.opensearch import OpenSearchKB  # noqa: PLC0415
+
+    if not articles:
+        LOGGER.warning("Danh sách bài rỗng, không có gì để predict.")
+        return {"inserted": 0, "errors": 0}
+
+    verifier = _load_verifier()
+    lock = threading.Lock()  # bảo vệ model forward pass khỏi race condition
+
+    docs: list[dict] = []
+    LOGGER.info("Bắt đầu predict %d bài với %d luồng ...", len(articles), predict_workers)
+
+    with ThreadPoolExecutor(max_workers=predict_workers) as executor:
+        futures = {executor.submit(_predict_one, verifier, lock, art): art for art in articles}
+        for future in as_completed(futures):
+            doc = future.result()
+            if doc:
+                docs.append(doc)
+
+    LOGGER.info("Predict xong: %d / %d bài có kết quả.", len(docs), len(articles))
+
+    if not docs:
+        LOGGER.warning("Không có doc nào để insert vào OpenSearch.")
+        return {"inserted": 0, "errors": 0}
+
+    kb = OpenSearchKB(
+        index_name=os.getenv("OP_CLAIMS_INDEX", "claims"),
+        embedding_dim=1,
+    )
+    result = kb.insert_many(docs, upsert=True)
+    LOGGER.info(
+        "Đã insert %d docs vào index '%s'. Lỗi: %d.",
+        result.get("inserted", 0),
+        kb.index,
+        result.get("errors", 0),
+    )
+    return result
+
+
+_CRAWL_WORKER_OPTIONS = [1, 2, 4, 8, 12]
+_PREDICT_WORKER_OPTIONS = [1, 2, 4, 6, 8]
+_SEP = "─" * 64
+
+
+def _benchmark_crawl(hours_back: float, limit: int) -> tuple[list[dict], int]:
+    """
+    Phase 1: đo tốc độ cào với từng mức crawl_workers.
+    Trả về (articles từ lần chạy có rate cao nhất, best_workers).
+    """
+    print(f"\n{'═'*64}")
+    print("PHASE 1 – Crawl workers  (request thực tới 24hmoney.vn)")
+    print(_SEP)
+    print(f"{'Workers':>8} │ {'Fetched':>7} │ {'Time (s)':>9} │ {'Art/s':>8} │ Speedup vs 1")
+    print(_SEP)
+
+    rows: list[tuple[int, int, float, float]] = []
+    best_articles: list[dict] = []
+
+    for w in _CRAWL_WORKER_OPTIONS:
+        crawler = Crawl24HMoneyV2(hours_back=hours_back, limit=limit, workers=w, delay=0.1, timeout=15)
+        t0 = time.perf_counter()
+        try:
+            articles = crawler.crawl()
+            elapsed = time.perf_counter() - t0
+            rate = len(articles) / elapsed if elapsed > 0 else 0.0
+        except Exception as exc:
+            elapsed = time.perf_counter() - t0
+            articles = []
+            rate = 0.0
+            print(f"{w:>8} │  ERROR: {exc}")
+            rows.append((w, 0, elapsed, 0.0))
+            continue
+
+        baseline = rows[0][3] if rows else rate
+        speedup = rate / baseline if baseline > 0 else 1.0
+        print(f"{w:>8} │ {len(articles):>7} │ {elapsed:>9.2f} │ {rate:>8.2f} │ {speedup:>8.2f}x")
+        rows.append((w, len(articles), elapsed, rate))
+
+        if not best_articles or rate >= max(r[3] for r in rows):
+            best_articles = articles
+
+    best_row = max(rows, key=lambda r: r[3])
+    print(_SEP)
+    print(f"✅ Tối ưu crawl : --workers {best_row[0]}  ({best_row[3]:.2f} bài/giây)")
+    return best_articles, best_row[0]
+
+
+def _benchmark_predict(articles: list[dict], simulate_ms: float, use_lock: bool) -> int:
+    """
+    Phase 2: đo thông lượng predict giả lập với từng mức predict_workers.
+
+    use_lock=True  giống _predict_one thực tế (lock bảo vệ model forward pass).
+    use_lock=False upper-bound nếu model hoàn toàn thread-safe.
+    Trả về best_workers.
+    """
+    lock_label = "có lock – thực tế" if use_lock else "không lock – upper-bound"
+    print(f"\n{'═'*64}")
+    print(f"PHASE 2 – Predict workers  (simulate={simulate_ms:.0f} ms/bài, {lock_label})")
+    print(_SEP)
+    print(f"{'Workers':>8} │ {'Predicted':>9} │ {'Time (s)':>9} │ {'Art/s':>8} │ Speedup vs 1")
+    print(_SEP)
+
+    lock = threading.Lock()
+    rows: list[tuple[int, int, float, float]] = []
+
+    for w in _PREDICT_WORKER_OPTIONS:
+        def _task(art: dict, _lock: bool = use_lock) -> dict:
+            doc = {
+                "id": str(uuid.uuid4()),
+                "claim": art.get("title", ""),
+                "verdict": "Chưa chắc chắn",
+                "confidence": 0.5,
+                "evidence": [],
+                "source_links": [],
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "source": "24hmoney",
+                "url": art.get("url", ""),
+                "published_at": art.get("published_at"),
+            }
+            if _lock:
+                with lock:
+                    time.sleep(simulate_ms / 1000)
+            else:
+                time.sleep(simulate_ms / 1000)
+            return doc
+
+        t0 = time.perf_counter()
+        docs: list[dict] = []
+        with ThreadPoolExecutor(max_workers=w) as executor:
+            futures = [executor.submit(_task, art) for art in articles]
+            for future in as_completed(futures):
+                docs.append(future.result())
+        elapsed = time.perf_counter() - t0
+        rate = len(docs) / elapsed if elapsed > 0 else 0.0
+
+        baseline = rows[0][3] if rows else rate
+        speedup = rate / baseline if baseline > 0 else 1.0
+        print(f"{w:>8} │ {len(docs):>9} │ {elapsed:>9.2f} │ {rate:>8.2f} │ {speedup:>8.2f}x")
+        rows.append((w, len(docs), elapsed, rate))
+
+    best_row = max(rows, key=lambda r: r[3])
+    note = " (lock tuần tự → 1-2 workers là đủ)" if use_lock else " (song song thực sự)"
+    print(_SEP)
+    print(f"✅ Tối ưu predict: --predict-workers {best_row[0]}  ({best_row[3]:.2f} bài/giây){note}")
+    return best_row[0]
+
+
+def run_benchmark(hours_back: float, limit: int, simulate_ms: float, no_lock: bool) -> None:
+    """Chạy toàn bộ benchmark và in khuyến nghị cuối."""
+    use_lock = not no_lock
+    print("=" * 64)
+    print("  BENCHMARK: 24hmoney crawler + predict workers")
+    print(f"  simulate_ms={simulate_ms:.0f}  lock={use_lock}  article_limit={limit}")
+    print("=" * 64)
+
+    articles, best_crawl_w = _benchmark_crawl(hours_back, limit)
+
+    if not articles:
+        # Không cào được → dùng dummy để vẫn benchmark predict
+        articles = [
+            {"title": f"Tin tài chính #{i}: cổ phiếu tăng mạnh bất thường", "url": "", "published_at": None}
+            for i in range(max(limit, 10))
+        ]
+        print(f"\n⚠️  Không lấy được bài thực; dùng {len(articles)} dummy articles cho Phase 2.")
+
+    best_predict_w = _benchmark_predict(articles, simulate_ms, use_lock)
+
+    print(f"\n{'═'*64}")
+    print("KHUYẾN NGHỊ SỬ DỤNG")
+    print(_SEP)
+    print("  python -m src.data_process.crawlers.news_crawler.crawl_24hmoney \\")
+    print(f"      --workers {best_crawl_w} \\")
+    print(f"      --predict-workers {best_predict_w} \\")
+    print("      --hours-back 2")
+    print()
+    print("Ghi chú:")
+    print("  • Crawl workers  : I/O-bound → nhiều workers = nhanh hơn (đến giới hạn mạng)")
+    print("  • Predict workers: bị lock serializing → 1-2 workers thường là tối ưu")
+    print("  • Chạy lại với --benchmark-no-lock để xem upper-bound nếu model thread-safe")
+    print(_SEP)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Crawler 24hmoney.vn – lấy bài viết mới nhất theo khoảng thời gian",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--hours-back", type=float, default=2.0, metavar="N",
+                   help="Lấy bài đăng trong N giờ gần nhất")
+    p.add_argument("--limit", type=int, default=0, metavar="N",
+                   help="Số bài tối đa (0 = không giới hạn)")
+    p.add_argument("--workers", type=int, default=4, metavar="N",
+                   help="Số luồng song song khi tải nội dung")
+    p.add_argument("--delay", type=float, default=0.3, metavar="SEC",
+                   help="Giây nghỉ giữa mỗi request")
+    p.add_argument("--timeout", type=int, default=20, metavar="SEC",
+                   help="Timeout mỗi request (giây)")
+    p.add_argument("--predict-workers", type=int, default=2, metavar="N",
+                   help="Số luồng song song khi predict và insert vào OpenSearch")
+    # ── Benchmark flags ──────────────────────────────────────────────────────
+    p.add_argument("--benchmark", action="store_true",
+                   help="Chạy benchmark tìm workers tối ưu thay vì pipeline thật")
+    p.add_argument("--benchmark-simulate-ms", type=float, default=500, metavar="MS",
+                   help="Độ trễ giả lập mỗi lần predict khi benchmark (ms)")
+    p.add_argument("--benchmark-no-lock", action="store_true",
+                   help="Benchmark predict không dùng lock (upper-bound lý thuyết)")
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Crawler tin tức từ 24hmoney.vn")
-    parser.add_argument("--url", default=DEFAULT_BASE_URL, help="Trang bắt đầu crawl")
-    parser.add_argument("--limit", type=int, default=20, help="Số bài viết tối đa")
-    parser.add_argument(
-        "--output",
-        default="data/24hmoney_news.json",
-        help="Đường dẫn file JSON đầu ra",
-    )
-    parser.add_argument("--timeout", type=int, default=20, help="Timeout request (giây)")
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Mức log",
-    )
-    args = parser.parse_args()
+    args = build_arg_parser().parse_args()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    crawler = Crawl24HMoney(base_url=args.url, timeout=args.timeout)
-    articles = crawler.crawl(limit=args.limit)
-    save_to_json(articles, args.output)
+    if args.benchmark:
+        run_benchmark(
+            hours_back=args.hours_back,
+            limit=args.limit if args.limit > 0 else 20,
+            simulate_ms=args.benchmark_simulate_ms,
+            no_lock=args.benchmark_no_lock,
+        )
+        return
 
-    print(f"Đã lưu {len(articles)} bài viết vào: {args.output}")
+    crawler = Crawl24HMoneyV2(
+        hours_back=args.hours_back,
+        limit=args.limit,
+        workers=args.workers,
+        delay=args.delay,
+        timeout=args.timeout,
+    )
+
+    articles = crawler.crawl()
+
+    result = predict_and_index(articles, predict_workers=args.predict_workers)
+    print(
+        f"\nKết quả: insert {result.get('inserted', 0)} / {len(articles)} bài "
+        f"vào OpenSearch (lỗi: {result.get('errors', 0)})."
+    )
 
 
 if __name__ == "__main__":
