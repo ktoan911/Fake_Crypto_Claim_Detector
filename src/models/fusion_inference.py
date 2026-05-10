@@ -4,10 +4,11 @@ import hashlib
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from loguru import logger
@@ -756,32 +757,42 @@ class FusionClaimVerifier:
                 all_llm_evidences = []
                 all_source_links = []
 
+                def _retrieve_one(
+                    item: Tuple[int, str],
+                ) -> Tuple[int, str, Any, List[str], List[str]]:
+                    _idx, _text = item
+                    _feat, _evidence, _results = _build_retrieval_features_train_compatible(
+                        self.retriever, _text, self.top_k
+                    )
+                    _links: List[str] = []
+                    for _r in _results[: self.llm_evidence_top_k]:
+                        _meta = _r.metadata or {}
+                        _url = str(
+                            _meta.get("article_url")
+                            or _meta.get("url")
+                            or _meta.get("link")
+                            or _meta.get("source_url")
+                            or ""
+                        ).strip()
+                        if _url and _url not in _links:
+                            _links.append(_url)
+                    return _idx, _text, _feat, _evidence[: self.llm_evidence_top_k], _links
+
+                # Retrieval là I/O-bound (OpenSearch HTTP) → parallelize an toàn
+                n_workers = min(len(batch), 8)
+                retrieved: dict[int, Tuple] = {}
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {pool.submit(_retrieve_one, item): item for item in batch}
+                    for future in as_completed(futures):
+                        r_idx, r_text, r_feat, r_ev, r_links = future.result()
+                        retrieved[r_idx] = (r_text, r_feat, r_ev, r_links)
+
                 for idx, text in batch:
                     valid_indices.append(idx)
                     valid_claims.append(text)
-
-                    feat, retrieved_evidence, retrieval_results = (
-                        _build_retrieval_features_train_compatible(
-                            self.retriever, text, self.top_k
-                        )
-                    )
+                    _, feat, ev, links = retrieved[idx]
                     all_retrieval_features.append(feat)
-                    all_llm_evidences.append(
-                        retrieved_evidence[: self.llm_evidence_top_k]
-                    )
-
-                    links = []
-                    for r in retrieval_results[: self.llm_evidence_top_k]:
-                        meta = r.metadata or {}
-                        url = str(
-                            meta.get("article_url")
-                            or meta.get("url")
-                            or meta.get("link")
-                            or meta.get("source_url")
-                            or ""
-                        ).strip()
-                        if url and url not in links:
-                            links.append(url)
+                    all_llm_evidences.append(ev)
                     all_source_links.append(links)
 
                 retrieval_features = torch.tensor(
