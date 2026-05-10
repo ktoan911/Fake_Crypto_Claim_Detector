@@ -36,6 +36,9 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(os.path.join(_PROJECT_ROOT, ".env"), override=True)
 
 LOGGER = logging.getLogger(__name__)
 
