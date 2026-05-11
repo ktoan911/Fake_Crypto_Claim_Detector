@@ -476,13 +476,13 @@ class FusionClaimVerifier:
         if llm_evidence_top_k is None:
             llm_evidence_top_k = int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "3"))
         self.llm_evidence_top_k = max(1, int(llm_evidence_top_k))
-        llm_batch_env = os.getenv("FUSION_LLM_INFER_BATCH_SIZE", "1")
+        llm_batch_env = os.getenv("LLM_INFER_BATCH_SIZE") or os.getenv("FUSION_LLM_INFER_BATCH_SIZE", "1")
         try:
             llm_infer_batch_size = int(llm_batch_env)
         except ValueError:
             llm_infer_batch_size = 1
             logger.warning(
-                f"[fusion_inference] Invalid FUSION_LLM_INFER_BATCH_SIZE={llm_batch_env!r}, fallback to 1"
+                f"[fusion_inference] Invalid LLM_INFER_BATCH_SIZE={llm_batch_env!r}, fallback to 1"
             )
         self.llm_infer_batch_size = max(1, llm_infer_batch_size)
         self.label_list = list(self.saved_config.get("label_list", LABEL_LIST))
