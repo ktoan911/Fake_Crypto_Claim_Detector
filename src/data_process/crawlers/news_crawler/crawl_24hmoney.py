@@ -304,7 +304,6 @@ def predict_and_index(articles: list[dict]) -> dict:
                 "claim": title,
                 "verdict": pred.verdict,
                 "confidence": pred.confidence,
-                "evidence": pred.evidence,
                 "source_links": pred.source_links,
                 "checked_at": checked_at,
                 "source": "24hmoney",

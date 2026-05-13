@@ -46,6 +46,7 @@ class OpenSearchKB:
             timeout=60,
             max_retries=3,
             retry_on_timeout=True,
+            connections_per_node=10,
         )
 
     def create_index(self, overwrite: bool = False) -> None:
