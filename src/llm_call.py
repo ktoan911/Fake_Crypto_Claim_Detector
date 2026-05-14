@@ -1,26 +1,15 @@
 import json
-import os
 import re
 from datetime import datetime, timedelta
 from typing import List
 
 import pytz
 from dotenv import load_dotenv
-from openai import OpenAI
+from together import Together
 
 load_dotenv()
 
-_client: OpenAI | None = None
-
-
-def _get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI(
-            api_key=os.getenv("OPENAI_KEY"),
-            base_url="https://senator-gigolo-stark.ngrok-free.dev/v1",
-        )
-    return _client
+client = Together()  # auth defaults to os.environ.get("TOGETHER_API_KEY")
 
 SYSTEM_PROMPT_EXTRACTION = "You are an information extraction expert."
 
@@ -138,13 +127,12 @@ def generate_cluster_content_with_llm(
 
     cluster_all = build_prompt_summary_cluster(cluster_claims, representative_claim)
 
-    response = _get_client().chat.completions.create(
-        model="vip",
+    response = client.chat.completions.create(
+        model="Qwen/Qwen3.5-9B",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT_TOPIC},
             {"role": "user", "content": cluster_all},
         ],
-        temperature=0.7,
     )
     return response.choices[0].message.content
 
@@ -173,13 +161,12 @@ def split_claim(claim: str) -> List[str]:
         prompt = build_prompt_extraction(claim)
 
         for attempt in range(3):
-            response = _get_client().chat.completions.create(
-                model="vip",
+            response = client.chat.completions.create(
+                model="Qwen/Qwen3.5-9B",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.7,
             )
             output_text = response.choices[0].message.content.strip()
 

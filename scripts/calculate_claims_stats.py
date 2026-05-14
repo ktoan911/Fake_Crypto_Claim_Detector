@@ -161,7 +161,7 @@ def calculate_and_save_stats(target_date: datetime = None):
             "stats_24h": stats_24h,
             "daily_total": daily_total,
             "daily_false": daily_false,
-            "cluster": result_dict_cluster[:5],
+            "cluster": result_dict_cluster.get("clusters", [])[:5],
         }
 
         # Lưu vào OpenSearch index stats qua insert_many() của OpenSearchKB
