@@ -145,7 +145,7 @@ def load_claims_from_opensearch(timestamp_seconds: int = 86400) -> List[str]:
                     "bool": {
                         "must": [{"range": {"checked_at": {"gte": cutoff_time}}}],
                         "filter": [
-                            {"terms": {"verdict.keyword": ["Sai", "Chưa chắc chắn"]}}
+                            {"terms": {"verdict.keyword": ["Sai"]}}
                         ],
                     }
                 },

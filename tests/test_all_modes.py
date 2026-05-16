@@ -6,6 +6,12 @@ Evaluates 4 modes:
 2. LoRA + Gold Evidence
 3. Fusion + Retrieval Evidence
 4. Fusion + Gold Evidence
+
+Model sources support both local paths and HuggingFace repo IDs.
+Default HF repos are read from env vars (same as .env / fusion_inference.py):
+  LLM_FINETUNE        -> LoRA model (e.g. ktoan911/fact-check-Qwen3-4B-finetune)
+  FUSION_MODEL        -> Fusion checkpoint (e.g. ktoan911/fact-check-fusion-model)
+  RETRIEVER_MODEL     -> Retriever embedding model (e.g. AITeamVN/Vietnamese_Embedding)
 """
 
 import argparse
@@ -31,6 +37,13 @@ from src.training.fusion_trainer import (  # Re-use helper
     _build_retrieval_features,
 )
 from src.utils import normalize_text
+
+# ---------------------------------------------------------------------------
+# Env-var defaults (mirrors .env / fusion_inference.py convention)
+# ---------------------------------------------------------------------------
+_DEFAULT_LLM_MODEL = os.getenv("LLM_FINETUNE", "ktoan911/fact-check-Qwen3-4B-finetune")
+_DEFAULT_FUSION_MODEL = os.getenv("FUSION_MODEL", "ktoan911/fact-check-fusion-model")
+_DEFAULT_RETRIEVER_MODEL = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding")
 
 # Label mapping for metrics
 LABEL_MAP = {idx: label for idx, label in enumerate(LABEL_LIST)}
@@ -74,22 +87,39 @@ def calculate_metrics(y_true, y_pred, mode_name, label_list=LABEL_LIST):
     return metrics
 
 
+def _resolve_fusion_model_path(path_or_repo: str, filename: str = "model.pt") -> str:
+    """
+    Resolve a fusion model path — mirrors fusion_inference._resolve_fusion_model_path.
+    Accepts a local .pt file path OR a HuggingFace repo id.
+    """
+    if os.path.isfile(path_or_repo):
+        return path_or_repo
+    try:
+        from huggingface_hub import hf_hub_download
+
+        logger.info(
+            f"[load_fusion_model] Downloading '{filename}' from HF repo '{path_or_repo}'..."
+        )
+        local_path = hf_hub_download(repo_id=path_or_repo, filename=filename)
+        logger.info(f"[load_fusion_model] Downloaded to {local_path}")
+        return local_path
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"Cannot resolve fusion model path '{path_or_repo}': {exc}"
+        ) from exc
+
+
 def load_fusion_model(model_path, device, num_classes=None):
-    """Load trained fusion model components."""
-    import os
+    """
+    Load trained fusion model components.
+    model_path can be:
+      - A local .pt file path
+      - A HuggingFace repo id (e.g. 'ktoan911/fact-check-fusion-model')
+    """
+    resolved_path = _resolve_fusion_model_path(model_path)
+    logger.info(f"[load_fusion_model] Loading checkpoint from {resolved_path}")
 
-    if not os.path.isfile(model_path):
-        try:
-            from huggingface_hub import hf_hub_download
-
-            logger.info(f"Downloading fusion model from HF repo {model_path}...")
-            model_path = hf_hub_download(repo_id=model_path, filename="model.pt")
-        except Exception as exc:
-            raise FileNotFoundError(
-                f"Cannot resolve fusion model path '{model_path}': {exc}"
-            )
-
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(resolved_path, map_location=device, weights_only=False)
     fusion_state = checkpoint["fusion"]
 
     # Load config from checkpoint if available, else standard
@@ -137,19 +167,29 @@ def load_fusion_model(model_path, device, num_classes=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test LoRA and Fusion models in all modes"
+        description="Test LoRA and Fusion models in all modes. "
+        "Model args accept local paths OR HuggingFace repo ids."
     )
     parser.add_argument(
         "--csv", type=str, required=True, help="Path to test CSV or JSON/JSONL"
     )
     parser.add_argument(
-        "--lora_model", type=str, required=True, help="Path to LoRA adapter"
+        "--lora_model",
+        type=str,
+        default=_DEFAULT_LLM_MODEL,
+        help=(
+            "Path to LoRA/fine-tuned model (local dir or HF repo id). "
+            f"Default: {_DEFAULT_LLM_MODEL!r} (from env LLM_FINETUNE)"
+        ),
     )
     parser.add_argument(
         "--fusion_model",
         type=str,
-        required=True,
-        help="Path to Fusion checkpoint (.pt)",
+        default=_DEFAULT_FUSION_MODEL,
+        help=(
+            "Path to Fusion checkpoint (.pt) or HF repo id containing model.pt. "
+            f"Default: {_DEFAULT_FUSION_MODEL!r} (from env FUSION_MODEL)"
+        ),
     )
     parser.add_argument(
         "--limit", type=int, default=None, help="Limit number of samples for testing"
@@ -158,11 +198,23 @@ def main():
         "--retriever_model",
         type=str,
         default=None,
-        help="Override trained dense retrieval model path. If not provided, will use the one used during fusion training.",
+        help=(
+            "Override dense retrieval embedding model (local path or HF repo id). "
+            "If not provided, will fall back to fusion checkpoint config, "
+            f"then env RETRIEVER_MODEL ({_DEFAULT_RETRIEVER_MODEL!r})."
+        ),
     )
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
     parser.add_argument(
-        "--llm_batch_size", type=int, default=1, help="LLM inference batch size"
+        "--batch_size",
+        type=int,
+        default=512,
+        help="Batch size for retrieval feature batching",
+    )
+    parser.add_argument(
+        "--llm_batch_size",
+        type=int,
+        default=int(os.getenv("LLM_INFER_BATCH_SIZE", "32")),
+        help="LLM inference batch size (default from env LLM_INFER_BATCH_SIZE or 32)",
     )
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
@@ -177,8 +229,11 @@ def main():
         args.fusion_model, args.device
     )
     top_k = fusion_config.get("top_k", 10)
-    retriever_model = args.retriever_model or fusion_config.get(
-        "retriever_model", "bge-vi-base"
+    # Resolve retriever model: CLI arg > checkpoint config > env var default
+    retriever_model = (
+        args.retriever_model
+        or fusion_config.get("retriever_model")
+        or _DEFAULT_RETRIEVER_MODEL
     )
 
     # Extract dynamic label properties

@@ -29,16 +29,16 @@ class FusionTrainingConfig:
     epochs: int = 3
     learning_rate: float = 1e-4
     beta_lr_multiplier: float = (
-        5.0  # Let scalar gate β adapt faster than full MLP blocks.
+        10.0  # Aggressive β updates so it can escape 0.8 plateau when LLM dominates.
     )
     top_k: int = 10
     alpha: float = 0.7
     lambda_decay: float = 0.1
     gamma: float = 0.5
     initial_beta: float = (
-        0.8  # Trust trained LLM more initially; retrieval MLP starts random
+        0.95  # LLM is the strong branch (acc ~0.89 gold); start near identity.
     )
-    lambda_reg: float = 0.01  # Only used in fusion layer, not doubled
+    lambda_reg: float = 0.0  # Disable β² penalty — it pulls β back toward 0.5 and dilutes a clean LLM.
     max_length: int = 2048
     evidence_mode: str = (
         "gold"  # "gold" or "retrieved"
@@ -58,7 +58,7 @@ class FusionTrainingConfig:
         True  # Learn per-sample beta offsets from branch confidence patterns.
     )
     retrieval_aux_loss_weight: float = (
-        0.5  # Extra supervision on retrieval branch to avoid chance-level collapse.
+        0.2  # Light supervision: keep MLP learning when retrieval features have signal, but don't force it to overfit noise.
     )
     save_best_checkpoint: bool = (
         True  # Save best epoch on training-set metrics instead of last epoch only.
@@ -83,6 +83,119 @@ def _build_retrieval_features(
 
     # Return list of evidence texts (for smart truncation in LLMScorer)
     return np.array(features, dtype=np.float32), evidence_texts
+
+
+def _save_training_curves(
+    history: Dict[str, list],
+    save_path: str,
+    best_epoch: int = -1,
+) -> List[str]:
+    """Plot per-epoch training metrics as separate PNG files next to save_path.
+
+    Returns list of image paths written (empty if matplotlib unavailable or
+    no metrics).
+    """
+    if not history or not history.get("loss"):
+        logger.warning("No training history to plot.")
+        return []
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")  # Headless: don't require a display.
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not available; skipping training curves.")
+        return []
+
+    out_dir = os.path.dirname(save_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    epochs = list(range(1, len(history["loss"]) + 1))
+    suffix = f" — best epoch: {best_epoch}" if best_epoch > 0 else ""
+    written: List[str] = []
+
+    def _mark_best(ax):
+        if best_epoch > 0:
+            ax.axvline(best_epoch, color="gray", linestyle=":", alpha=0.6, label=f"best ep={best_epoch}")
+
+    # 1) Losses
+    img_path = os.path.join(out_dir, "loss_curve.png")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, history["loss"], label="Total loss", marker="o", markersize=3)
+    ax.plot(
+        epochs,
+        history["retrieval_aux_loss"],
+        label="Retrieval aux loss",
+        marker="s",
+        markersize=3,
+        alpha=0.7,
+    )
+    _mark_best(ax)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title(f"Losses{suffix}")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(img_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    written.append(img_path)
+    logger.info(f"Loss curve saved to {img_path}")
+
+    # 2) Branch accuracies
+    img_path = os.path.join(out_dir, "accuracy_curve.png")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, history["acc"], label="Fusion acc", marker="o", markersize=3, linewidth=2)
+    ax.plot(epochs, history["llm_acc"], label="LLM-only acc", linestyle="--", alpha=0.8)
+    ax.plot(
+        epochs,
+        history["retrieval_acc"],
+        label="Retrieval-branch acc",
+        linestyle=":",
+        alpha=0.8,
+    )
+    _mark_best(ax)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Accuracy")
+    ax.set_ylim(0, 1.05)
+    ax.set_title(f"Branch accuracies{suffix}")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(img_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    written.append(img_path)
+    logger.info(f"Accuracy curve saved to {img_path}")
+
+    # 3) β + learning rate (twin axis)
+    img_path = os.path.join(out_dir, "beta_lr_curve.png")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(epochs, history["beta"], color="tab:purple", marker="o", markersize=3, label="β (LLM weight)")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("β", color="tab:purple")
+    ax.tick_params(axis="y", labelcolor="tab:purple")
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3)
+
+    ax2 = ax.twinx()
+    ax2.plot(epochs, history["lr"], color="tab:orange", linestyle="--", label="lr")
+    ax2.set_ylabel("Learning rate", color="tab:orange")
+    ax2.tick_params(axis="y", labelcolor="tab:orange")
+    ax2.set_yscale("log")
+
+    _mark_best(ax)
+
+    lines_a, labels_a = ax.get_legend_handles_labels()
+    lines_b, labels_b = ax2.get_legend_handles_labels()
+    ax.legend(lines_a + lines_b, labels_a + labels_b, loc="best", fontsize=9)
+    ax.set_title(f"β evolution + LR schedule{suffix}")
+    plt.tight_layout()
+    plt.savefig(img_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    written.append(img_path)
+    logger.info(f"β + LR curve saved to {img_path}")
+
+    return written
 
 
 def _normalize_label_to_id(label_value) -> int:
@@ -494,6 +607,18 @@ def train_fusion_from_dataframe(
     best_loss = float("inf")
     best_state: Optional[Dict[str, Any]] = None
 
+    # Per-epoch metric history for plotting after training.
+    history: Dict[str, list] = {
+        "loss": [],
+        "retrieval_aux_loss": [],
+        "acc": [],
+        "llm_acc": [],
+        "retrieval_acc": [],
+        "beta": [],
+        "lr": [],
+        "per_class": [],
+    }
+
     for epoch in range(config.epochs):
         # Shuffle indices at the start of each epoch
         indices = torch.randperm(dataset_size)
@@ -638,6 +763,16 @@ def train_fusion_from_dataframe(
         logger.info(
             f"Epoch {epoch + 1}/{config.epochs} - loss: {avg_loss:.4f} - retrieval_loss: {avg_retrieval_aux_loss:.4f} - acc: {accuracy:.4f} - llm_acc: {llm_acc_epoch:.4f} - retrieval_acc: {retrieval_acc_epoch:.4f} - β: {beta_val:.4f} - lr: {current_lr:.2e} - per_class: [{per_class_str}]"
         )
+
+        history["loss"].append(float(avg_loss))
+        history["retrieval_aux_loss"].append(float(avg_retrieval_aux_loss))
+        history["acc"].append(float(accuracy))
+        history["llm_acc"].append(float(llm_acc_epoch))
+        history["retrieval_acc"].append(float(retrieval_acc_epoch))
+        history["beta"].append(float(beta_val))
+        history["lr"].append(float(current_lr))
+        history["per_class"].append([float(x) for x in per_class_acc])
+
         scheduler.step()
 
     state_to_save = {
@@ -678,4 +813,11 @@ def train_fusion_from_dataframe(
     )
 
     logger.info(f"Fusion model saved to {save_path}")
+
+    _save_training_curves(
+        history,
+        save_path=save_path,
+        best_epoch=best_epoch,
+    )
+
     return save_path

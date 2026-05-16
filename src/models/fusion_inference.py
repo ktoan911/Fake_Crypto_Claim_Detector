@@ -19,7 +19,7 @@ from src.llm_call import split_claim
 from src.retrieval.retrieval import QueryExpander, RetrievalResult, TemporalScorer
 
 
-def _resolve_fusion_model_path(path_or_repo: str, filename: str = "model.pt") -> str:
+def _resolve_fusion_model_path(path_or_repo: str, filename: str = "time_fusion_model_v2.pt") -> str:
     if os.path.isfile(path_or_repo):
         return path_or_repo
     try:
