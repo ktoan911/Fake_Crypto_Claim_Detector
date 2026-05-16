@@ -1,0 +1,16 @@
+/* Base layer: element resets and global applies */
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  button {
+    cursor: pointer;
+  }
+}

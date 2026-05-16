@@ -1,0 +1,10 @@
+/* Custom variants centralized here */
+
+/* Dark mode variant: use with `dark:` prefix and toggle by adding `.dark` to <html> or <body> */
+@custom-variant dark (&:is(.dark *));
+
+/* Responsive device variants (no HTML classes needed) */
+/* Using classic media queries for broad compatibility */
+@custom-variant mobile (@media (max-width: 639px));
+@custom-variant tablet (@media (min-width: 640px) and (max-width: 1023px));
+@custom-variant desktop (@media (min-width: 1024px));

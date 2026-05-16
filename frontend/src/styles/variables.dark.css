@@ -1,0 +1,65 @@
+/* Dark mode CSS variables (activate by adding `.dark` on <html> or <body>) */
+
+.dark {
+  --background: #0a0a0a;
+  --foreground: #e3e2e7;
+  --card: rgba(248, 248, 248, 0.1);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: #262626;
+  --popover-foreground: #f4f4f4;
+  --primary: #d5e0ff;
+  --primary-foreground: #f6f2ff;
+  --secondary: #aaadbb;
+  --secondary-foreground: #e3e2e7;
+  --muted: oklch(0.274 0.006 286.033);
+  --muted-foreground: #aaadbb;
+  --accent: #12121314;
+  --accent-foreground: #f4f4f4;
+  --accent-border: #4de5c5;
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: #393939;
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.552 0.016 289.938);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.21 0.006 285.885);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.274 0.006 286.033);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.552 0.016 285.938);
+  --shadow: rgba(255, 255, 255, 0.6);
+  --shadow1: rgba(255, 255, 255, 0.3);
+  --FN-Gradient-1: linear-gradient(
+    180deg,
+    #fff 0%,
+    #41e0be 30%,
+    #5791f0 70%,
+    #872dee 100%
+  );
+  --FN-Gradient-2: linear-gradient(
+    150deg,
+    #41e0be 30%,
+    #5791f0 70%,
+    #872dee 100%
+  );
+  --text-shadow: rgba(255, 255, 255, 0.7);
+  --card-bg: #1a1b1f;
+  --body-bg: #07090f;
+  --tooltip: #292929;
+  --chart-text1: #8d8d8d;
+  --chart-girdline: #393939;
+  --FN-Gradient-3: linear-gradient(150deg, #fff 30%, #41e0be 70%);
+  --FN-Gradient-4: linear-gradient(150deg, #5791f0 30%, #872dee 70%);
+  --rate-high: #db9696;
+  --rate-medium: #d1b893;
+  --rate-low: #a3d4bb;
+  --text-high: #a04242;
+  --text-medium: #907447;
+  --text-low: #478164;
+}

@@ -1,0 +1,50 @@
+/* Typography styles: element defaults and special text classes */
+
+@layer base {
+  h1 {
+    @apply font-bold leading-tight tracking-tight mobile:text-3xl tablet:text-4xl desktop:text-5xl;
+  }
+  h2 {
+    @apply font-semibold leading-tight tracking-tight mobile:text-2xl tablet:text-3xl desktop:text-4xl;
+  }
+  h3 {
+    @apply font-semibold leading-snug tracking-tight mobile:text-xl tablet:text-2xl desktop:text-3xl;
+  }
+  h4 {
+    @apply font-medium leading-snug tracking-tight mobile:text-lg tablet:text-xl desktop:text-2xl;
+  }
+  h5 {
+    @apply font-medium leading-normal tracking-tight mobile:text-base tablet:text-lg desktop:text-xl;
+  }
+  h6 {
+    @apply font-medium uppercase tracking-wide mobile:text-sm tablet:text-base desktop:text-lg;
+  }
+  p {
+    @apply text-[14px] leading-7;
+  }
+}
+
+@layer components {
+  /* Special text helpers */
+  .lead {
+    @apply text-lg tablet:text-xl text-muted-foreground;
+  }
+  .muted {
+    @apply text-muted-foreground;
+  }
+  .caption {
+    @apply text-xs text-muted-foreground;
+  }
+  .overline {
+    @apply uppercase tracking-wider text-[0.7rem] text-muted-foreground;
+  }
+  .blockquote {
+    @apply border-l-4 border-border pl-4 italic text-muted-foreground;
+  }
+  .code {
+    @apply font-mono text-sm bg-muted/50 px-1.5 py-0.5 rounded;
+  }
+  .shadow-text {
+    @apply [text-shadow:0px_0px_8px_#FFFFFF99];
+  }
+}
