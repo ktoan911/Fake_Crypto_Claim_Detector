@@ -138,27 +138,76 @@ def generate_cluster_content_with_llm(
 
 
 def safe_parse_list(text: str) -> List[str]:
+    """Trích danh sách claim từ output của LLM theo nhiều format khác nhau."""
+    if not text:
+        return []
+
+    def _clean(items):
+        out = []
+        for x in items:
+            s = str(x).strip().strip('"').strip("'").strip("`")
+            if s:
+                out.append(s)
+        return out
+
+    # 1) Raw JSON array
     try:
-        return json.loads(text)
-    except:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return _clean(parsed)
+    except Exception:
         pass
 
+    # 2) JSON array nằm đâu đó trong text (kèm prefix/giải thích)
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group())
-        except:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, list):
+                return _clean(parsed)
+        except Exception:
             pass
 
-    return []  # fail-safe
+    # 3) Bullet list:  - foo  /  * foo  /  • foo
+    bullets = re.findall(r"^\s*[-*•]\s*(.+?)\s*$", text, re.MULTILINE)
+    if bullets:
+        return _clean(bullets)
+
+    # 4) Numbered list: 1. foo  /  2) foo
+    numbered = re.findall(r"^\s*\d+[\.\)]\s*(.+?)\s*$", text, re.MULTILINE)
+    if numbered:
+        return _clean(numbered)
+
+    return []
+
+
+def _should_skip_split(text: str) -> bool:
+    """Tránh gọi LLM cho input ngắn / không có dấu hiệu nhiều fact."""
+    if len(text) < 30:
+        return True
+    # Bắt đầu bằng số thứ tự ("1. ", "2) ") + ngắn → 1 mục trong list, không phải multi-claim
+    if re.match(r"^\s*\d+[\.\)]\s", text) and len(text) < 120:
+        return True
+    # Không có dấu chấm câu kết và ngắn → có khả năng là cụm từ đơn lẻ
+    if len(text) < 80 and not re.search(r"[.!?。\n]", text):
+        return True
+    return False
 
 
 # =========================
 # 3. Main function (no raise)
 # =========================
 def split_claim(claim: str) -> List[str]:
+    text = (claim or "").strip()
+    if not text:
+        return []
+
+    # Heuristic: input ngắn / không phải multi-claim → khỏi gọi LLM, dùng nguyên claim
+    if _should_skip_split(text):
+        return [text]
+
     try:
-        prompt = build_prompt_extraction(claim)
+        prompt = build_prompt_extraction(text)
 
         for attempt in range(3):
             response = client.chat.completions.create(
@@ -168,17 +217,20 @@ def split_claim(claim: str) -> List[str]:
                     {"role": "user", "content": prompt},
                 ],
             )
-            output_text = response.choices[0].message.content.strip()
+            output_text = (response.choices[0].message.content or "").strip()
 
             result = safe_parse_list(output_text)
-            if result:  # parse OK
+            if result:
                 return result
 
-            print(f"[WARN] Retry {attempt + 1}: format lỗi")
+            print(
+                f"[WARN] Retry {attempt + 1}: format lỗi — raw response: "
+                f"{output_text[:200]!r}"
+            )
 
-        print("[ERROR] LLM failed after 3 attempts")
-        return []
+        print("[ERROR] LLM split failed after 3 attempts, fallback to original claim")
+        return [text]
 
     except Exception as e:
-        print(f"[ERROR] Exception: {e}")
-        return []
+        print(f"[ERROR] split_claim exception: {e}, fallback to original claim")
+        return [text]

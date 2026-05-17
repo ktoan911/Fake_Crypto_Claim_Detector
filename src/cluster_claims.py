@@ -2,9 +2,20 @@ from __future__ import annotations
 
 import os
 import sys
+
+# Giới hạn số thread cho BLAS/OMP TRƯỚC khi import torch/numpy/bertopic,
+# nếu không các env này sẽ bị bỏ qua. Cluster yếu thì oversubscribe gây thrash.
+_THREADS = os.getenv("CLUSTER_NUM_THREADS", "2")
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "TOKENIZERS_PARALLELISM"):
+    os.environ.setdefault(_v, _THREADS if _v != "TOKENIZERS_PARALLELISM" else "false")
+
+import math
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from threading import Lock
+from typing import Dict, List
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from dotenv import load_dotenv
@@ -15,21 +26,43 @@ from src.llm_call import generate_cluster_content_with_llm
 load_dotenv()
 
 try:
+    import torch
     from bertopic import BERTopic
+    from hdbscan import HDBSCAN
     from sentence_transformers import SentenceTransformer
     from umap import UMAP
 except ImportError as exc:
     raise ImportError(
-        "sentence-transformers and bertopic are required. Install dependencies from requirements.txt."
+        "sentence-transformers, bertopic, hdbscan are required. Install dependencies from requirements.txt."
     ) from exc
+
+try:
+    torch.set_num_threads(int(_THREADS))
+except Exception:
+    pass
+
+_MODEL_CACHE: Dict[str, SentenceTransformer] = {}
+_MODEL_LOCK = Lock()
+
+
+def _get_embedding_model(model_name: str) -> SentenceTransformer:
+    """Cache SentenceTransformer để tránh tải lại model ~120MB mỗi request."""
+    cached = _MODEL_CACHE.get(model_name)
+    if cached is not None:
+        return cached
+    with _MODEL_LOCK:
+        cached = _MODEL_CACHE.get(model_name)
+        if cached is None:
+            cached = SentenceTransformer(model_name)
+            _MODEL_CACHE[model_name] = cached
+        return cached
 
 def cluster_claims(
     claims: List[str],
     model_name: str,
-    num_clusters: Optional[int] = None,
-    min_k: int = 2,
     max_k: int = 10,
     random_state: int = 42,
+    llm_workers: int = 4,
 ) -> Dict:
     cleaned_claims = [c.strip() for c in claims if isinstance(c, str) and c.strip()]
     if not cleaned_claims:
@@ -37,10 +70,8 @@ def cluster_claims(
 
     n_samples = len(cleaned_claims)
 
-    model = SentenceTransformer(model_name)
-
     if n_samples < 3:
-        # Quá ít claim, gộp chung vào 1 cluster
+        # Quá ít claim, gộp chung vào 1 cluster — không cần load embedding model
         rep_claim = cleaned_claims[0]
         gen_content = generate_cluster_content_with_llm(cleaned_claims, rep_claim)
         return {
@@ -58,20 +89,38 @@ def cluster_claims(
             ],
         }
 
-    n_neighbors = min(15, n_samples - 1)
-    n_components = min(5, max(1, n_samples - 2))
-    min_topic_size = min(10, max(2, n_samples // 3))
+    model = _get_embedding_model(model_name)
+
+    # n_neighbors thấp → UMAP giữ cấu trúc local, claim khác chủ đề ít bị kéo lại gần.
+    # n_components cao hơn (5 → 10-15) để không collapse phân biệt semantic khi giảm chiều.
+    # min_topic_size adaptive theo sqrt(N): vừa đủ để có cluster, không quá lớn ép gom nhầm.
+    n_neighbors = max(3, min(10, n_samples - 1))
+    n_components = max(2, min(15, n_samples - 2))
+    min_topic_size = max(2, int(math.sqrt(n_samples) / 2))
 
     umap_model = UMAP(
         n_neighbors=n_neighbors,
         n_components=n_components,
+        min_dist=0.0,
         metric="cosine",
-        random_state=42,
+        random_state=random_state,
+    )
+
+    # Tách HDBSCAN ra để chỉnh cluster_selection_method="leaf" (cluster mịn hơn
+    # so với "eom" mặc định — tránh over-merge các topic gần nhau).
+    # min_samples=1 giảm strictness về density, ít noise hơn.
+    hdbscan_model = HDBSCAN(
+        min_cluster_size=min_topic_size,
+        min_samples=1,
+        metric="euclidean",
+        cluster_selection_method="leaf",
+        prediction_data=False,
     )
 
     topic_model = BERTopic(
         embedding_model=model,
         umap_model=umap_model,
+        hdbscan_model=hdbscan_model,
         min_topic_size=min_topic_size,
         calculate_probabilities=False,
         verbose=False,
@@ -91,7 +140,7 @@ def cluster_claims(
         reverse=True,
     )[:max_k]
 
-    clusters = []
+    prepared = []
     for cluster_id in sorted_cluster_ids:
         indices = cluster_to_indices[cluster_id]
         cluster_claim_list = [cleaned_claims[i] for i in indices]
@@ -102,11 +151,28 @@ def cluster_claims(
         else:
             representative_claim = cluster_claim_list[0]
 
-        generated_content = generate_cluster_content_with_llm(
-            cluster_claims=cluster_claim_list,
-            representative_claim=representative_claim,
+        prepared.append((cluster_id, indices, cluster_claim_list, representative_claim))
+
+    # LLM call là I/O-bound (HTTP tới Together). Chạy song song để tổng latency
+    # gần bằng 1 call thay vì N call tuần tự.
+    def _summarize(item):
+        _cid, _idx, _claims, _rep = item
+        return generate_cluster_content_with_llm(
+            cluster_claims=_claims,
+            representative_claim=_rep,
         )
 
+    workers = max(1, min(llm_workers, len(prepared)))
+    if workers == 1 or len(prepared) <= 1:
+        contents = [_summarize(p) for p in prepared]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            contents = list(pool.map(_summarize, prepared))
+
+    clusters = []
+    for (cluster_id, indices, cluster_claim_list, representative_claim), generated_content in zip(
+        prepared, contents
+    ):
         clusters.append(
             {
                 "cluster_id": cluster_id,
