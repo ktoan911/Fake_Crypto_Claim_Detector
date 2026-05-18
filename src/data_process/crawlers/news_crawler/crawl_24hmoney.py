@@ -44,7 +44,30 @@ LOGGER = logging.getLogger(__name__)
 
 SITEMAP_URL = "https://24hmoney.vn/sitemap-news.xml"
 
-ALLOWED_CATEGORY_IDS: frozenset[str] = frozenset({"1", "4", "27", "30", "50", "81"})
+ALLOWED_CATEGORY_IDS: frozenset[str] = frozenset({"1", "2", "4", "27"})
+
+_OPINION_TITLE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\?\s*$"),
+    re.compile(r"^\s*(nên|có nên|đừng|hãy)\b", re.IGNORECASE),
+    re.compile(r"\b(nên|có nên|đừng)\s+(làm|mua|bán|chọn|đầu tư|gom|giữ|vội|bỏ)\b", re.IGNORECASE),
+    re.compile(r"\b(làm gì|mua gì|bán gì|chọn gì|đầu tư gì|mua mã nào|chọn mã nào)\b", re.IGNORECASE),
+    re.compile(r"\b(bắt đáy|gom (cổ phiếu|hàng)|săn (hàng|cổ phiếu|deal|cơ hội))\b", re.IGNORECASE),
+    re.compile(r"^\s*cảnh báo\s*[:!]", re.IGNORECASE),
+    re.compile(r"\b(kỳ vọng tăng|tham vọng (chạm|đạt|vượt|cán)|lọt tầm ngắm|cơ hội (săn|gom|bắt|vàng))\b", re.IGNORECASE),
+    re.compile(r"\b(hào quang|bài viết này|đáng chú ý nhất|không thể bỏ qua)\b", re.IGNORECASE),
+    re.compile(r"^\s*\d+\s+(nguyên tắc|bí quyết|cách|lý do|sai lầm|điều|chiến lược|bài học)\b", re.IGNORECASE),
+)
+
+
+def _is_news_title(title: str) -> bool:
+    """Trả về False nếu tiêu đề có dấu hiệu opinion/advice/question/clickbait."""
+    if not title:
+        return False
+    t = title.strip()
+    for pat in _OPINION_TITLE_PATTERNS:
+        if pat.search(t):
+            return False
+    return True
 
 NS = {
     "sm": "http://www.sitemaps.org/schemas/sitemap/0.9",
@@ -158,6 +181,7 @@ class Crawl24HMoneyV2:
         LOGGER.info("Lọc bài đăng sau %s (%.1f giờ gần nhất)", cutoff.isoformat(), self.hours_back)
 
         filtered: list[dict] = []
+        dropped_opinion = 0
         for entry in entries:
             dt = entry["published_at_dt"]
             if dt is None:
@@ -168,7 +192,14 @@ class Crawl24HMoneyV2:
                 continue
             if entry["category_id"] not in ALLOWED_CATEGORY_IDS:
                 continue
+            if not _is_news_title(entry.get("title") or ""):
+                dropped_opinion += 1
+                LOGGER.debug("Bỏ tiêu đề opinion/clickbait: %s", entry.get("title"))
+                continue
             filtered.append(entry)
+
+        if dropped_opinion:
+            LOGGER.info("Đã loại %d tiêu đề opinion/clickbait/question", dropped_opinion)
 
         filtered.sort(key=lambda e: e["published_at"] or 0, reverse=True)
 
