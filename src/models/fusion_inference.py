@@ -218,10 +218,10 @@ class OpenSearchHybridRetriever:
         try:
             count = int(self.kb.client.count(index=self.kb.index).get("count", pool))
             if count > 0:
-                # Cap the inference search pool at 500 to keep retrieval < 2 seconds.
-                pool = min(count, max(rrf_top_k * 5, 500))
+                # Cap the inference search pool at 200 to keep retrieval < 1 second.
+                pool = min(count, max(rrf_top_k * 5, 200))
         except Exception as exc:
-            pool = max(pool, 300)
+            pool = max(pool, 200)
             logger.warning(
                 f"Could not fetch OpenSearch count, using pool={pool}: {exc}"
             )

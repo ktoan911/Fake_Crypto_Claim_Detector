@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from dotenv import load_dotenv
-from opensearchpy import OpenSearch
+from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
 load_dotenv()
@@ -46,7 +46,8 @@ class OpenSearchKB:
             timeout=60,
             max_retries=3,
             retry_on_timeout=True,
-            connections_per_node=10,
+            connection_class=RequestsHttpConnection,
+            pool_maxsize=20,
         )
 
     def create_index(self, overwrite: bool = False) -> None:
