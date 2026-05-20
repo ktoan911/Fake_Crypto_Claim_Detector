@@ -275,6 +275,26 @@ def looks_like_article_url(full_url: str, title: str) -> bool:
     return score >= 2
 
 
+def _normalize_iso_datetime(value: str | None) -> str | None:
+    """Coerce loose date strings into ISO-8601 UTC. Return None if unparseable."""
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    # Strip stray whitespace inside offsets like "10:43 + 07:00" -> "10:43+07:00"
+    candidate = re.sub(r"([+-])\s+(\d)", r"\1\2", raw)
+    for attempt in (candidate, raw):
+        try:
+            dt = dtparser.parse(attempt)
+        except Exception:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    return None
+
+
 def parse_published_at(soup: BeautifulSoup) -> str | None:
     published_at = None
     meta_pub = (
@@ -319,13 +339,7 @@ def parse_published_at(soup: BeautifulSoup) -> str | None:
     if not published_at:
         return None
 
-    try:
-        dt = dtparser.parse(published_at)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat()
-    except Exception:
-        return published_at
+    return _normalize_iso_datetime(published_at)
 
 
 def extract_article_text(soup: BeautifulSoup) -> str:
@@ -618,10 +632,11 @@ async def fetch_article_content(session, item, semaphore, cutoff_time=None):
     """
     async with semaphore:
         candidate_urls = build_url_variants(item["article_url"])
+        dead_status_hits = 0
         for candidate_url in candidate_urls:
-            for attempt in range(3):  # retry 3 lần mỗi candidate
+            for attempt in range(2):  # retry 2 lần mỗi candidate (giảm từ 3)
                 try:
-                    async with session.get(candidate_url, timeout=15) as response:
+                    async with session.get(candidate_url, timeout=8) as response:
                         if response.status == 200:
                             html = await response.text(errors="ignore")
                             content, published_at = parse_article_html(html)
@@ -647,13 +662,19 @@ async def fetch_article_content(session, item, semaphore, cutoff_time=None):
                                     str(response.url)
                                 )
                                 return
+                            # 200 nhưng không bóc được content → thử retry
+                        elif response.status in (404, 410):
+                            # Chắc chắn chết, không retry và đánh dấu để skip Playwright
+                            dead_status_hits += 1
+                            break
                         elif response.status in (403, 406, 429):
+                            # Có thể bị WAF → bỏ candidate này, để Playwright thử
                             break
                         else:
                             await asyncio.sleep(0.2)
                 except Exception as e:
-                    if attempt < 2:
-                        await asyncio.sleep(1)
+                    if attempt < 1:
+                        await asyncio.sleep(0.5)
                     else:
                         logging.debug(
                             f"Lỗi lấy nội dung bằng aiohttp ({candidate_url}): {e}"
@@ -661,6 +682,8 @@ async def fetch_article_content(session, item, semaphore, cutoff_time=None):
 
         item["content"] = ""
         item["published_at"] = None
+        if dead_status_hits >= len(candidate_urls):
+            item["_http_dead"] = True
 
 
 async def fetch_article_content_playwright(context, item, semaphore, cutoff_time=None):
@@ -683,20 +706,18 @@ async def fetch_article_content_playwright(context, item, semaphore, cutoff_time
             )
             for candidate_url in build_url_variants(item["article_url"]):
                 response = await page.goto(
-                    candidate_url, wait_until="domcontentloaded", timeout=45000
+                    candidate_url, wait_until="domcontentloaded", timeout=25000
                 )
                 if response and response.status >= 400:
                     continue
 
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
-
-                await asyncio.sleep(1.0)
+                # Bỏ wait_for_load_state(networkidle) — hay treo tới timeout 10s.
+                # Một lần sleep ngắn + scroll đủ kích hoạt lazy-load cho các trang
+                # JS-render thông thường.
+                await asyncio.sleep(0.5)
                 try:
                     await page.evaluate("window.scrollBy(0, 1400)")
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
                 except Exception:
                     pass
 
@@ -794,8 +815,8 @@ async def main(args):
             logging.info(
                 f"Đã thu thập {len(results)} liên kết. Bắt đầu tải nội dung bài viết..."
             )
-            content_semaphore = asyncio.Semaphore(30)  # tăng từ 15 → 30
-            connector = aiohttp.TCPConnector(ssl=False, limit=60)
+            content_semaphore = asyncio.Semaphore(60)  # tăng từ 30 → 60
+            connector = aiohttp.TCPConnector(ssl=False, limit=120, limit_per_host=12)
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -811,11 +832,14 @@ async def main(args):
                 ]
                 await asyncio.gather(*fetch_tasks)
 
-            # Bỏ qua bài đã bị đánh dấu _skipped_old (quá cũ) khỏi fallback Playwright
+            # Bỏ qua bài đã bị đánh dấu _skipped_old (quá cũ) hoặc _http_dead
+            # (404/410 ở mọi candidate) khỏi fallback Playwright
             missing_items = [
                 item
                 for item in results
-                if not item.get("content", "").strip() and not item.get("_skipped_old")
+                if not item.get("content", "").strip()
+                and not item.get("_skipped_old")
+                and not item.get("_http_dead")
             ]
             if missing_items:
                 logging.info(
@@ -1143,9 +1167,11 @@ async def main(args):
                 new_item = item.copy()
                 new_item["title"] = title
                 new_item["content"] = f"{title} {chunk}".strip() if title else chunk
-                # Fallback published_at → ngày cào nếu null
-                if not new_item.get("published_at"):
-                    new_item["published_at"] = datetime.now(timezone.utc).isoformat()
+                # Fallback published_at → ngày cào nếu null hoặc không parse được
+                normalized_pub = _normalize_iso_datetime(new_item.get("published_at"))
+                new_item["published_at"] = (
+                    normalized_pub or datetime.now(timezone.utc).isoformat()
+                )
                 chunk_id_raw = f"{new_item.get('article_url', '')}_{chunk_idx}"
                 new_item["id"] = hashlib.md5(chunk_id_raw.encode("utf-8")).hexdigest()
                 # Fix (5): chỉ gán embedding nếu dim khớp với expected_dim
