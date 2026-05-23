@@ -1,15 +1,57 @@
 import json
+import os
+import random
 import re
+import time
 from datetime import datetime, timedelta
 from typing import List
 
 import pytz
 from dotenv import load_dotenv
 from together import Together
+from together import error as together_error
 
 load_dotenv()
 
-client = Together()  # auth defaults to os.environ.get("TOGETHER_API_KEY")
+# Together SDK mặc định lấy timeout từ httpx — với model lớn + prompt dài
+# (cluster có thể chứa hàng trăm claim) request dễ vượt ngưỡng và bắn
+# together.APITimeoutError. Đặt timeout tường minh, dài hơn default.
+_TOGETHER_TIMEOUT = float(os.getenv("TOGETHER_TIMEOUT", "120"))
+_TOGETHER_MAX_RETRIES = int(os.getenv("TOGETHER_MAX_RETRIES", "3"))
+
+client = Together(
+    timeout=_TOGETHER_TIMEOUT,
+)  # auth defaults to os.environ.get("TOGETHER_API_KEY")
+
+
+_RETRYABLE_ERRORS = (
+    together_error.APITimeoutError,
+    together_error.APIConnectionError,
+    together_error.RateLimitError,
+)
+
+
+def _chat_completion_with_retry(**kwargs):
+    """Wrap client.chat.completions.create với retry + exponential backoff cho
+    các lỗi mạng/timeout/rate-limit. Lỗi non-retryable (Auth, BadRequest...)
+    được raise ngay để không che lỗi cấu hình."""
+    last_err = None
+    for attempt in range(_TOGETHER_MAX_RETRIES):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except _RETRYABLE_ERRORS as e:
+            last_err = e
+            if attempt == _TOGETHER_MAX_RETRIES - 1:
+                break
+            # Exponential backoff + jitter: 2s, 4s, 8s ...
+            sleep_s = (2 ** attempt) + random.uniform(0, 1)
+            print(
+                f"[WARN] Together API {type(e).__name__} "
+                f"(attempt {attempt + 1}/{_TOGETHER_MAX_RETRIES}), "
+                f"retry sau {sleep_s:.1f}s"
+            )
+            time.sleep(sleep_s)
+    raise last_err
 
 SYSTEM_PROMPT_EXTRACTION = "You are an information extraction expert."
 
@@ -95,7 +137,17 @@ INPUT:
     return prompt.strip()
 
 
+# Output tối đa 5 từ → ~32 token là dư. Cap để tránh model generate lan man,
+# vốn là một nguyên nhân chính khiến request timeout.
+_CLUSTER_SUMMARY_MAX_TOKENS = int(os.getenv("CLUSTER_SUMMARY_MAX_TOKENS", "64"))
+# Giới hạn số claim đưa vào prompt — cluster lớn có thể có hàng trăm claim,
+# prompt dài làm inference chậm và dễ timeout. Lấy mẫu là đủ để LLM nắm topic.
+_CLUSTER_SUMMARY_MAX_CLAIMS = int(os.getenv("CLUSTER_SUMMARY_MAX_CLAIMS", "30"))
+
+
 def build_prompt_summary_cluster(claims, centroid):
+    if len(claims) > _CLUSTER_SUMMARY_MAX_CLAIMS:
+        claims = claims[:_CLUSTER_SUMMARY_MAX_CLAIMS]
     claims_text = "\n".join([f"- {c}" for c in claims])
 
     return f"""
@@ -127,14 +179,24 @@ def generate_cluster_content_with_llm(
 
     cluster_all = build_prompt_summary_cluster(cluster_claims, representative_claim)
 
-    response = client.chat.completions.create(
-        model="Qwen/Qwen3.5-9B",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_TOPIC},
-            {"role": "user", "content": cluster_all},
-        ],
-    )
-    return response.choices[0].message.content
+    try:
+        response = _chat_completion_with_retry(
+            model="Qwen/Qwen3.5-9B",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_TOPIC},
+                {"role": "user", "content": cluster_all},
+            ],
+            max_tokens=_CLUSTER_SUMMARY_MAX_TOKENS,
+            temperature=0.2,
+        )
+        return (response.choices[0].message.content or "").strip()
+    except _RETRYABLE_ERRORS as e:
+        # Sau khi đã retry vẫn timeout/connect lỗi → fallback dùng representative
+        # claim làm topic thay vì để cả pipeline cluster crash.
+        print(
+            f"[ERROR] generate_cluster_content_with_llm fallback do {type(e).__name__}: {e}"
+        )
+        return representative_claim
 
 
 def safe_parse_list(text: str) -> List[str]:
@@ -210,7 +272,7 @@ def split_claim(claim: str) -> List[str]:
         prompt = build_prompt_extraction(text)
 
         for attempt in range(3):
-            response = client.chat.completions.create(
+            response = _chat_completion_with_retry(
                 model="Qwen/Qwen3.5-9B",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},

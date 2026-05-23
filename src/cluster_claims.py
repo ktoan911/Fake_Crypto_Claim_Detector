@@ -62,7 +62,7 @@ def cluster_claims(
     model_name: str,
     max_k: int = 10,
     random_state: int = 42,
-    llm_workers: int = 4,
+    llm_workers: int = 2,
 ) -> Dict:
     cleaned_claims = [c.strip() for c in claims if isinstance(c, str) and c.strip()]
     if not cleaned_claims:
@@ -154,13 +154,19 @@ def cluster_claims(
         prepared.append((cluster_id, indices, cluster_claim_list, representative_claim))
 
     # LLM call là I/O-bound (HTTP tới Together). Chạy song song để tổng latency
-    # gần bằng 1 call thay vì N call tuần tự.
+    # gần bằng 1 call thay vì N call tuần tự. Mặc định 2 worker — nhiều hơn dễ
+    # đẩy Together vào rate-limit ngầm và làm cả batch cùng timeout.
     def _summarize(item):
         _cid, _idx, _claims, _rep = item
-        return generate_cluster_content_with_llm(
-            cluster_claims=_claims,
-            representative_claim=_rep,
-        )
+        try:
+            return generate_cluster_content_with_llm(
+                cluster_claims=_claims,
+                representative_claim=_rep,
+            )
+        except Exception as e:
+            # Một cluster fail không được phép kéo cả pipeline xuống.
+            print(f"[ERROR] cluster {_cid} summarize failed: {e}, fallback rep claim")
+            return _rep
 
     workers = max(1, min(llm_workers, len(prepared)))
     if workers == 1 or len(prepared) <= 1:
