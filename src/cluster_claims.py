@@ -26,6 +26,7 @@ from src.llm_call import generate_cluster_content_with_llm
 load_dotenv()
 
 try:
+    import numpy as np
     import torch
     from bertopic import BERTopic
     from hdbscan import HDBSCAN
@@ -33,7 +34,7 @@ try:
     from umap import UMAP
 except ImportError as exc:
     raise ImportError(
-        "sentence-transformers, bertopic, hdbscan are required. Install dependencies from requirements.txt."
+        "sentence-transformers, bertopic, hdbscan, numpy are required. Install dependencies from requirements.txt."
     ) from exc
 
 try:
@@ -91,12 +92,27 @@ def cluster_claims(
 
     model = _get_embedding_model(model_name)
 
+    # Tính embedding một lần và normalize → cosine sim = dot product, dùng được
+    # cho cả UMAP (metric=cosine), centroid và cohesion filter ở dưới.
+    embeddings = model.encode(
+        cleaned_claims,
+        batch_size=32,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype(np.float32)
+
     # n_neighbors thấp → UMAP giữ cấu trúc local, claim khác chủ đề ít bị kéo lại gần.
-    # n_components cao hơn (5 → 10-15) để không collapse phân biệt semantic khi giảm chiều.
+    # n_components giữ ở ngưỡng thấp (5) — HDBSCAN là density-based, high-dim
+    # phá tín hiệu density (curse of dimensionality) khiến cluster gom nhầm.
     # min_topic_size adaptive theo sqrt(N): vừa đủ để có cluster, không quá lớn ép gom nhầm.
-    n_neighbors = max(3, min(10, n_samples - 1))
-    n_components = max(2, min(15, n_samples - 2))
+    n_neighbors = max(5, min(15, n_samples - 1))
+    n_components = max(2, min(5, n_samples - 2))
     min_topic_size = max(2, int(math.sqrt(n_samples) / 2))
+    # min_samples càng cao → HDBSCAN càng strict về density, đẩy outlier ra noise
+    # thay vì gom vào cluster lân cận. min_samples=1 (cũ) là quá lỏng và là
+    # nguyên nhân chính khiến cluster chứa claim không liên quan.
+    min_samples = max(2, min(min_topic_size, int(math.sqrt(n_samples) / 2)))
 
     umap_model = UMAP(
         n_neighbors=n_neighbors,
@@ -106,14 +122,13 @@ def cluster_claims(
         random_state=random_state,
     )
 
-    # Tách HDBSCAN ra để chỉnh cluster_selection_method="leaf" (cluster mịn hơn
-    # so với "eom" mặc định — tránh over-merge các topic gần nhau).
-    # min_samples=1 giảm strictness về density, ít noise hơn.
+    # cluster_selection_method="eom" cho cluster ổn định hơn "leaf" khi
+    # min_samples đã đủ chặt — leaf dễ vỡ vụn thành nhiều cluster nhỏ kém chất lượng.
     hdbscan_model = HDBSCAN(
         min_cluster_size=min_topic_size,
-        min_samples=1,
+        min_samples=min_samples,
         metric="euclidean",
-        cluster_selection_method="leaf",
+        cluster_selection_method="eom",
         prediction_data=False,
     )
 
@@ -126,31 +141,65 @@ def cluster_claims(
         verbose=False,
     )
 
-    topics, _ = topic_model.fit_transform(cleaned_claims)
+    # Truyền embeddings đã tính sẵn để BERTopic không encode lại — vừa nhanh hơn
+    # vừa đảm bảo cluster + cohesion filter dùng cùng một không gian vector.
+    topics, _ = topic_model.fit_transform(cleaned_claims, embeddings=embeddings)
 
     cluster_to_indices: Dict[int, List[int]] = defaultdict(list)
     for idx, label in enumerate(topics):
         cluster_to_indices[int(label)].append(idx)
 
-    # Loại bỏ cluster nhiễu (id=-1 của BERTopic), sắp xếp theo size giảm dần
-    # rồi chỉ lấy tối đa max_k cluster lớn nhất trước khi gọi LLM
+    # Hậu kiểm cohesion: với mỗi cluster, tính centroid trên embedding chuẩn hoá
+    # rồi loại claim có cosine sim < ngưỡng. Đây là chốt chặn cuối — kể cả
+    # HDBSCAN gom nhầm 1 outlier vào cluster đông, ta vẫn đẩy nó ra.
+    # Ngưỡng default 0.45: hai claim tiếng Việt cùng chủ đề tài chính thường
+    # >0.55, < 0.4 thường là khác chủ đề hẳn.
+    cohesion_threshold = float(os.getenv("CLUSTER_COHESION_THRESHOLD", "0.45"))
+
+    refined: Dict[int, Dict] = {}
+    for cid, indices in cluster_to_indices.items():
+        if cid == -1 or len(indices) < min_topic_size:
+            continue
+        cluster_emb = embeddings[indices]
+        centroid = cluster_emb.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm < 1e-9:
+            continue
+        centroid = centroid / norm
+        sims = cluster_emb @ centroid  # cosine vì đã normalize
+        keep_mask = sims >= cohesion_threshold
+        kept_indices = [indices[i] for i, k in enumerate(keep_mask) if k]
+        if len(kept_indices) < min_topic_size:
+            # Cluster còn lại quá nhỏ sau khi lọc → drop, ưu tiên chất lượng
+            # hơn coverage như user yêu cầu.
+            continue
+        kept_emb = embeddings[kept_indices]
+        kept_centroid = kept_emb.mean(axis=0)
+        kept_centroid = kept_centroid / max(np.linalg.norm(kept_centroid), 1e-9)
+        kept_sims = kept_emb @ kept_centroid
+        # Representative = claim gần centroid nhất → ổn định và đại diện hơn
+        # c-TF-IDF mặc định của BERTopic (vốn token hoá theo space, lệch với tiếng Việt).
+        rep_local_idx = int(np.argmax(kept_sims))
+        refined[cid] = {
+            "indices": kept_indices,
+            "rep_global_idx": kept_indices[rep_local_idx],
+            "mean_sim": float(kept_sims.mean()),
+        }
+
+    # Sắp xếp theo size giảm dần, tie-break bằng cohesion (mean_sim) để cluster
+    # chặt được ưu tiên khi cùng size. Lấy tối đa max_k cluster.
     sorted_cluster_ids = sorted(
-        (cid for cid in cluster_to_indices if cid != -1),
-        key=lambda cid: len(cluster_to_indices[cid]),
+        refined.keys(),
+        key=lambda cid: (len(refined[cid]["indices"]), refined[cid]["mean_sim"]),
         reverse=True,
     )[:max_k]
 
     prepared = []
     for cluster_id in sorted_cluster_ids:
-        indices = cluster_to_indices[cluster_id]
+        info = refined[cluster_id]
+        indices = info["indices"]
         cluster_claim_list = [cleaned_claims[i] for i in indices]
-
-        rep_docs = topic_model.get_representative_docs(cluster_id)
-        if rep_docs and len(rep_docs) > 0:
-            representative_claim = rep_docs[0]
-        else:
-            representative_claim = cluster_claim_list[0]
-
+        representative_claim = cleaned_claims[info["rep_global_idx"]]
         prepared.append((cluster_id, indices, cluster_claim_list, representative_claim))
 
     # LLM call là I/O-bound (HTTP tới Together). Chạy song song để tổng latency
