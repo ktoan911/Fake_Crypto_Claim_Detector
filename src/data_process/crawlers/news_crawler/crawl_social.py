@@ -83,11 +83,6 @@ DELAY_BETWEEN = 0.3        # giây nghỉ giữa các batch query (giảm rate-l
 # Lưu ý: exa-py SDK chưa expose timeout ở constructor, nên --timeout hiện chỉ
 # có ý nghĩa biểu trưng cho phép tương lai pass xuống. Không dùng trực tiếp ở đây.
 
-# Excerpt = 1 câu đầu tiên đủ dài, ghép với title để tạo đầu ra chuẩn
-# (title thường là đề tựa, câu đầu thường là lead/sapo — ghép lại đủ ý cho LLM phân loại).
-SENTENCE_MIN_CHARS = 30      # câu ngắn hơn ngưỡng này coi như chưa đủ ý → thử câu kế tiếp
-SENTENCE_MAX_CHARS = 300     # nếu câu quá dài thì cắt mềm tại khoảng trắng
-
 # 2. BỘ TỪ KHÓA ĐƯỢC THIẾT KẾ ĐẶC TRỊ CHO TÀI CHÍNH VIỆT NAM
 # Chia theo nhóm chủ đề để đảm bảo 50 tin lấy được phủ đều, không bị dồn vào 1 chủ đề.
 QUERY_GROUPS = {
@@ -210,69 +205,6 @@ def clean_text(text):
     return text
 
 
-def first_sentence(text, min_chars=SENTENCE_MIN_CHARS, max_chars=SENTENCE_MAX_CHARS):
-    """
-    Trích câu đầu tiên đủ ý từ văn bản.
-    - Bỏ qua các câu quá ngắn (< min_chars) — thường là tiêu đề phụ, ngày tháng, "Đọc thêm:"...
-    - Nếu câu vượt max_chars, cắt mềm tại khoảng trắng cuối cùng + "…"
-    - Trả về chuỗi rỗng nếu không tìm được câu phù hợp.
-    """
-    if not text:
-        return ""
-
-    # Chuẩn hoá: bỏ xuống dòng thừa, gộp khoảng trắng
-    cleaned = " ".join(text.split())
-
-    # Tách câu thô theo . ! ? — đủ tốt cho tiếng Việt
-    parts = re.split(r"(?<=[.!?])\s+", cleaned)
-
-    for sent in parts:
-        sent = sent.strip()
-        if len(sent) < min_chars:
-            continue
-        if len(sent) <= max_chars:
-            return sent
-        # Câu quá dài → cắt mềm
-        window = sent[:max_chars]
-        space = window.rfind(" ")
-        if space >= int(max_chars * 0.5):
-            return window[:space].rstrip(",;:") + "…"
-        return window + "…"
-
-    return ""
-
-
-def build_record_text(title, content):
-    """
-    Đầu ra chuẩn = title + câu đầu tiên đủ ý của content (đã được làm sạch).
-    Tránh lặp nếu câu đầu đã chứa title (hoặc ngược lại).
-    """
-    title = clean_text(title or "")
-    cleaned_content = clean_text(content or "")
-
-    # Nếu title xuất hiện 2+ lần trong content (header lặp), chỉ giữ phần sau lần lặp cuối
-    if title and len(title) >= 15:
-        occurrences = [m.start() for m in re.finditer(re.escape(title), cleaned_content)]
-        if len(occurrences) >= 2:
-            cleaned_content = cleaned_content[occurrences[-1] + len(title):].strip()
-
-    sent = first_sentence(cleaned_content)
-
-    if not sent:
-        return title
-    if not title:
-        return sent
-
-    # Tránh lặp: nếu câu đầu chứa toàn bộ title (hoặc gần đúng) thì chỉ trả về câu đó
-    if title.lower() in sent.lower():
-        return sent
-
-    # Đảm bảo title có dấu kết câu trước khi nối
-    if title[-1] not in ".!?":
-        title = title + "."
-    return f"{title} {sent}"
-
-
 def search(query):
     # start_published_date dùng HOURS_BACK (CLI override được)
     cutoff = (datetime.now(tz=timezone.utc) - timedelta(hours=HOURS_BACK)).isoformat()
@@ -366,7 +298,7 @@ def crawl():
     Mỗi article = {"title": str, "url": str, "published_at": int|None}.
     """
     seen_url = set()
-    seen_content = set()
+    seen_title = set()
     state_lock = threading.Lock()
 
     quota = _build_quota(TARGET_COUNT, QUERY_GROUPS)
@@ -391,15 +323,15 @@ def crawl():
                 if not keep(item):
                     continue
 
-                content = build_record_text(item.title, item.text)
-                key = _norm_for_dedup(content)
-                if not key or key in seen_content:
+                title = clean_text(item.title or "")
+                key = _norm_for_dedup(title)
+                if not key or key in seen_title:
                     continue
 
                 seen_url.add(url)
-                seen_content.add(key)
+                seen_title.add(key)
                 articles.append({
-                    "title": content,  # title + 1 câu đầu, đã clean — dùng làm claim
+                    "title": title,
                     "url": url,
                     "published_at": _published_to_unix(item.published_date),
                 })

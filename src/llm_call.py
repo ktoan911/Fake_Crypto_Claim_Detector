@@ -75,6 +75,8 @@ Rules:
 The topic should be general enough to cover all claims, but specific enough to be meaningful.
 """
 
+SYSTEM_PROMPT_RUMOR_GENERATION = "Bạn là hệ thống tạo tin đồn tài chính tiếng Việt."
+
 
 def build_prompt_extraction(claim: str) -> str:
     tz = pytz.timezone("Asia/Ho_Chi_Minh")
@@ -171,6 +173,43 @@ Claim trung tâm:
 Danh sách claim:
 {claims_text}
 """
+
+
+def build_prompt_generate_rumors_from_news(news_items, target_count=50):
+    news_text = []
+    for idx, item in enumerate(news_items, start=1):
+        source_ref = item.get("source_ref") or idx
+        title = str(item.get("title") or "")[:220]
+        content = str(item.get("content") or item.get("description") or "")[:700]
+        news_text.append(f"[{source_ref}] {title}\n{content}")
+
+    return f"""
+Dựa vào các tin tức sau, hãy bịa ra đúng {target_count} tin đồn/claim tài chính tiếng Việt.
+
+Yêu cầu:
+- Trả về ONLY JSON array, không giải thích.
+- Mỗi item có format: {{"claim": "...", "source_ref": 1}}
+- Mỗi claim chỉ 1-2 câu ngắn.
+- Có thể đúng, sai, thiếu chắc chắn hoặc chỉ cùng chủ đề.
+- source_ref là số trong [] của tin nguồn liên quan nhất.
+
+Tin nguồn:
+{chr(10).join(news_text)}
+""".strip()
+
+
+def generate_rumor_claims_from_news(news_items, target_count=50):
+    prompt = build_prompt_generate_rumors_from_news(news_items, target_count)
+    response = _chat_completion_with_retry(
+        model="Qwen/Qwen3.5-9B",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT_RUMOR_GENERATION},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=4096,
+        temperature=0.8,
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 def generate_cluster_content_with_llm(
