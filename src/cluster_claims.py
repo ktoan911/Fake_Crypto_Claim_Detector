@@ -69,6 +69,10 @@ def cluster_claims(
     if not cleaned_claims:
         raise ValueError("Input claims list is empty after cleaning.")
 
+    # e5 models cần prefix "passage: " cho clustering để activate correct embedding space
+    _is_e5 = "e5" in model_name.lower()
+    encode_claims = [f"passage: {c}" for c in cleaned_claims] if _is_e5 else cleaned_claims
+
     n_samples = len(cleaned_claims)
 
     if n_samples < 3:
@@ -95,23 +99,20 @@ def cluster_claims(
     # Tính embedding một lần và normalize → cosine sim = dot product, dùng được
     # cho cả UMAP (metric=cosine), centroid và cohesion filter ở dưới.
     embeddings = model.encode(
-        cleaned_claims,
+        encode_claims,
         batch_size=32,
         show_progress_bar=False,
         convert_to_numpy=True,
         normalize_embeddings=True,
     ).astype(np.float32)
 
-    # n_neighbors thấp → UMAP giữ cấu trúc local, claim khác chủ đề ít bị kéo lại gần.
-    # n_components giữ ở ngưỡng thấp (5) — HDBSCAN là density-based, high-dim
-    # phá tín hiệu density (curse of dimensionality) khiến cluster gom nhầm.
-    # min_topic_size adaptive theo sqrt(N): vừa đủ để có cluster, không quá lớn ép gom nhầm.
+    # n_neighbors: giữ cấu trúc local, claim khác chủ đề ít bị kéo lại gần.
+    # n_components: tăng lên 10 để giữ nhiều cấu trúc topic hơn trước khi HDBSCAN
+    # chạy — 5 chiều trước đây mất signal phân biệt các chủ đề gần nhau.
+    # min_topic_size adaptive theo sqrt(N).
     n_neighbors = max(5, min(15, n_samples - 1))
-    n_components = max(2, min(5, n_samples - 2))
+    n_components = max(2, min(10, n_samples // 5))
     min_topic_size = max(2, int(math.sqrt(n_samples) / 2))
-    # min_samples càng cao → HDBSCAN càng strict về density, đẩy outlier ra noise
-    # thay vì gom vào cluster lân cận. min_samples=1 (cũ) là quá lỏng và là
-    # nguyên nhân chính khiến cluster chứa claim không liên quan.
     min_samples = max(2, min(min_topic_size, int(math.sqrt(n_samples) / 2)))
 
     umap_model = UMAP(
@@ -150,11 +151,11 @@ def cluster_claims(
         cluster_to_indices[int(label)].append(idx)
 
     # Hậu kiểm cohesion: với mỗi cluster, tính centroid trên embedding chuẩn hoá
-    # rồi loại claim có cosine sim < ngưỡng. Đây là chốt chặn cuối — kể cả
-    # HDBSCAN gom nhầm 1 outlier vào cluster đông, ta vẫn đẩy nó ra.
-    # Ngưỡng default 0.45: hai claim tiếng Việt cùng chủ đề tài chính thường
-    # >0.55, < 0.4 thường là khác chủ đề hẳn.
-    cohesion_threshold = float(os.getenv("CLUSTER_COHESION_THRESHOLD", "0.45"))
+    # rồi loại claim có cosine sim < ngưỡng. Đây là chốt chặn cuối.
+    # Ngưỡng 0.55: hai claim cùng chủ đề tài chính tiếng Việt thường đạt >0.6,
+    # khác chủ đề thường < 0.5. Dùng 0.45 trước đây quá lỏng — cluster 3 bị lẫn
+    # đô thị/hạ tầng vào vì cosine sim ~0.47-0.50 vẫn pass ngưỡng cũ.
+    cohesion_threshold = float(os.getenv("CLUSTER_COHESION_THRESHOLD", "0.55"))
 
     refined: Dict[int, Dict] = {}
     for cid, indices in cluster_to_indices.items():
@@ -234,7 +235,7 @@ def cluster_claims(
                 "size": len(indices),
                 "representative_claim": representative_claim,
                 "cluster_content": generated_content,
-                "claims": cluster_claim_list[:5],
+                "claims": cluster_claim_list[:10],
             }
         )
 
@@ -286,7 +287,7 @@ def load_claims_from_opensearch(timestamp_seconds: int = 86400) -> List[str]:
 
 def run_clustering_pipeline(
     timestamp_seconds: int = 86400,
-    model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    model_name: str = "intfloat/multilingual-e5-base",
 ) -> Dict:
     """
     Hàm để gọi trực tiếp từ các file khác.

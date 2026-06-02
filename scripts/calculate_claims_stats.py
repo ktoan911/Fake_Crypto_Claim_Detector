@@ -148,7 +148,7 @@ def calculate_and_save_stats(target_date: datetime = None):
 
         result_dict_cluster = run_clustering_pipeline(
             timestamp_seconds=864000,
-            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+            model_name="intfloat/multilingual-e5-base",
         )
 
         doc_id = target_date.strftime("%Y-%m-%d")

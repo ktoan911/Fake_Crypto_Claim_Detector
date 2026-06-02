@@ -223,42 +223,67 @@ def parse_rumor_claims(text: str) -> List[Dict[str, Any]]:
 
 
 def build_rumor_articles(
-    news_items: List[Dict[str, Any]], target_count: int
+    news_items: List[Dict[str, Any]],
+    target_count: int,
+    max_retries: int = 2,
 ) -> List[Dict[str, Any]]:
-    raw_output = generate_rumor_claims_from_news(
-        news_items=news_items,
-        target_count=target_count,
-    )
-    rumors = parse_rumor_claims(raw_output)
-    if not rumors:
-        LOGGER.warning(
-            "Không parse được rumor claim từ LLM output: %r", raw_output[:300]
+    rumors: List[Dict[str, Any]] = []
+    total_attempts = max(1, max_retries + 1)
+    for attempt in range(1, total_attempts + 1):
+        raw_output = generate_rumor_claims_from_news(
+            news_items=news_items,
+            target_count=target_count,
         )
-    ref_map = {int(item["source_ref"]): item for item in news_items}
+        rumors = parse_rumor_claims(raw_output)
+        if rumors:
+            if attempt > 1:
+                LOGGER.info("LLM parse OK ở lần thử %d/%d", attempt, total_attempts)
+            break
+        preview = (raw_output or "")[:300] if isinstance(raw_output, str) else repr(raw_output)[:300]
+        LOGGER.warning(
+            "Lần thử %d/%d: không parse được rumor claim từ LLM: %r",
+            attempt,
+            total_attempts,
+            preview,
+        )
+    else:
+        LOGGER.error(
+            "Bỏ qua batch (%d tin nguồn) sau %d lần LLM không trả về JSON hợp lệ.",
+            len(news_items),
+            total_attempts,
+        )
+        return []
+
+    ref_map = {item["source_ref"]: item for item in news_items}
 
     articles: List[Dict[str, Any]] = []
-    for idx, rumor in enumerate(rumors):
+    skipped_no_ref = 0
+    for rumor in rumors:
         claim = _compact_text(rumor.get("claim"))
         if not claim:
             continue
 
         source_ref = rumor.get("source_ref")
         source_item = ref_map.get(source_ref) if source_ref is not None else None
-        if source_item is None and news_items:
-            source_item = news_items[idx % len(news_items)]
-            source_ref = source_item.get("source_ref")
         if source_item is None:
-            source_item = {}
+            skipped_no_ref += 1
+            continue
 
         articles.append(
             {
                 "title": claim,
                 "url": source_item.get("url", ""),
-                "published_at": source_item.get("published_at_unix"),
+                "published_at_unix": source_item.get("published_at_unix"),
                 "source_ref": source_ref,
                 "source_news_id": source_item.get("source_news_id", ""),
                 "source_news_title": source_item.get("title", ""),
             }
+        )
+
+    if skipped_no_ref:
+        LOGGER.warning(
+            "Bỏ %d rumor không khớp source_ref hợp lệ (tránh gán sai nguồn).",
+            skipped_no_ref,
         )
 
     return articles[:target_count]
@@ -330,7 +355,7 @@ def predict_and_index(
                 "checked_at": checked_at,
                 "source": DEFAULT_SOURCE,
                 "url": article.get("url", ""),
-                "published_at": article.get("published_at"),
+                "published_at": article.get("published_at_unix"),
                 "generated": True,
                 "generated_from_index": kb_index_name,
                 "source_news_id": article.get("source_news_id", ""),
@@ -393,6 +418,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Chỉ search + sinh tin đồn, không predict/index vào OpenSearch claims.",
     )
     parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Số lần retry LLM nếu parse fail; vượt ngưỡng thì bỏ batch để khỏi tốn quota.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -411,6 +442,8 @@ def main() -> None:
         raise ValueError("--limit phải lớn hơn 0")
     if args.source_limit <= 0:
         raise ValueError("--source-limit phải lớn hơn 0")
+    if args.max_retries < 0:
+        raise ValueError("--max-retries không được âm")
 
     kb_index_name = os.getenv("OP_KB_NAME", "news_kb")
     news_items = search_news_kb(
@@ -423,7 +456,11 @@ def main() -> None:
         LOGGER.warning("Không tìm thấy tin nguồn phù hợp trong %s.", kb_index_name)
         return
 
-    articles = build_rumor_articles(news_items, target_count=args.limit)
+    articles = build_rumor_articles(
+        news_items,
+        target_count=args.limit,
+        max_retries=args.max_retries,
+    )
     LOGGER.info("Generated %d rumor claims", len(articles))
 
     if args.no_index:

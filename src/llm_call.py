@@ -201,7 +201,7 @@ Tin nguồn:
 def generate_rumor_claims_from_news(news_items, target_count=50):
     prompt = build_prompt_generate_rumors_from_news(news_items, target_count)
     response = _chat_completion_with_retry(
-        model="Qwen/Qwen3.5-9B",
+        model="Qwen/Qwen3.7-Max",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT_RUMOR_GENERATION},
             {"role": "user", "content": prompt},
@@ -220,7 +220,7 @@ def generate_cluster_content_with_llm(
 
     try:
         response = _chat_completion_with_retry(
-            model="Qwen/Qwen3.5-9B",
+            model="Qwen/Qwen3.7-Max",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_TOPIC},
                 {"role": "user", "content": cluster_all},
@@ -312,7 +312,7 @@ def split_claim(claim: str) -> List[str]:
 
         for attempt in range(3):
             response = _chat_completion_with_retry(
-                model="Qwen/Qwen3.5-9B",
+                model="Qwen/Qwen3.7-Max",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},
                     {"role": "user", "content": prompt},
