@@ -360,19 +360,19 @@ class LLMScorer:
         # in-place (bf16 <-> fp32 upcast), which is not safe to run concurrently.
         with self._inference_lock, torch.no_grad():
             outputs = self.model(input_ids=input_tensor, attention_mask=mask_tensor)
-            # outputs.logits: [batch, seq_len, vocab_size]
-
-            # Find the position where we predict the label token
-            # This is the last non-pad position
+            # outputs.logits: [batch, seq_len, vocab_size] — can be ~600MB for Qwen vocab.
+            # Extract pred_logits immediately then delete outputs to free RAM before
+            # the label extraction below.
             seq_lengths = mask_tensor.sum(dim=1)
             batch_idx = torch.arange(input_tensor.size(0), device=self.device)
             pred_pos = seq_lengths - 1
-
-            pred_logits = outputs.logits[batch_idx, pred_pos, :]  # [batch, vocab_size]
+            pred_logits = outputs.logits[batch_idx, pred_pos, :].clone()  # [batch, vocab_size]
+            del outputs, input_tensor, mask_tensor
 
         # Extract logits only for label tokens
         label_ids = [self.label_token_ids[label] for label in self.labels]
         label_logits = torch.stack([pred_logits[:, idx] for idx in label_ids], dim=-1)
+        del pred_logits
 
         return label_logits  # [batch, num_labels] - RAW LOGITS
 

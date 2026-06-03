@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
 import re
@@ -667,6 +668,14 @@ class FusionClaimVerifier:
             seen.add(part)
             normalized.append(part)
 
+        # Cap số sub-claims để tránh OOM khi claim rất dài và splitter trả về nhiều items.
+        _max_sub = int(os.getenv("MAX_SUB_CLAIMS", "5"))
+        if len(normalized) > _max_sub:
+            logger.warning(
+                f"[fusion_inference] sub-claims capped {len(normalized)} -> {_max_sub} (MAX_SUB_CLAIMS={_max_sub})"
+            )
+            normalized = normalized[:_max_sub]
+
         return normalized or [text]
 
     def _aggregate_sub_claim_predictions(
@@ -874,6 +883,7 @@ class FusionClaimVerifier:
                 del retrieval_encoded
                 del fusion_output
                 del probs_batch
+                gc.collect()
 
         if self.debug:
             logger.info(

@@ -62,6 +62,8 @@ _max_pending = int(os.getenv("MAX_PENDING_REQUESTS", "64"))
 _inference_timeout_s = float(os.getenv("INFERENCE_TIMEOUT_S", "120"))
 _batch_max_size = int(os.getenv("BATCH_MAX_SIZE", "8"))
 _batch_max_wait_ms = float(os.getenv("BATCH_MAX_WAIT_MS", "50"))
+# Giới hạn độ dài claim để tránh OOM trên server yếu. 0 = không giới hạn.
+_max_claim_chars = int(os.getenv("MAX_CLAIM_CHARS", "0"))
 
 
 class _BatchScheduler:
@@ -259,6 +261,12 @@ async def verify_claim(request: ClaimRequest, http_request: Request):
                 "error": "Claim rỗng.",
             },
         )
+
+    if _max_claim_chars > 0 and len(claim_text) > _max_claim_chars:
+        logger.warning(
+            f"[verify] claim quá dài ({len(claim_text)} chars > {_max_claim_chars}), truncate"
+        )
+        claim_text = claim_text[:_max_claim_chars]
 
     domain = http_request.headers.get("host", "unknown")
     logger.info(f"[verify] domain={domain} claim={claim_text!r}")

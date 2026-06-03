@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+from random import random
 import re
 import sys
 import uuid
@@ -395,12 +396,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Query BM25 dùng để lấy tin nguồn từ news_kb.",
     )
     parser.add_argument(
-        "--limit",
-        type=int,
-        default=50,
-        help="Số tin đồn/claim cần sinh.",
-    )
-    parser.add_argument(
         "--source-limit",
         type=int,
         default=20,
@@ -438,8 +433,6 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    if args.limit <= 0:
-        raise ValueError("--limit phải lớn hơn 0")
     if args.source_limit <= 0:
         raise ValueError("--source-limit phải lớn hơn 0")
     if args.max_retries < 0:
@@ -458,7 +451,7 @@ def main() -> None:
 
     articles = build_rumor_articles(
         news_items,
-        target_count=args.limit,
+        target_count=random.randint(30, 60),
         max_retries=args.max_retries,
     )
     LOGGER.info("Generated %d rumor claims", len(articles))
