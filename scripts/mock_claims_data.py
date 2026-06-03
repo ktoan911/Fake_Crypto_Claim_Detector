@@ -109,4 +109,4 @@ def generate_mock_claims(num_claims=100):
 
 
 if __name__ == "__main__":
-    generate_mock_claims(4000)
+    generate_mock_claims(50)

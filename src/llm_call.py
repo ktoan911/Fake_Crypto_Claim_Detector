@@ -49,7 +49,9 @@ class _StreamedResponse:
 
 def _collect_stream(stream) -> _StreamedResponse:
     content = "".join(
-        (chunk.choices[0].delta.content or "") for chunk in stream
+        (chunk.choices[0].delta.content or "")
+        for chunk in stream
+        if chunk.choices
     )
     return _StreamedResponse(content)
 
