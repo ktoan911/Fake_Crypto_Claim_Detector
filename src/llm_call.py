@@ -31,14 +31,44 @@ _RETRYABLE_ERRORS = (
 )
 
 
+class _StreamedMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _StreamedChoice:
+    def __init__(self, content: str):
+        self.message = _StreamedMessage(content)
+
+
+class _StreamedResponse:
+    """Wraps a collected stream so callers can use .choices[0].message.content."""
+    def __init__(self, content: str):
+        self.choices = [_StreamedChoice(content)]
+
+
+def _collect_stream(stream) -> _StreamedResponse:
+    content = "".join(
+        (chunk.choices[0].delta.content or "") for chunk in stream
+    )
+    return _StreamedResponse(content)
+
+
 def _chat_completion_with_retry(**kwargs):
     """Wrap client.chat.completions.create với retry + exponential backoff cho
     các lỗi mạng/timeout/rate-limit. Lỗi non-retryable (Auth, BadRequest...)
-    được raise ngay để không che lỗi cấu hình."""
+    được raise ngay để không che lỗi cấu hình.
+    Nếu model yêu cầu streaming, tự động retry với stream=True và gộp chunks."""
     last_err = None
     for attempt in range(_TOGETHER_MAX_RETRIES):
         try:
             return client.chat.completions.create(**kwargs)
+        except together_error.BadRequestError as e:
+            # Some models only support streaming — retry once transparently
+            if "streaming_required" in str(e) and not kwargs.get("stream"):
+                stream = client.chat.completions.create(**kwargs, stream=True)
+                return _collect_stream(stream)
+            raise
         except _RETRYABLE_ERRORS as e:
             last_err = e
             if attempt == _TOGETHER_MAX_RETRIES - 1:
@@ -201,7 +231,7 @@ Tin nguồn:
 def generate_rumor_claims_from_news(news_items, target_count=50):
     prompt = build_prompt_generate_rumors_from_news(news_items, target_count)
     response = _chat_completion_with_retry(
-        model="Qwen/Qwen3.7-Max",
+        model="Qwen/Qwen3.6-Plus",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT_RUMOR_GENERATION},
             {"role": "user", "content": prompt},
@@ -220,7 +250,7 @@ def generate_cluster_content_with_llm(
 
     try:
         response = _chat_completion_with_retry(
-            model="Qwen/Qwen3.7-Max",
+            model="Qwen/Qwen3.6-Plus",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_TOPIC},
                 {"role": "user", "content": cluster_all},
@@ -312,7 +342,7 @@ def split_claim(claim: str) -> List[str]:
 
         for attempt in range(3):
             response = _chat_completion_with_retry(
-                model="Qwen/Qwen3.7-Max",
+                model="Qwen/Qwen3.6-Plus",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},
                     {"role": "user", "content": prompt},

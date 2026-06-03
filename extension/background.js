@@ -35,7 +35,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         func: (claim) => {
             window.__claimShowLoading && window.__claimShowLoading();
 
-            fetch("http://localhost:8000/verify", {
+            fetch("http://localhost:7860/verify", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ claim })
