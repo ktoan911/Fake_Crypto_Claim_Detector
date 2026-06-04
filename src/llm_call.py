@@ -43,15 +43,14 @@ class _StreamedChoice:
 
 class _StreamedResponse:
     """Wraps a collected stream so callers can use .choices[0].message.content."""
+
     def __init__(self, content: str):
         self.choices = [_StreamedChoice(content)]
 
 
 def _collect_stream(stream) -> _StreamedResponse:
     content = "".join(
-        (chunk.choices[0].delta.content or "")
-        for chunk in stream
-        if chunk.choices
+        (chunk.choices[0].delta.content or "") for chunk in stream if chunk.choices
     )
     return _StreamedResponse(content)
 
@@ -76,7 +75,7 @@ def _chat_completion_with_retry(**kwargs):
             if attempt == _TOGETHER_MAX_RETRIES - 1:
                 break
             # Exponential backoff + jitter: 2s, 4s, 8s ...
-            sleep_s = (2 ** attempt) + random.uniform(0, 1)
+            sleep_s = (2**attempt) + random.uniform(0, 1)
             print(
                 f"[WARN] Together API {type(e).__name__} "
                 f"(attempt {attempt + 1}/{_TOGETHER_MAX_RETRIES}), "
@@ -84,6 +83,7 @@ def _chat_completion_with_retry(**kwargs):
             )
             time.sleep(sleep_s)
     raise last_err
+
 
 SYSTEM_PROMPT_EXTRACTION = "You are an information extraction expert."
 
@@ -216,7 +216,7 @@ def build_prompt_generate_rumors_from_news(news_items, target_count=50):
         news_text.append(f"[{source_ref}] {title}\n{content}")
 
     return f"""
-Dựa vào các tin tức sau, hãy bịa ra đúng {target_count} tin đồn/claim tài chính tiếng Việt.
+Dựa vào các tin tức sau, hãy bịa ra đúng {target_count} tin đồn/claim tài chính tiếng Việt như kiểu chúng được bàn tán xôn xao trên các diễn .
 
 Yêu cầu:
 - Trả về ONLY JSON array, không giải thích.
@@ -224,6 +224,8 @@ Yêu cầu:
 - Mỗi claim chỉ 1-2 câu ngắn.
 - Có thể đúng, sai, thiếu chắc chắn hoặc chỉ cùng chủ đề.
 - source_ref là số trong [] của tin nguồn liên quan nhất.
+- Các câu được sinh ra cần được gắn với ít nhất 1 tin nguồn, dựa trên nội dung tin đó, không hoàn toàn bịa ra ngoài không liên quan.
+- Các câu tin đồn không được chưa những cụm từ như "có tin đồn là", "người ta bàn tán rằng",... hay các cụm tương tự vì các cụm này thể hiện câu được sinh ra là được bịa ra chứ không phải tin đồn được cào trên các trang diễn đàn.
 
 Tin nguồn:
 {chr(10).join(news_text)}
