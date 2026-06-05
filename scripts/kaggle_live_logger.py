@@ -1,15 +1,4 @@
 """
-Cell đầu notebook:
-
-    import os, sys
-    sys.path.insert(0, "/kaggle/working")   # thư mục chứa src/
-    os.environ["OP_HOST"] = "..."
-    os.environ["OP_PORT"] = "25060"
-    os.environ["OP_AUTH_USERNAME"] = "doadmin"
-    os.environ["OP_AUTH_PASSWORD"] = "..."
-
-    exec(open("kaggle_live_logger.py").read())
-
 Mỗi lần chạy tạo 1 document duy nhất, id = ngày giờ bắt đầu (VD: 2024-01-15T08:30).
 Mỗi print() append thêm dòng vào field `content`, cách nhau bằng \\n.
 """
