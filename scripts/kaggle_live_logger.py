@@ -5,6 +5,16 @@ Mỗi print() append thêm dòng vào field `content`, cách nhau bằng \\n.
 
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
+
+# Khi chạy trực tiếp: __file__ = .../scripts/kaggle_live_logger.py → parents[1] = project root
+# Khi exec() từ notebook cell: __file__ không tồn tại → dùng cwd (notebook phải ở project root)
+try:
+    _root = Path(__file__).resolve().parents[1]
+except NameError:
+    _root = Path.cwd()
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
 
 from src.database.opensearch import OpenSearchKB  # noqa: E402
 
