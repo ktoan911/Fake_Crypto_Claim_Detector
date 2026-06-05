@@ -543,6 +543,25 @@ def _kg_list_runs_sync(limit: int) -> list[dict]:
     return [{"doc_id": h["_id"], **h["_source"]} for h in resp["hits"]["hits"]]
 
 
+def _kg_status_sync() -> dict:
+    """Gọi Kaggle API để lấy trạng thái kernel (RUNNING / COMPLETE / ERROR ...)."""
+    import requests
+    username = os.getenv("KAGGLE_USERNAME", "")
+    key = os.getenv("KAGGLE_KEY", "")
+    kernel = os.getenv("KAGGLE_KERNEL", "")  # dạng "owner/kernel-slug"
+    if not (username and key and kernel):
+        return {"status": "UNKNOWN"}
+    owner, slug = kernel.split("/", 1)
+    resp = requests.get(
+        "https://www.kaggle.com/api/v1/kernels/status",
+        params={"userName": owner, "kernelSlug": slug},
+        auth=(username, key),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 @app.get("/kaggle/logs")
 async def get_kaggle_logs():
     """
