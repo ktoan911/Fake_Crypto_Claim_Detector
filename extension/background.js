@@ -54,5 +54,5 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
 chrome.action.onClicked.addListener((tab) => {
     // Đổi link này thành tên miền bạn muốn nhảy tới
-    chrome.tabs.create({ url: "https://www.google.com/" });
+    chrome.tabs.create({ url: "http://localhost:3000/dashboard" });
 });

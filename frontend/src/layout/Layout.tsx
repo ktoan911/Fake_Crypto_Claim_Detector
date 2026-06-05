@@ -10,6 +10,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
   // Listen for 401 responses and disconnect wallet automatically
 
+  const isAdminRoute = pathname.startsWith("/admin");
+
+  if (isAdminRoute) {
+    return <>{children}</>;
+  }
+
   return (
     <div>
       <Header />

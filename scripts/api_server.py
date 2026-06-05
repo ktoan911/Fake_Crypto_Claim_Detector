@@ -228,6 +228,70 @@ class ClaimRequest(BaseModel):
     claim: str
 
 
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/admin/login")
+async def admin_login(request: AdminLoginRequest):
+    import bcrypt
+    from opensearchpy.exceptions import ConnectionError as OSConnectionError
+
+    try:
+        client = _kg_os_client()
+        if not client.indices.exists(index="admin"):
+            return JSONResponse(
+                status_code=503,
+                content={"success": False, "error": "Hệ thống xác thực chưa được khởi tạo."},
+            )
+
+        # Chỉ query theo username, verify hash trong Python để tránh timing attack
+        resp = client.search(
+            index="admin",
+            body={"size": 1, "query": {"term": {"username": request.username}}},
+        )
+        hits = resp.get("hits", {}).get("hits", [])
+
+        _INVALID = JSONResponse(
+            status_code=401,
+            content={"success": False, "error": "Tên đăng nhập hoặc mật khẩu không đúng."},
+        )
+
+        if not hits:
+            # Vẫn chạy checkpw trên dummy hash để giữ thời gian phản hồi đồng đều
+            bcrypt.checkpw(b"dummy", bcrypt.hashpw(b"dummy", bcrypt.gensalt()))
+            return _INVALID
+
+        stored_hash: str = hits[0]["_source"].get("password", "")
+        try:
+            match = bcrypt.checkpw(
+                request.password.encode("utf-8"),
+                stored_hash.encode("utf-8"),
+            )
+        except Exception:
+            return _INVALID
+
+        if match:
+            logger.info(f"[admin/login] success user={request.username!r}")
+            return {"success": True}
+
+        return _INVALID
+
+    except OSConnectionError as e:
+        logger.warning(f"[admin/login] OpenSearch unreachable: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "error": "Không thể kết nối đến hệ thống."},
+        )
+    except Exception as e:
+        logger.error(f"[admin/login] error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": "Lỗi máy chủ nội bộ."},
+        )
+
+
 @app.get("/health")
 def health(request: Request):
     logger.info(f"[health] domain={request.headers.get('host', 'unknown')}")
@@ -359,6 +423,8 @@ async def claims_stats(date: str = None):
       stats mới nhất hiện có (không mặc định "hôm nay" để tránh trả rỗng khi
       crawler/stats chưa kịp chạy xong cho ngày hiện tại).
     """
+    from opensearchpy.exceptions import ConnectionError as OSConnectionError
+
     try:
         client = _stats_kb.client
         index = _stats_kb.index
@@ -389,6 +455,8 @@ async def claims_stats(date: str = None):
         try:
             resp = client.get(index=index, id=date)
             return resp.get("_source", {})
+        except OSConnectionError:
+            raise
         except Exception:
             logger.warning(
                 f"Stats for date {date} not found. Looking for the most recent stats..."
@@ -401,11 +469,20 @@ async def claims_stats(date: str = None):
                 "error": f"No stats data available in index '{index}'.",
             }
 
+    except OSConnectionError as e:
+        logger.warning(f"[claims/stats] OpenSearch unreachable: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "error": "OpenSearch service is unreachable. Please check the connection."},
+        )
     except Exception as e:
         import traceback
 
         logger.error(f"[claims/stats] {traceback.format_exc()}")
-        return {"status": "error", "error": str(e)}
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": str(e)},
+        )
 
 
 # ── Kaggle notebook log endpoints ─────────────────────────────────────────────

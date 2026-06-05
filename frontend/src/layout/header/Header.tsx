@@ -37,7 +37,7 @@ export default function Header() {
               <Image src="/LOGO.png" alt="Biểu trưng" width={35} height={42} />
             </Link>
             <h1 className="text-2xl font-semibold hidden md:flex bg-clip-text text-transparent bg-[image:var(--FN-Gradient-2)]">
-              Radar Lừa Đảo
+              Fake Finance Detector
             </h1>
           </div>
           <div className="h-full hidden lg:flex items-center justify-center ">
