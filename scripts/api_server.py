@@ -1,15 +1,17 @@
 import asyncio
 import hashlib
+import json
 import os
 import sys
 import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
 
@@ -54,7 +56,10 @@ _claim_cache: _TTLCache = _TTLCache(maxsize=500, ttl=3600.0)
 _stats_kb: OpenSearchKB | None = None
 _batch_scheduler: "_BatchScheduler | None" = None
 
-# Counter các request đang in-flight (đang chờ batch + đang inference). Dùng để
+# ── Kaggle log via OpenSearch ─────────────────────────────────────────────────
+_CRAWL_LOGS_INDEX = "crawl_logs"
+
+# ── Counter các request đang in-flight (đang chờ batch + đang inference). Dùng để
 # từ chối sớm khi queue quá dài, tránh tích lũy RAM khi burst.
 _pending_lock = threading.Lock()
 _pending_count = 0
@@ -401,3 +406,145 @@ async def claims_stats(date: str = None):
 
         logger.error(f"[claims/stats] {traceback.format_exc()}")
         return {"status": "error", "error": str(e)}
+
+
+# ── Kaggle notebook log endpoints ─────────────────────────────────────────────
+
+
+def _kg_os_client():
+    """OpenSearch client dùng chung với phần còn lại của project."""
+    from opensearchpy import OpenSearch, RequestsHttpConnection
+    return OpenSearch(
+        hosts=[{"host": os.getenv("OP_HOST"), "port": int(os.getenv("OP_PORT")), "scheme": "https"}],
+        http_auth=(os.getenv("OP_AUTH_USERNAME"), os.getenv("OP_AUTH_PASSWORD")),
+        verify_certs=True,
+        http_compress=True,
+        timeout=10,
+        connection_class=RequestsHttpConnection,
+    )
+
+
+def _kg_get_doc_sync(doc_id: str | None) -> dict | None:
+    """
+    Lấy 1 document từ crawl_logs.
+    doc_id = None → trả document mới nhất theo start_ts.
+    """
+    client = _kg_os_client()
+    if not client.indices.exists(index=_CRAWL_LOGS_INDEX):
+        return None
+    if doc_id:
+        try:
+            r = client.get(index=_CRAWL_LOGS_INDEX, id=doc_id)
+            return {"doc_id": r["_id"], **r["_source"]}
+        except Exception:
+            return None
+    # Lấy doc mới nhất
+    resp = client.search(
+        index=_CRAWL_LOGS_INDEX,
+        body={"size": 1, "sort": [{"start_ts": {"order": "desc"}}], "query": {"match_all": {}}},
+    )
+    hits = resp["hits"]["hits"]
+    if not hits:
+        return None
+    return {"doc_id": hits[0]["_id"], **hits[0]["_source"]}
+
+
+def _kg_list_runs_sync(limit: int) -> list[dict]:
+    """Trả danh sách các run gần nhất (mỗi run = 1 doc)."""
+    client = _kg_os_client()
+    if not client.indices.exists(index=_CRAWL_LOGS_INDEX):
+        return []
+    resp = client.search(
+        index=_CRAWL_LOGS_INDEX,
+        body={
+            "size": limit,
+            "sort": [{"start_ts": {"order": "desc"}}],
+            "query": {"match_all": {}},
+            "_source": ["start_ts"],   # không trả content để nhẹ
+        },
+    )
+    return [{"doc_id": h["_id"], **h["_source"]} for h in resp["hits"]["hits"]]
+
+
+@app.get("/kaggle/logs")
+async def get_kaggle_logs():
+    """
+    Tự động xác định log cần trả:
+    - Notebook đang chạy → lấy document mới nhất (đang được ghi).
+    - Notebook không chạy → lấy document mới nhất (run gần nhất).
+    Trả thêm field `running` để frontend biết trạng thái.
+    """
+    loop = asyncio.get_running_loop()
+
+    status_task = loop.run_in_executor(None, _kg_status_sync)
+    doc_task    = loop.run_in_executor(None, _kg_get_doc_sync, None)
+
+    try:
+        status, doc = await asyncio.gather(status_task, doc_task, return_exceptions=True)
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e)})
+
+    running = isinstance(status, dict) and status.get("status") == "RUNNING"
+
+    if isinstance(doc, Exception) or doc is None:
+        return JSONResponse(status_code=404, content={"error": "Chưa có log nào."})
+
+    return {**doc, "running": running}
+
+
+@app.get("/kaggle/logs/stream")
+async def stream_kaggle_logs(request: Request):
+    """
+    SSE — tự lấy doc mới nhất rồi stream.
+    Đang chạy: mỗi 5 giây poll content mới append vào.
+    Không chạy: gửi toàn bộ content rồi đóng stream.
+    """
+    loop = asyncio.get_running_loop()
+
+    async def event_generator():
+        sent_len = 0
+
+        while not await request.is_disconnected():
+            try:
+                status, doc = await asyncio.gather(
+                    loop.run_in_executor(None, _kg_status_sync),
+                    loop.run_in_executor(None, _kg_get_doc_sync, None),
+                    return_exceptions=True,
+                )
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                await asyncio.sleep(5)
+                continue
+
+            if isinstance(doc, Exception) or doc is None:
+                yield ": waiting\n\n"
+                await asyncio.sleep(5)
+                continue
+
+            running = isinstance(status, dict) and status.get("status") == "RUNNING"
+            content: str = doc.get("content", "")
+
+            if len(content) > sent_len:
+                new_text = content[sent_len:]
+                for line in new_text.split("\n"):
+                    if line.strip():
+                        yield f"data: {json.dumps({'line': line, 'running': running}, ensure_ascii=False)}\n\n"
+                sent_len = len(content)
+
+            if not running:
+                # Notebook đã xong, gửi hết rồi đóng
+                yield f"data: {json.dumps({'done': True})}\n\n"
+                return
+
+            yield ": heartbeat\n\n"
+            await asyncio.sleep(5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
