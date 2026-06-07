@@ -1,0 +1,10 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter+Tight:ital,wght@0,100..900;1,100..900&family=Tektur:wght@400..900&display=swap");
+@import "./variants.css";
+@import "tailwindcss";
+@import "./variables.light.css";
+@import "./variables.dark.css";
+@import "./theme.css";
+@import "./layers.base.css";
+@import "./layers.components.css";
+@import "./layers.utilities.css";
+@import "./typography.css";

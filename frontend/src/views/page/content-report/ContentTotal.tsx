@@ -54,7 +54,7 @@ const ContentTotal = () => {
       {listGeneralInfo.map((info, index) => (
         <div key={index}>
           <GradientBorderCardV1 background="var(--card-bg)">
-            <div className="flex justify-around items-center animate-leaderboard-card">
+            <div className="flex justify-around items-center animate-leaderboard-card min-h-[110px] md:min-h-[100px]">
               <div className="flex-1/3">
                 <Image
                   src={info.imageSrc}
@@ -68,7 +68,7 @@ const ContentTotal = () => {
                   {info.value}
                 </h5>
                 <p
-                  className={`${resolvedTheme === "dark" ? "muted" : "text-chart-text1"} text-[15px] font-medium`}
+                  className={`${resolvedTheme === "dark" ? "muted" : "text-chart-text1"} text-[15px] font-bold`}
                 >
                   {info.title}
                 </p>

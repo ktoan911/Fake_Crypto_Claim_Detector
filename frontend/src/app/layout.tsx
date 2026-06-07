@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Script from "next/script";
-import "./globals.css";
+import "../styles/globals.css";
 import { ToastContainer } from "react-toastify";
 
 import ReactQueryProvider from "../providers/ReactQueryProvider";

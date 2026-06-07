@@ -782,57 +782,52 @@
   dependencies:
     tslib "^2.8.0"
 
-"@tailwindcss/node@4.2.2":
-  version "4.2.2"
-  resolved "https://registry.npmjs.org/@tailwindcss/node/-/node-4.2.2.tgz"
-  integrity sha512-pXS+wJ2gZpVXqFaUEjojq7jzMpTGf8rU6ipJz5ovJV6PUGmlJ+jvIwGrzdHdQ80Sg+wmQxUFuoW1UAAwHNEdFA==
+"@tailwindcss/node@4.3.0":
+  version "4.3.0"
+  resolved "https://registry.npmjs.org/@tailwindcss/node/-/node-4.3.0.tgz"
+  integrity sha512-aFb4gUhFOgdh9AXo4IzBEOzBkkAxm9VigwDJnMIYv3lcfXCJVesNfbEaBl4BNgVRyid92AmdviqwBUBRKSeY3g==
   dependencies:
     "@jridgewell/remapping" "^2.3.5"
-    enhanced-resolve "^5.19.0"
+    enhanced-resolve "^5.21.0"
     jiti "^2.6.1"
     lightningcss "1.32.0"
     magic-string "^0.30.21"
     source-map-js "^1.2.1"
-    tailwindcss "4.2.2"
+    tailwindcss "4.3.0"
 
-"@tailwindcss/oxide-linux-x64-gnu@4.2.2":
-  version "4.2.2"
-  resolved "https://registry.npmjs.org/@tailwindcss/oxide-linux-x64-gnu/-/oxide-linux-x64-gnu-4.2.2.tgz"
-  integrity sha512-rTAGAkDgqbXHNp/xW0iugLVmX62wOp2PoE39BTCGKjv3Iocf6AFbRP/wZT/kuCxC9QBh9Pu8XPkv/zCZB2mcMg==
+"@tailwindcss/oxide-linux-x64-gnu@4.3.0":
+  version "4.3.0"
+  resolved "https://registry.npmjs.org/@tailwindcss/oxide-linux-x64-gnu/-/oxide-linux-x64-gnu-4.3.0.tgz"
+  integrity sha512-DRNdQRpSGzRGfARVuVkxvM8Q12nh19l4BF/G7zGA1oe+9wcC6saFBHTISrpIcKzhiXtSrlSrluCfvMuledoCTQ==
 
-"@tailwindcss/oxide-linux-x64-musl@4.2.2":
-  version "4.2.2"
-  resolved "https://registry.npmjs.org/@tailwindcss/oxide-linux-x64-musl/-/oxide-linux-x64-musl-4.2.2.tgz"
-  integrity sha512-XW3t3qwbIwiSyRCggeO2zxe3KWaEbM0/kW9e8+0XpBgyKU4ATYzcVSMKteZJ1iukJ3HgHBjbg9P5YPRCVUxlnQ==
-
-"@tailwindcss/oxide@4.2.2":
-  version "4.2.2"
-  resolved "https://registry.npmjs.org/@tailwindcss/oxide/-/oxide-4.2.2.tgz"
-  integrity sha512-qEUA07+E5kehxYp9BVMpq9E8vnJuBHfJEC0vPC5e7iL/hw7HR61aDKoVoKzrG+QKp56vhNZe4qwkRmMC0zDLvg==
+"@tailwindcss/oxide@4.3.0":
+  version "4.3.0"
+  resolved "https://registry.npmjs.org/@tailwindcss/oxide/-/oxide-4.3.0.tgz"
+  integrity sha512-F7HZGBeN9I0/AuuJS5PwcD8xayx5ri5GhjYUDBEVYUkexyA/giwbDNjRVrxSezE3T250OU2K/wp/ltWx3UOefg==
   optionalDependencies:
-    "@tailwindcss/oxide-android-arm64" "4.2.2"
-    "@tailwindcss/oxide-darwin-arm64" "4.2.2"
-    "@tailwindcss/oxide-darwin-x64" "4.2.2"
-    "@tailwindcss/oxide-freebsd-x64" "4.2.2"
-    "@tailwindcss/oxide-linux-arm-gnueabihf" "4.2.2"
-    "@tailwindcss/oxide-linux-arm64-gnu" "4.2.2"
-    "@tailwindcss/oxide-linux-arm64-musl" "4.2.2"
-    "@tailwindcss/oxide-linux-x64-gnu" "4.2.2"
-    "@tailwindcss/oxide-linux-x64-musl" "4.2.2"
-    "@tailwindcss/oxide-wasm32-wasi" "4.2.2"
-    "@tailwindcss/oxide-win32-arm64-msvc" "4.2.2"
-    "@tailwindcss/oxide-win32-x64-msvc" "4.2.2"
+    "@tailwindcss/oxide-android-arm64" "4.3.0"
+    "@tailwindcss/oxide-darwin-arm64" "4.3.0"
+    "@tailwindcss/oxide-darwin-x64" "4.3.0"
+    "@tailwindcss/oxide-freebsd-x64" "4.3.0"
+    "@tailwindcss/oxide-linux-arm-gnueabihf" "4.3.0"
+    "@tailwindcss/oxide-linux-arm64-gnu" "4.3.0"
+    "@tailwindcss/oxide-linux-arm64-musl" "4.3.0"
+    "@tailwindcss/oxide-linux-x64-gnu" "4.3.0"
+    "@tailwindcss/oxide-linux-x64-musl" "4.3.0"
+    "@tailwindcss/oxide-wasm32-wasi" "4.3.0"
+    "@tailwindcss/oxide-win32-arm64-msvc" "4.3.0"
+    "@tailwindcss/oxide-win32-x64-msvc" "4.3.0"
 
-"@tailwindcss/postcss@^4":
-  version "4.2.2"
-  resolved "https://registry.npmjs.org/@tailwindcss/postcss/-/postcss-4.2.2.tgz"
-  integrity sha512-n4goKQbW8RVXIbNKRB/45LzyUqN451deQK0nzIeauVEqjlI49slUlgKYJM2QyUzap/PcpnS7kzSUmPb1sCRvYQ==
+"@tailwindcss/postcss@^4.3.0":
+  version "4.3.0"
+  resolved "https://registry.npmjs.org/@tailwindcss/postcss/-/postcss-4.3.0.tgz"
+  integrity sha512-Jm05Tjx+9yCLGv5qw1c+84Psds8MnyrEQYCB+FFk2lgGiUjlRqdxke4mVTuYrj2xnVZqKim2Apr5ySuQRYAw/w==
   dependencies:
     "@alloc/quick-lru" "^5.2.0"
-    "@tailwindcss/node" "4.2.2"
-    "@tailwindcss/oxide" "4.2.2"
-    postcss "^8.5.6"
-    tailwindcss "4.2.2"
+    "@tailwindcss/node" "4.3.0"
+    "@tailwindcss/oxide" "4.3.0"
+    postcss "^8.5.10"
+    tailwindcss "4.3.0"
 
 "@tanstack/query-core@5.99.2":
   version "5.99.2"
@@ -1417,13 +1412,13 @@ emoji-regex@^9.2.2:
   resolved "https://registry.npmjs.org/emoji-regex/-/emoji-regex-9.2.2.tgz"
   integrity sha512-L18DaJsXSUk2+42pv8mLs5jJT2hqFkFE4j21wOmgbUqsZ2hL72NsUU785g9RXgo3s0ZNgVl42TiHp3ZtOv/Vyg==
 
-enhanced-resolve@^5.19.0:
-  version "5.20.1"
-  resolved "https://registry.npmjs.org/enhanced-resolve/-/enhanced-resolve-5.20.1.tgz"
-  integrity sha512-Qohcme7V1inbAfvjItgw0EaxVX5q2rdVEZHRBrEQdRZTssLDGsL8Lwrznl8oQ/6kuTJONLaDcGjkNP247XEhcA==
+enhanced-resolve@^5.21.0:
+  version "5.23.0"
+  resolved "https://registry.npmjs.org/enhanced-resolve/-/enhanced-resolve-5.23.0.tgz"
+  integrity sha512-yJN/BOOLxcOW2aQgeif9mSnaUB8KtvmMMp56oA1kx1CRfBKbhZm2pJ+NBY+3eOboHxix8lfjWpHE0Ei5U8RbSA==
   dependencies:
     graceful-fs "^4.2.4"
-    tapable "^2.3.0"
+    tapable "^2.3.3"
 
 es-abstract@^1.17.5, es-abstract@^1.23.2, es-abstract@^1.23.3, es-abstract@^1.23.5, es-abstract@^1.23.6, es-abstract@^1.23.9, es-abstract@^1.24.0, es-abstract@^1.24.2:
   version "1.24.2"
@@ -2394,11 +2389,6 @@ lightningcss-linux-x64-gnu@1.32.0:
   resolved "https://registry.npmjs.org/lightningcss-linux-x64-gnu/-/lightningcss-linux-x64-gnu-1.32.0.tgz"
   integrity sha512-V7Qr52IhZmdKPVr+Vtw8o+WLsQJYCTd8loIfpDaMRWGUZfBOYEJeyJIkqGIDMZPwPx24pUMfwSxxI8phr/MbOA==
 
-lightningcss-linux-x64-musl@1.32.0:
-  version "1.32.0"
-  resolved "https://registry.npmjs.org/lightningcss-linux-x64-musl/-/lightningcss-linux-x64-musl-1.32.0.tgz"
-  integrity sha512-bYcLp+Vb0awsiXg/80uCRezCYHNg1/l3mt0gzHnWV9XP1W5sKa5/TCdGWaR/zBM2PeF/HbsQv/j2URNOiVuxWg==
-
 lightningcss@1.32.0:
   version "1.32.0"
   resolved "https://registry.npmjs.org/lightningcss/-/lightningcss-1.32.0.tgz"
@@ -2518,10 +2508,10 @@ ms@^2.1.1, ms@^2.1.3:
   resolved "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"
   integrity sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==
 
-nanoid@^3.3.11, nanoid@^3.3.6:
-  version "3.3.11"
-  resolved "https://registry.npmjs.org/nanoid/-/nanoid-3.3.11.tgz"
-  integrity sha512-N8SpfPUnUp1bK+PMYW8qSWdl9U+wwNWI4QKxOYDy9JAro3WMX7p2OeVRF9v+347pnakNevPmiHhNmZ2HbFA76w==
+nanoid@^3.3.12, nanoid@^3.3.6:
+  version "3.3.12"
+  resolved "https://registry.npmjs.org/nanoid/-/nanoid-3.3.12.tgz"
+  integrity sha512-ZB9RH/39qpq5Vu6Y+NmUaFhQR6pp+M2Xt76XBnEwDaGcVAqhlvxrl3B2bKS5D3NH3QR76v3aSrKaF/Kiy7lEtQ==
 
 napi-postinstall@^0.3.0:
   version "0.3.4"
@@ -2718,12 +2708,12 @@ possible-typed-array-names@^1.0.0:
   resolved "https://registry.npmjs.org/possible-typed-array-names/-/possible-typed-array-names-1.1.0.tgz"
   integrity sha512-/+5VFTchJDoVj3bhoqi6UeymcD00DAwb1nJwamzPvHEszJ4FpF6SNNbUbOS8yI56qHzdV8eK0qEfOSiodkTdxg==
 
-postcss@^8.5.6:
-  version "8.5.9"
-  resolved "https://registry.npmjs.org/postcss/-/postcss-8.5.9.tgz"
-  integrity sha512-7a70Nsot+EMX9fFU3064K/kdHWZqGVY+BADLyXc8Dfv+mTLLVl6JzJpPaCZ2kQL9gIJvKXSLMHhqdRRjwQeFtw==
+postcss@^8.5.10, postcss@^8.5.15:
+  version "8.5.15"
+  resolved "https://registry.npmjs.org/postcss/-/postcss-8.5.15.tgz"
+  integrity sha512-FfR8sjd4em2T6fb3I2MwAJU7HWVMr9zba+enmQeeWFfCbm+UOC/0X4DS8XtpUTMwWMGbjKYP7xjfNekzyGmB3A==
   dependencies:
-    nanoid "^3.3.11"
+    nanoid "^3.3.12"
     picocolors "^1.1.1"
     source-map-js "^1.2.1"
 
@@ -3161,15 +3151,15 @@ tailwind-merge@^3.4.0:
   resolved "https://registry.npmjs.org/tailwind-merge/-/tailwind-merge-3.5.0.tgz"
   integrity sha512-I8K9wewnVDkL1NTGoqWmVEIlUcB9gFriAEkXkfCjX5ib8ezGxtR3xD7iZIxrfArjEsH7F1CHD4RFUtxefdqV/A==
 
-tailwindcss@^4, tailwindcss@4.2.2:
-  version "4.2.2"
-  resolved "https://registry.npmjs.org/tailwindcss/-/tailwindcss-4.2.2.tgz"
-  integrity sha512-KWBIxs1Xb6NoLdMVqhbhgwZf2PGBpPEiwOqgI4pFIYbNTfBXiKYyWoTsXgBQ9WFg/OlhnvHaY+AEpW7wSmFo2Q==
+tailwindcss@^4.3.0, tailwindcss@4.3.0:
+  version "4.3.0"
+  resolved "https://registry.npmjs.org/tailwindcss/-/tailwindcss-4.3.0.tgz"
+  integrity sha512-y6nxMGB1nMW9R6k96e5gdIFzcfL/gTJRNaqGes1YvkLnPVXzWgbqFF2yLC0T8G774n24cx3Pe8XrKoniCOAH+Q==
 
-tapable@^2.3.0:
-  version "2.3.2"
-  resolved "https://registry.npmjs.org/tapable/-/tapable-2.3.2.tgz"
-  integrity sha512-1MOpMXuhGzGL5TTCZFItxCc0AARf1EZFQkGqMm7ERKj8+Hgr5oLvJOVFcC+lRmR8hCe2S3jC4T5D7Vg/d7/fhA==
+tapable@^2.3.3:
+  version "2.3.3"
+  resolved "https://registry.npmjs.org/tapable/-/tapable-2.3.3.tgz"
+  integrity sha512-uxc/zpqFg6x7C8vOE7lh6Lbda8eEL9zmVm/PLeTPBRhh1xCgdWaQ+J1CUieGpIfm2HdtsUpRv+HshiasBMcc6A==
 
 tinyglobby@^0.2.13, tinyglobby@^0.2.15:
   version "0.2.16"

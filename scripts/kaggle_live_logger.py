@@ -1,6 +1,7 @@
 """
 Mỗi lần chạy tạo 1 document duy nhất, id = ngày giờ bắt đầu (VD: 2024-01-15T08:30).
-Mỗi print() append thêm dòng vào field `content`, cách nhau bằng \\n.
+Mỗi print() append thêm dòng vào field `content`, flush lên OpenSearch mỗi 3 dòng.
+Không dùng Painless script — chỉ dùng doc update với full content.
 """
 
 import sys
@@ -33,8 +34,8 @@ if not _kb.client.indices.exists(index="crawl_logs"):
         },
     )
 
-# ID = ngày giờ bắt đầu run — dùng làm document ID
-DOC_ID = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+# ID = ngày giờ bắt đầu run (giờ local) — dùng làm document ID
+DOC_ID = datetime.now().strftime("%Y-%m-%dT%H:%M")
 
 _kb.client.index(
     index="crawl_logs",
@@ -42,36 +43,41 @@ _kb.client.index(
     body={"start_ts": datetime.now(timezone.utc).isoformat(), "content": ""},
 )
 
+_FLUSH_EVERY = 3  # flush lên OpenSearch mỗi N dòng
+
 
 class _LiveLogger:
-    _buf = ""
+    def __init__(self):
+        self._line_buf = ""   # buffer dòng chưa kết thúc
+        self._content = ""    # full content đã tích lũy
+        self._pending = 0     # số dòng chưa flush
 
     def write(self, msg: str):
         sys.__stdout__.write(msg)
-        self._buf += msg
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
+        self._line_buf += msg
+        while "\n" in self._line_buf:
+            line, self._line_buf = self._line_buf.split("\n", 1)
             if line.strip():
-                self._append(line)
+                self._content += line + "\n"
+                self._pending += 1
+                if self._pending >= _FLUSH_EVERY:
+                    self._flush()
 
-    def _append(self, line: str):
+    def _flush(self):
         try:
             _kb.client.update(
                 index="crawl_logs",
                 id=DOC_ID,
-                body={
-                    "script": {
-                        "source": "ctx._source.content += params.line",
-                        "lang": "painless",
-                        "params": {"line": line + "\n"},
-                    }
-                },
+                body={"doc": {"content": self._content}},
             )
+            self._pending = 0
         except Exception as e:
-            sys.__stdout__.write(f"[live_logger] append failed: {e}\n")
+            sys.__stdout__.write(f"[live_logger] flush failed: {e}\n")
 
     def flush(self):
         sys.__stdout__.flush()
+        if self._pending > 0:
+            self._flush()
 
     def isatty(self):
         return False

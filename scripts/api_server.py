@@ -7,7 +7,6 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,6 +58,10 @@ _batch_scheduler: "_BatchScheduler | None" = None
 # ── Kaggle log via OpenSearch ─────────────────────────────────────────────────
 _CRAWL_LOGS_INDEX = "crawl_logs"
 
+# ── Server log (in-memory ring buffer) ───────────────────────────────────────
+_server_log_buf: list[str] = []
+_SERVER_LOG_MAX = 500
+
 # ── Counter các request đang in-flight (đang chờ batch + đang inference). Dùng để
 # từ chối sớm khi queue quá dài, tránh tích lũy RAM khi burst.
 _pending_lock = threading.Lock()
@@ -81,7 +84,9 @@ class _BatchScheduler:
     cho request lẻ.
     """
 
-    def __init__(self, verifier: FusionClaimVerifier, max_batch: int, max_wait_ms: float):
+    def __init__(
+        self, verifier: FusionClaimVerifier, max_batch: int, max_wait_ms: float
+    ):
         self.verifier = verifier
         self.max_batch = max(1, max_batch)
         self.max_wait_s = max(0.0, max_wait_ms / 1000.0)
@@ -160,6 +165,40 @@ class _BatchScheduler:
                     fut.set_result(pred)
 
 
+def _server_log_sink(message) -> None:
+    """Loguru sink: ghi thẳng vào ring buffer."""
+    line = str(message).rstrip("\n")
+    if line.strip():
+        _server_log_buf.append(line)
+        if len(_server_log_buf) > _SERVER_LOG_MAX:
+            del _server_log_buf[0]
+
+
+def _setup_server_log() -> None:
+    """Đăng ký loguru sink + stdlib handler để capture uvicorn logs vào ring buffer."""
+    import logging as _stdlib_logging
+    from datetime import datetime
+
+    class _StdlibSink(_stdlib_logging.Handler):
+        def emit(self, record: _stdlib_logging.LogRecord) -> None:
+            ts = datetime.now().strftime("%H:%M:%S")
+            line = f"{ts} - {record.levelname} - {record.getMessage()}"
+            _server_log_buf.append(line)
+            if len(_server_log_buf) > _SERVER_LOG_MAX:
+                del _server_log_buf[0]
+
+    _sink = _StdlibSink()
+    for name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
+        _stdlib_logging.getLogger(name).addHandler(_sink)
+
+    logger.add(
+        _server_log_sink,
+        format="{time:HH:mm:ss} - {level} - {message}",
+        level="INFO",
+        enqueue=True,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model và khởi tạo tài nguyên dùng chung một lần khi startup."""
@@ -206,6 +245,12 @@ async def lifespan(app: FastAPI):
     )
     logger.info("[startup] Stats OpenSearchKB connection ready ✓")
 
+    try:
+        _setup_server_log()
+        logger.info("[startup] Server log handler registered ✓")
+    except Exception as e:
+        logger.warning(f"[startup] Server log handler failed (non-fatal): {e}")
+
     yield
 
     if _batch_scheduler is not None:
@@ -243,7 +288,10 @@ async def admin_login(request: AdminLoginRequest):
         if not client.indices.exists(index="admin"):
             return JSONResponse(
                 status_code=503,
-                content={"success": False, "error": "Hệ thống xác thực chưa được khởi tạo."},
+                content={
+                    "success": False,
+                    "error": "Hệ thống xác thực chưa được khởi tạo.",
+                },
             )
 
         # Chỉ query theo username, verify hash trong Python để tránh timing attack
@@ -255,7 +303,10 @@ async def admin_login(request: AdminLoginRequest):
 
         _INVALID = JSONResponse(
             status_code=401,
-            content={"success": False, "error": "Tên đăng nhập hoặc mật khẩu không đúng."},
+            content={
+                "success": False,
+                "error": "Tên đăng nhập hoặc mật khẩu không đúng.",
+            },
         )
 
         if not hits:
@@ -473,7 +524,10 @@ async def claims_stats(date: str = None):
         logger.warning(f"[claims/stats] OpenSearch unreachable: {e}")
         return JSONResponse(
             status_code=503,
-            content={"status": "error", "error": "OpenSearch service is unreachable. Please check the connection."},
+            content={
+                "status": "error",
+                "error": "OpenSearch service is unreachable. Please check the connection.",
+            },
         )
     except Exception as e:
         import traceback
@@ -491,8 +545,15 @@ async def claims_stats(date: str = None):
 def _kg_os_client():
     """OpenSearch client dùng chung với phần còn lại của project."""
     from opensearchpy import OpenSearch, RequestsHttpConnection
+
     return OpenSearch(
-        hosts=[{"host": os.getenv("OP_HOST"), "port": int(os.getenv("OP_PORT")), "scheme": "https"}],
+        hosts=[
+            {
+                "host": os.getenv("OP_HOST"),
+                "port": int(os.getenv("OP_PORT")),
+                "scheme": "https",
+            }
+        ],
         http_auth=(os.getenv("OP_AUTH_USERNAME"), os.getenv("OP_AUTH_PASSWORD")),
         verify_certs=True,
         http_compress=True,
@@ -518,12 +579,21 @@ def _kg_get_doc_sync(doc_id: str | None) -> dict | None:
     # Lấy doc mới nhất
     resp = client.search(
         index=_CRAWL_LOGS_INDEX,
-        body={"size": 1, "sort": [{"start_ts": {"order": "desc"}}], "query": {"match_all": {}}},
+        body={
+            "size": 1,
+            "sort": [{"start_ts": {"order": "desc"}}],
+            "query": {"match_all": {}},
+        },
     )
     hits = resp["hits"]["hits"]
     if not hits:
         return None
-    return {"doc_id": hits[0]["_id"], **hits[0]["_source"]}
+    doc = {"doc_id": hits[0]["_id"], **hits[0]["_source"]}
+    if "content" in doc:
+        lines = doc["content"].splitlines()
+        if len(lines) > _SERVER_LOG_MAX:
+            doc["content"] = "\n".join(lines[-_SERVER_LOG_MAX:]) + "\n"
+    return doc
 
 
 def _kg_list_runs_sync(limit: int) -> list[dict]:
@@ -537,7 +607,7 @@ def _kg_list_runs_sync(limit: int) -> list[dict]:
             "size": limit,
             "sort": [{"start_ts": {"order": "desc"}}],
             "query": {"match_all": {}},
-            "_source": ["start_ts"],   # không trả content để nhẹ
+            "_source": ["start_ts"],  # không trả content để nhẹ
         },
     )
     return [{"doc_id": h["_id"], **h["_source"]} for h in resp["hits"]["hits"]]
@@ -546,6 +616,7 @@ def _kg_list_runs_sync(limit: int) -> list[dict]:
 def _kg_status_sync() -> dict:
     """Gọi Kaggle API để lấy trạng thái kernel (RUNNING / COMPLETE / ERROR ...)."""
     import requests
+
     username = os.getenv("KAGGLE_USERNAME", "")
     key = os.getenv("KAGGLE_KEY", "")
     kernel = os.getenv("KAGGLE_KERNEL", "")  # dạng "owner/kernel-slug"
@@ -573,10 +644,12 @@ async def get_kaggle_logs():
     loop = asyncio.get_running_loop()
 
     status_task = loop.run_in_executor(None, _kg_status_sync)
-    doc_task    = loop.run_in_executor(None, _kg_get_doc_sync, None)
+    doc_task = loop.run_in_executor(None, _kg_get_doc_sync, None)
 
     try:
-        status, doc = await asyncio.gather(status_task, doc_task, return_exceptions=True)
+        status, doc = await asyncio.gather(
+            status_task, doc_task, return_exceptions=True
+        )
     except Exception as e:
         return JSONResponse(status_code=502, content={"error": str(e)})
 
@@ -644,3 +717,12 @@ async def stream_kaggle_logs(request: Request):
             "Connection": "keep-alive",
         },
     )
+
+
+# ── Server logs endpoints ─────────────────────────────────────────────────────
+
+@app.get("/server/logs")
+async def get_server_logs():
+    """Trả toàn bộ ring buffer server log dưới dạng content string."""
+    content = "\n".join(_server_log_buf)
+    return {"content": content, "running": True}

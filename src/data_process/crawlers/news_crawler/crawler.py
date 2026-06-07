@@ -753,6 +753,72 @@ async def fetch_article_content_playwright(context, item, semaphore, cutoff_time
                 await page.close()
 
 
+def _push_crawl_info(
+    crawled_at: str,
+    total_articles: int,
+    source_counts: dict,
+) -> None:
+    """Ghi log thống kê phiên cào vào index crawl_info trên OpenSearch."""
+    try:
+        from opensearchpy import OpenSearch, RequestsHttpConnection
+
+        client = OpenSearch(
+            hosts=[
+                {
+                    "host": os.getenv("OP_HOST"),
+                    "port": int(os.getenv("OP_PORT")),
+                    "scheme": "https",
+                }
+            ],
+            http_auth=(os.getenv("OP_AUTH_USERNAME"), os.getenv("OP_AUTH_PASSWORD")),
+            verify_certs=True,
+            http_compress=True,
+            timeout=30,
+            connection_class=RequestsHttpConnection,
+        )
+        index_name = "crawl_info"
+        if not client.indices.exists(index=index_name):
+            client.indices.create(
+                index=index_name,
+                body={
+                    "mappings": {
+                        "properties": {
+                            "crawled_at": {"type": "date"},
+                            "total_articles": {"type": "integer"},
+                            "per_source": {
+                                "type": "nested",
+                                "properties": {
+                                    "source_url": {"type": "keyword"},
+                                    "count": {"type": "integer"},
+                                },
+                            },
+                        }
+                    }
+                },
+            )
+        per_source_list = [
+            {"source_url": url, "count": cnt}
+            for url, cnt in source_counts.items()
+        ]
+        doc_id = hashlib.md5(crawled_at.encode()).hexdigest()
+        client.index(
+            index=index_name,
+            id=doc_id,
+            body={
+                "crawled_at": crawled_at,
+                "total_articles": total_articles,
+                "per_source": per_source_list,
+            },
+            refresh="wait_for",
+        )
+        logging.info(
+            f"[crawl_info] Đã ghi log phiên cào: crawled_at={crawled_at}, "
+            f"total_articles={total_articles}, sources={len(per_source_list)}."
+        )
+    except Exception as e:
+        logging.warning(f"[crawl_info] Không thể ghi log phiên cào vào OpenSearch: {e}")
+
+
 async def main(args):
     results = []
     concurrency_limit = 10  # tăng từ 5 → 10 để crawl danh sách nhanh hơn
@@ -940,6 +1006,13 @@ async def main(args):
         )
     if not no_links and not links_but_no_content:
         logging.info("Tất cả nguồn đều cào được ít nhất 1 bài viết hợp lệ.")
+
+    # --- Ghi log thống kê phiên cào vào crawl_info (trước khi truncate max_articles) ---
+    _push_crawl_info(
+        crawled_at=datetime.now(timezone.utc).isoformat(),
+        total_articles=len(valid_results),
+        source_counts=source_content_counts,
+    )
 
     # Giới hạn số bài xử lý nếu có --max-articles
     if args.max_articles and len(valid_results) > args.max_articles:

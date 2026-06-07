@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import useAreaChartConfig from "./useAreaChartConfig";
 
 import { SeriesOptionsType } from "highcharts";
-import { TRange } from "@/src/components/Graph/GraphSection";
+import { TRange } from "@/src/components/Graph/ChartCard";
 
 // Snapshot type matching the API: { timestamp, fakenew1, fakenew2 }
 export type FakeNewSnapshot = {

@@ -4,6 +4,7 @@ import React from "react";
 // import ModalCustom from "../components/customs/ModalCustom";
 import { usePathname } from "next/navigation";
 import Header from "./header/Header";
+import HeaderAdmin from "./header/HeaderAdmin";
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -13,14 +14,21 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const isAdminRoute = pathname.startsWith("/admin");
 
   if (isAdminRoute) {
-    return <>{children}</>;
+    if (pathname.startsWith("/admin/login")) {
+      return <>{children}</>;
+    }
+
+    return <HeaderAdmin>{children}</HeaderAdmin>;
   }
 
   return (
     <div>
       <Header />
-      <main className="relative overflow-x-hidden hide-scrollbar min-h-screen" style={{ backgroundColor: "var(--body-bg)" }}>
-        {pathname === "/" ? (
+      <main
+        className="relative overflow-x-hidden hide-scrollbar min-h-screen"
+        style={{ backgroundColor: "var(--body-bg)" }}
+      >
+        {pathname === "/dashboard" ? (
           <div
             className="absolute w-screen h-screen opacity-8 pointer-events-none left-[2%] "
             style={{
@@ -35,7 +43,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         )}
         <div className="px-1 pt-16 max-w-8xl mx-auto">{children}</div>
       </main>
-      {/* {pathname === "/" ? <Footer /> : <></>} */}
+      {/* {pathname === "/dashboard" ? <Footer /> : <></>} */}
       {/* <ModalCustom /> */}
     </div>
   );
