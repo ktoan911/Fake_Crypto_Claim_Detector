@@ -6,7 +6,7 @@ export default function SystemLogSection() {
     <>
       <IntroAppPage
         title="System Logs"
-        description="Raw server output - tail -f /var/log/crawler/system.log"
+        description="Raw server output log"
       ></IntroAppPage>
       <SystemLogPanel />
     </>

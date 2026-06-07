@@ -759,21 +759,30 @@ def _push_crawl_info(
     source_counts: dict,
 ) -> None:
     """Ghi log thống kê phiên cào vào index crawl_info trên OpenSearch."""
+    op_host = os.getenv("OP_HOST")
+    op_port = os.getenv("OP_PORT")
+    op_user = os.getenv("OP_AUTH_USERNAME")
+    op_pass = os.getenv("OP_AUTH_PASSWORD")
+    if not op_host or not op_port or not op_user or not op_pass:
+        logging.warning("[crawl_info] Thiếu biến môi trường OpenSearch, bỏ qua ghi log phiên cào.")
+        return
     try:
         from opensearchpy import OpenSearch, RequestsHttpConnection
 
         client = OpenSearch(
             hosts=[
                 {
-                    "host": os.getenv("OP_HOST"),
-                    "port": int(os.getenv("OP_PORT")),
+                    "host": op_host,
+                    "port": int(op_port),
                     "scheme": "https",
                 }
             ],
-            http_auth=(os.getenv("OP_AUTH_USERNAME"), os.getenv("OP_AUTH_PASSWORD")),
+            http_auth=(op_user, op_pass),
             verify_certs=True,
             http_compress=True,
-            timeout=30,
+            timeout=10,
+            max_retries=1,
+            retry_on_timeout=False,
             connection_class=RequestsHttpConnection,
         )
         index_name = "crawl_info"

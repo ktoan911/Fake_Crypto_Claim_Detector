@@ -188,16 +188,10 @@ export default function HeaderAdmin({ children }: AdminShellProps) {
                 className="flex items-center gap-2 px-2 py-1.5 rounded-xl hover:bg-gray-50 dark:hover:bg-slate-800 transition-colors"
               >
                 <div
-                  className="w-7 h-7 rounded-full flex items-center justify-center shadow shadow-purple-400/30 overflow-hidden shrink-0"
+                  className="w-7 h-7 rounded-full flex items-center justify-center shadow shadow-purple-400/30 shrink-0"
                   style={{ background: GRADIENT }}
                 >
-                  <Image
-                    src="/image/default.png"
-                    alt={fakeUser.name}
-                    width={28}
-                    height={28}
-                    className="rounded-full"
-                  />
+                  <User className="w-4 h-4 text-white" />
                 </div>
                 <div className="hidden sm:block text-left">
                   <p className="text-xs font-medium text-gray-700 dark:text-slate-200">

@@ -301,6 +301,6 @@ def run_clustering_pipeline(
         print(f"No claims found in the last {timestamp_seconds} seconds.")
         return {"error": "No claims found", "clusters": []}
 
-    print(f"Đã lấy được {len(claims)} claim từ OpenSearch.")
+    print(f"Đã lấy được {len(claims)} claim từ OpenSearch cho việc cluster claim.")
 
     return cluster_claims(claims=claims, model_name=model_name)
