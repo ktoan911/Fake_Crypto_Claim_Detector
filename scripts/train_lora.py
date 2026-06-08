@@ -19,7 +19,7 @@ load_dotenv()
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train LoRA for crypto claim classification"
+        description="Train LoRA for finance claim classification"
     )
     parser.add_argument(
         "--train-csv", type=str, default=None, help="Path to TRAIN CSV file"

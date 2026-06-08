@@ -72,7 +72,7 @@ export default function RootLayout({
         <meta itemProp="description" content={SITE_DESCRIPTION} />
         <meta
           name="keywords"
-          content="kiểm chứng, AI, tin giả, tài chính, crypto, DeFi, thời gian thực"
+          content="kiểm chứng, AI, tin giả, tài chính thời gian thực"
         />
         <meta property="og:type" content="website" />
         <meta property="og:title" content={SITE_TITLE} />

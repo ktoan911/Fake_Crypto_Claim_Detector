@@ -35,24 +35,24 @@
   --FN-Gradient-1: linear-gradient(
     180deg,
     #fff 0%,
-    #0fb490 30%,
-    #1070e4 60%,
-    #6913cb 100%
+    #3b82f6 30%,
+    #8b5cf6 60%,
+    #06b6d4 100%
   );
   --FN-Gradient-2: linear-gradient(
-    150deg,
-    #0fb490 30%,
-    #1070e4 60%,
-    #6913cb 100%
+    135deg,
+    #3b82f6,
+    #8b5cf6,
+    #06b6d4
   );
-  --text-shadow: rgba(80, 30, 160, 0.3);
+  --text-shadow: rgba(59, 130, 246, 0.3);
   --card-bg: #f8faf9;
   --body-bg: #fffbfe;
   --tooltip: #ffffff;
   --chart-text1: #383535;
   --chart-girdline: #cecaca;
-  --FN-Gradient-3: linear-gradient(150deg, #bde9e0 10%, #0fb490 80%);
-  --FN-Gradient-4: linear-gradient(150deg, #5392df 10%, #732cc5 80%);
+  --FN-Gradient-3: linear-gradient(150deg, #bfdbfe 10%, #06b6d4 80%);
+  --FN-Gradient-4: linear-gradient(150deg, #93c5fd 10%, #8b5cf6 80%);
   --rate-high: #f1bbbb;
   --rate-medium: #f1d4a7;
   --rate-low: #b9f0d4;

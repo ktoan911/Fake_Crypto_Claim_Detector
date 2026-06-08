@@ -57,8 +57,8 @@ export default function DonutChart({
         : {
             linearGradient: { x1: 0, y1: 0, x2: 1, y2: 1 },
             stops: [
-              [0.3, "#bde9e0"],
-              [0.7, "#0fb490"],
+              [0.3, "#bfdbfe"],
+              [0.7, "#06b6d4"],
             ],
           };
 

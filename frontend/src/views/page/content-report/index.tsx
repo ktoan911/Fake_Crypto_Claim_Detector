@@ -13,7 +13,7 @@ export default function ContentReport() {
       <div>
         <IntroAppPage
           title="Báo Cáo Nội Dung"
-          description="Thống kê tin tức tài chính / crypto được phát hiện theo ngày và theo nhóm."
+          description="Thống kê tin tức tài chính / ngân hàng được phát hiện theo ngày và theo nhóm."
         />
         <div className="mt-10">
           <ContentTotal />

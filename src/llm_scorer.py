@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import threading
 from typing import Any, List, Optional
 
 from loguru import logger
@@ -135,6 +134,14 @@ class LLMScorer:
             }
             if use_cuda:
                 kwargs["device_map"] = "auto"
+                # Flash Attention 2 giảm VRAM O(n) → O(n/block) và tăng tốc attention 2-4x.
+                # Cần package flash-attn: pip install flash-attn --no-build-isolation
+                try:
+                    import flash_attn  # noqa: F401
+                    kwargs["attn_implementation"] = "flash_attention_2"
+                    logger.info("[llm_scorer] Flash Attention 2 enabled.")
+                except ImportError:
+                    logger.info("[llm_scorer] flash-attn not installed, using default attention.")
             else:
                 # Be explicit to avoid accidental accelerate dispatch metadata on CPU.
                 kwargs["device_map"] = None
@@ -146,6 +153,7 @@ class LLMScorer:
                 logger.warning(
                     f"Model load failed ({exc}). Retrying with local cache only."
                 )
+                kwargs.pop("attn_implementation", None)
                 return AutoModelForCausalLM.from_pretrained(
                     model_path, torch_dtype=dtype, local_files_only=True, **kwargs
                 )
@@ -230,7 +238,6 @@ class LLMScorer:
             logger.debug(f"Label '{label}' -> token_id {tokens[0]}")
 
         self.prompt_template = prompt_template or PROMPT_TEMPLATE
-        self._inference_lock = threading.Lock()
         logger.info(f"LLMScorer initialized with model: {model_name}")
         logger.info(f"Label token IDs: {self.label_token_ids}")
 
@@ -356,9 +363,7 @@ class LLMScorer:
             padded_attention_mask, dtype=torch.long, device=self.device
         )
 
-        # Lock serialises forward passes: _pre_hook/_post_hook mutate module.weight.data
-        # in-place (bf16 <-> fp32 upcast), which is not safe to run concurrently.
-        with self._inference_lock, torch.no_grad():
+        with torch.no_grad():
             outputs = self.model(input_ids=input_tensor, attention_mask=mask_tensor)
             # outputs.logits: [batch, seq_len, vocab_size] — can be ~600MB for Qwen vocab.
             # Extract pred_logits immediately then delete outputs to free RAM before

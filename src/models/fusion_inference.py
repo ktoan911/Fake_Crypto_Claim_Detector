@@ -5,7 +5,6 @@ import hashlib
 import os
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import perf_counter
@@ -191,6 +190,7 @@ class OpenSearchHybridRetriever:
         gamma: float = 0.5,
         use_query_expansion: bool = True,
         rrf_k: int = 60,
+        device: Optional[str] = None,
     ):
         if not SENTENCE_TRANSFORMERS_AVAILABLE:
             raise ImportError(
@@ -204,7 +204,8 @@ class OpenSearchHybridRetriever:
             alpha=alpha, lambda_decay=lambda_decay, gamma=gamma
         )
         self.query_expander = QueryExpander() if use_query_expansion else None
-        self.encoder = SentenceTransformer(embedding_model)
+        _st_device = device or os.getenv("DEVICE", "cpu")
+        self.encoder = SentenceTransformer(embedding_model, device=_st_device)
         self.embedding_dim = int(self.encoder.get_sentence_embedding_dimension())
 
         # Ensure dimension check in OpenSearch wrapper matches the active encoder.
@@ -449,11 +450,13 @@ class FusionClaimVerifier:
                 "Fusion PyTorch modules are unavailable. Ensure torch is installed."
             )
 
-        if device and str(device).lower() != "cpu":
+        requested = (device or "cpu").strip().lower()
+        if requested != "cpu" and not torch.cuda.is_available():
             logger.warning(
-                f"fusion_inference is running in CPU-only mode; got device='{device}', forcing 'cpu'."
+                f"[fusion_inference] device='{requested}' requested but CUDA not available, falling back to 'cpu'."
             )
-        self.device = "cpu"
+            requested = "cpu"
+        self.device = requested
         self.checkpoint = torch.load(
             fusion_model_path, map_location=torch.device("cpu")
         )
@@ -535,6 +538,16 @@ class FusionClaimVerifier:
         self.retrieval_encoder.eval()
         self.fusion.eval()
 
+        # torch.compile tăng tốc ~20% cho fusion/retrieval_encoder (model nhỏ,
+        # compile nhanh). Chỉ bật trên GPU vì CPU compile overhead không đáng.
+        if self.device != "cpu" and hasattr(torch, "compile"):
+            try:
+                self.retrieval_encoder = torch.compile(self.retrieval_encoder)
+                self.fusion = torch.compile(self.fusion)
+                logger.info("[fusion_inference] torch.compile enabled for fusion models.")
+            except Exception as exc:
+                logger.warning(f"[fusion_inference] torch.compile failed (non-fatal): {exc}")
+
         model_name = llm_model_path or self.saved_config.get("model_name")
         if not model_name:
             raise ValueError(
@@ -574,6 +587,7 @@ class FusionClaimVerifier:
             gamma=gamma,
             use_query_expansion=True,
             rrf_k=rrf_k,
+            device=self.device,
         )
 
     # ------------------------------------------------------------------
@@ -815,14 +829,10 @@ class FusionClaimVerifier:
                             _links.append(_url)
                     return _idx, _text, _feat, _evidence[: self.llm_evidence_top_k], _links
 
-                # Retrieval là I/O-bound (OpenSearch HTTP) → parallelize an toàn
-                n_workers = min(len(batch), 8)
                 retrieved: dict[int, Tuple] = {}
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    futures = {pool.submit(_retrieve_one, item): item for item in batch}
-                    for future in as_completed(futures):
-                        r_idx, r_text, r_feat, r_ev, r_links = future.result()
-                        retrieved[r_idx] = (r_text, r_feat, r_ev, r_links)
+                for item in batch:
+                    r_idx, r_text, r_feat, r_ev, r_links = _retrieve_one(item)
+                    retrieved[r_idx] = (r_text, r_feat, r_ev, r_links)
 
                 for idx, text in batch:
                     valid_indices.append(idx)

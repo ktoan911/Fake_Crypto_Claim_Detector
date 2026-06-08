@@ -19,14 +19,17 @@ export const MENU_ITEMS: MenuItem[] = [
   { label: "BÁO CÁO", href: "#content-report" },
   { label: "CHIẾN DỊCH", href: "#campaigns" },
   { label: "TUYÊN BỐ MỚI NHẤT", href: "#latest-claims" },
+  { label: "XÁC MINH", href: "/verify" },
 ];
 
 export default function Header() {
   const pathname = usePathname();
-  const currentItem = MENU_ITEMS.find((item) => item.href === pathname);
-  const [selectedMenu, setSelectedMenu] = useState<string>(
-    currentItem ? currentItem.label : MENU_ITEMS[0].label,
-  );
+  const [activeHash, setActiveHash] = useState<string>(MENU_ITEMS[0].label);
+
+  const isItemSelected = (item: MenuItem) => {
+    if (item.href.startsWith("/")) return pathname === item.href;
+    return activeHash === item.label;
+  };
 
   return (
     <div className="fixed top-0 left-0 right-0 z-50 w-full h-16 bg-background border-b px-1 sm:px-2 md:px-6">
@@ -42,15 +45,16 @@ export default function Header() {
           </div>
           <div className="h-full hidden lg:flex items-center justify-center ">
             <div className="hidden lg:flex items-center gap-12 mt-1.5">
-              {MENU_ITEMS.map((item) => {
-                const isSelected = selectedMenu === item.label;
+              {MENU_ITEMS.filter((item) => pathname !== "/verify").map((item) => {
+                const isSelected = isItemSelected(item);
                 return (
                   <Link
                     key={item.href}
                     href={item.comingSoon ? "#" : item.href}
-                    onClick={() =>
-                      !item.comingSoon && setSelectedMenu(item.label)
-                    }
+                    onClick={() => {
+                      if (!item.comingSoon && item.href.startsWith("#"))
+                        setActiveHash(item.label);
+                    }}
                     className={`mb-1 py-3 rounded-sm text-md transition-colors flex items-center gap-3 ${
                       isSelected
                         ? "text-primary font-semibold"
@@ -80,15 +84,16 @@ export default function Header() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-56">
-                {MENU_ITEMS.map((item: MenuItem) => {
-                  const isSelected = selectedMenu === item.label;
+                {MENU_ITEMS.filter((item) => pathname !== "/verify").map((item: MenuItem) => {
+                  const isSelected = isItemSelected(item);
                   return (
                     <Link
                       key={item.href}
                       href={item.comingSoon ? "#" : item.href}
-                      onClick={() =>
-                        !item.comingSoon && setSelectedMenu(item.label)
-                      }
+                      onClick={() => {
+                        if (!item.comingSoon && item.href.startsWith("#"))
+                          setActiveHash(item.label);
+                      }}
                     >
                       <DropdownMenuItem
                         className={`cursor-pointer ${

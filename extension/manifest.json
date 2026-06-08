@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Fake Crypto Claim Detector",
+  "name": "Fake Claim Detector",
   "version": "1.0",
   "description": "Bôi đen nội dung (claim) để kiểm tra xem đúng hay sai.",
   "icons": {

@@ -340,10 +340,16 @@ class TemporalScorer:
         return temporal_score, recency, cyclicity
 
 
+import logging
+from typing import Dict, List
+
+logger = logging.getLogger(__name__)
+
+
 class QueryExpander:
     """
-    Implements query expansion for fact-checking.
-    Uses synonyms for better evidence retrieval.
+    Implements query expansion for Vietnamese banking & financial fact-checking.
+    Uses domain-specific synonyms for better evidence retrieval.
     """
 
     def __init__(self, glossary: Dict[str, List[str]] = None):
@@ -351,52 +357,236 @@ class QueryExpander:
         Initialize query expander.
 
         Args:
-            glossary: Dictionary mapping terms to synonyms
+            glossary: Dictionary mapping financial/banking terms to related synonyms
         """
         self.glossary = glossary or self._default_glossary()
         logger.info(f"QueryExpander initialized with {len(self.glossary)} terms")
 
     def _default_glossary(self) -> Dict[str, List[str]]:
-        """Default fact-checking glossary"""
+        """Rich glossary for Vietnamese financial fact-checking"""
+
         return {
-            # Claim verification terms
-            "claim": ["statement", "assertion", "allegation"],
-            "evidence": ["proof", "support", "documentation"],
-            "false": ["incorrect", "inaccurate", "misleading", "wrong"],
-            "true": ["correct", "accurate", "verified", "confirmed"],
-            "refuted": ["debunked", "disproven", "contradicted"],
-            "supported": ["confirmed", "validated", "corroborated"],
-            # Financial terms
-            "stock": ["shares", "equity", "securities"],
-            "investment": ["capital", "funding", "portfolio"],
-            "profit": ["gain", "return", "earnings"],
-            "loss": ["decline", "drop", "deficit"],
-            "market": ["exchange", "trading", "financial"],
-            # Verification terms
-            "verify": ["confirm", "validate", "authenticate", "check"],
-            "source": ["reference", "citation", "origin"],
-            "fact": ["truth", "reality", "data"],
+            # ==========================================
+            # 1. FACT-CHECKING LABELS & ACTIONS
+            # ==========================================
+            "đúng": [
+                "chính xác",
+                "xác thực",
+                "được xác nhận",
+                "đúng sự thật",
+                "chuẩn xác",
+            ],
+            "sai": [
+                "không chính xác",
+                "thông tin sai",
+                "sai lệch",
+                "không đúng",
+                "bác bỏ",
+            ],
+            "thiếu thông tin": [
+                "chưa đầy đủ",
+                "thiếu ngữ cảnh",
+                "không đủ dữ kiện",
+                "một phần sự thật",
+            ],
+            "bằng chứng": [
+                "nguồn chứng minh",
+                "tài liệu",
+                "dữ liệu xác thực",
+                "nguồn tham khảo",
+                "văn bản gốc",
+            ],
+            "xác minh": ["kiểm chứng", "đối chiếu", "thẩm định", "kiểm tra", "làm rõ"],
+            "tin giả": [
+                "fake news",
+                "tin bịa đặt",
+                "thông tin thất thiệt",
+                "tin đồn thất thiệt",
+            ],
+            "cảnh báo": ["warning", "khuyến cáo", "báo động", "lưu ý"],
+            # ==========================================
+            # 2. CORE BANKING & INSTITUTIONS
+            # ==========================================
+            "ngân hàng": ["tổ chức tín dụng", "bank", "ngân hàng thương mại", "NHTM"],
+            "ngân hàng nhà nước": [
+                "SBV",
+                "NHNN",
+                "central bank",
+                "ngân hàng trung ương",
+            ],
+            "chi nhánh": ["branch", "phòng giao dịch", "PGD", "điểm giao dịch"],
+            # ==========================================
+            # 3. MACROECONOMICS & POLICIES
+            # ==========================================
+            "lãi suất": [
+                "interest rate",
+                "lãi vay",
+                "lãi tiền gửi",
+                "lãi suất điều hành",
+            ],
+            "lạm phát": [
+                "inflation",
+                "CPI",
+                "chỉ số giá tiêu dùng",
+                "mất giá đồng tiền",
+            ],
+            "tỷ giá": [
+                "exchange rate",
+                "USD/VND",
+                "ngoại tệ",
+                "thị trường ngoại hối",
+                "forex",
+            ],
+            "chính sách tiền tệ": [
+                "monetary policy",
+                "nới lỏng tiền tệ",
+                "thắt chặt tiền tệ",
+                "bơm hút tiền",
+            ],
+            "room tín dụng": [
+                "hạn mức tín dụng",
+                "credit quota",
+                "chỉ tiêu tăng trưởng tín dụng",
+            ],
+            "dự trữ bắt buộc": [
+                "reserve requirement",
+                "tỷ lệ dự trữ",
+                "tiền gửi bắt buộc",
+            ],
+            # ==========================================
+            # 4. BANKING PRODUCTS & OPERATIONS
+            # ==========================================
+            "tín dụng": ["credit", "khoản vay", "cho vay", "cấp vốn"],
+            "tiền gửi": [
+                "deposit",
+                "savings",
+                "gửi tiết kiệm",
+                "tiền gửi thanh toán",
+                "CASA",
+            ],
+            "thẻ tín dụng": [
+                "credit card",
+                "thẻ ghi nợ",
+                "visa",
+                "mastercard",
+                "thẻ ngân hàng",
+            ],
+            "vay thế chấp": [
+                "mortgage",
+                "vay có tài sản đảm bảo",
+                "thế chấp tài sản",
+                "cầm cố",
+            ],
+            "vay tín chấp": [
+                "unsecured loan",
+                "vay không tài sản đảm bảo",
+                "vay tiêu dùng",
+            ],
+            "giải ngân": ["disbursement", "rót vốn", "chuyển tiền vay"],
+            "đáo hạn": ["maturity", "tất toán", "đến hạn thanh toán", "gia hạn nợ"],
+            "chuyển khoản": [
+                "bank transfer",
+                "chuyển tiền",
+                "remittance",
+                "chuyển mạch",
+            ],
+            # ==========================================
+            # 5. FINANCIAL METRICS & HEALTH
+            # ==========================================
+            "thanh khoản": [
+                "liquidity",
+                "dòng tiền",
+                "khả năng chi trả",
+                "khả năng thanh toán",
+            ],
+            "nợ xấu": [
+                "bad debt",
+                "non-performing loan",
+                "NPL",
+                "nợ nhóm 3",
+                "nợ quá hạn",
+            ],
+            "biên lãi thuần": ["NIM", "net interest margin", "chênh lệch lãi suất"],
+            "vốn điều lệ": ["charter capital", "vốn chủ sở hữu", "quy mô vốn", "CAR"],
+            # ==========================================
+            # 6. FINANCIAL MARKETS
+            # ==========================================
+            "trái phiếu": [
+                "bond",
+                "trái phiếu doanh nghiệp",
+                "debt securities",
+                "TPDN",
+                "trái phiếu chính phủ",
+            ],
+            "cổ phiếu": ["stock", "shares", "mã chứng khoán", "cổ phần"],
+            "chứng khoán": [
+                "securities",
+                "thị trường vốn",
+                "VN-Index",
+                "sàn giao dịch",
+            ],
+            "bảo hiểm": [
+                "insurance",
+                "bancassurance",
+                "bảo hiểm nhân thọ",
+                "hợp đồng bảo hiểm",
+            ],
+            # ==========================================
+            # 7. FRAUD, RISK & CYBERSECURITY
+            # ==========================================
+            "lừa đảo": ["scam", "gian lận", "chiếm đoạt", "mạo danh", "giả danh"],
+            "rút tiền hàng loạt": [
+                "bank run",
+                "withdrawal panic",
+                "khủng hoảng thanh khoản",
+                "ồ ạt rút tiền",
+            ],
+            "phá sản": ["bankrupt", "mất khả năng thanh toán", "sụp đổ", "vỡ nợ"],
+            "chiếm đoạt tài khoản": [
+                "account takeover",
+                "mất tiền trong thẻ",
+                "bị hack tài khoản",
+                "trừ tiền vô lý",
+            ],
+            "đường link lạ": [
+                "phishing link",
+                "link giả mạo",
+                "trang web lừa đảo",
+                "web đen",
+            ],
+            "mã độc": [
+                "malware",
+                "virus",
+                "phần mềm gián điệp",
+                "app giả mạo",
+                "ứng dụng độc hại",
+            ],
+            "rửa tiền": [
+                "money laundering",
+                "AML",
+                "hợp pháp hóa tiền bẩn",
+                "nguồn tiền bất hợp pháp",
+            ],
         }
 
     def expand_query(self, query: str) -> str:
-        """
-        Expand query with crypto-specific synonyms.
-
-        Args:
-            query: Original query string
-
-        Returns:
-            Expanded query with synonyms
-        """
         query_lower = query.lower()
         expanded_terms = [query]
 
         for term, synonyms in self.glossary.items():
             if term in query_lower:
-                # Add first two synonyms
+                # Add first two synonyms to avoid over-expanding the query
                 expanded_terms.extend(synonyms[:2])
 
-        return " ".join(expanded_terms)
+        # Remove duplicates while preserving order
+        seen = set()
+        result = []
+        for word in expanded_terms:
+            if word not in seen:
+                seen.add(word)
+                result.append(word)
+
+        return " ".join(result)
 
 
 class KnowledgeAugmentedRetriever:

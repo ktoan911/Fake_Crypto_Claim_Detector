@@ -54,7 +54,7 @@ function CampaignCard({
               {isExpanded ? "Ẩn tuyên bố" : "Xem tuyên bố"}
             </span>
             <svg
-              className={`w-4 h-4 transition-transform duration-200 text-[#1070e4] dark:text-[#6aabfb] ${isExpanded ? "rotate-180" : ""}`}
+              className={`w-4 h-4 transition-transform duration-200 text-[#3b82f6] dark:text-[#60a5fa] ${isExpanded ? "rotate-180" : ""}`}
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"

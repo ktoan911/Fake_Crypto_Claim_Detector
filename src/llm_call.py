@@ -318,13 +318,14 @@ def safe_parse_list(text: str) -> List[str]:
 
 def _should_skip_split(text: str) -> bool:
     """Tránh gọi LLM cho input ngắn / không có dấu hiệu nhiều fact."""
-    if len(text) < 30:
+    tmp_text = text.strip()
+    if len(tmp_text) < 30:
         return True
     # Bắt đầu bằng số thứ tự ("1. ", "2) ") + ngắn → 1 mục trong list, không phải multi-claim
-    if re.match(r"^\s*\d+[\.\)]\s", text) and len(text) < 120:
+    if re.match(r"^\s*\d+[\.\)]\s", tmp_text) and len(tmp_text) < 120:
         return True
     # Không có dấu chấm câu kết và ngắn → có khả năng là cụm từ đơn lẻ
-    if len(text) < 80 and not re.search(r"[.!?。\n]", text):
+    if len(tmp_text) < 80 and not re.search(r"[\n]", tmp_text):
         return True
     return False
 
