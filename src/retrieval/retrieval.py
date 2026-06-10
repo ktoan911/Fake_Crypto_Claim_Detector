@@ -27,8 +27,6 @@ except ImportError:
 
 import re
 
-from scipy.fft import fft
-from scipy.signal import find_peaks
 
 try:
     import nltk
@@ -219,8 +217,13 @@ class TemporalScorer:
         self, timestamps: List[datetime], pattern_type: str = None
     ) -> float:
         """
-        Calculate cyclicity score using FFT to detect repeating patterns.
+        Calculate cyclicity score using Autocorrelation Function (ACF) to detect
+        repeating lag patterns in document frequency over time.
         Implements Section 4.1's cycle-aware scoring (Eq.8).
+
+        Under the null hypothesis that organic news follows a non-periodic Poisson
+        process, ACF values at all lags are ~N(0, 1/N). Lags exceeding the 95%
+        confidence bound (±1.96/√N) indicate coordinated/non-organic activity.
 
         Args:
             timestamps: List of document timestamps for pattern analysis
@@ -231,38 +234,43 @@ class TemporalScorer:
         """
         valid_timestamps = [t for t in timestamps if t is not None]
         if len(valid_timestamps) < 10:
-            return 0.5  # Default for insufficient data
+            return 0.5
 
-        # Convert to daily occurrence counts
         min_date = min(valid_timestamps)
         max_date = max(valid_timestamps)
         date_range = (max_date - min_date).days + 1
 
-        if date_range < 7:
+        if date_range < 14:
             return 0.5
 
-        # Create time series
         daily_counts = np.zeros(date_range)
         for ts in valid_timestamps:
             day_idx = (ts - min_date).days
             if 0 <= day_idx < date_range:
                 daily_counts[day_idx] += 1
 
-        # Apply FFT
-        fft_result = fft(daily_counts)
-        power_spectrum = np.abs(fft_result[: len(fft_result) // 2]) ** 2
+        # Mean-centre before computing ACF (required for unbiased estimate)
+        x = daily_counts - daily_counts.mean()
+        n = len(x)
+        variance = np.dot(x, x)
+        if variance < 1e-10:
+            return 0.3
 
-        # Find dominant frequencies
-        peaks, properties = find_peaks(power_spectrum, height=np.mean(power_spectrum))
+        # Compute normalised ACF via full convolution; keep lags 1..max_lag
+        max_lag = min(n // 2, 90)
+        acf = np.correlate(x, x, mode="full")[n - 1:]  # lags 0,1,2,...
+        acf = acf[1 : max_lag + 1] / variance          # normalise; skip lag-0
 
-        if len(peaks) > 0:
-            # Calculate cyclicity based on peak strength
-            max_peak_power = max(properties["peak_heights"])
-            total_power = np.sum(power_spectrum)
-            cyclicity = min(1.0, max_peak_power / (total_power + 1e-8) * 5)
-        else:
-            cyclicity = 0.3
+        # 95 % confidence bound for white-noise null (Box & Jenkins, 1976)
+        confidence = 1.96 / np.sqrt(n)
 
+        significant = np.abs(acf) > confidence
+        if not significant.any():
+            return 0.3
+
+        # Score = mean excess above threshold at significant lags, capped at 1
+        excess = np.abs(acf[significant]) - confidence
+        cyclicity = float(min(1.0, excess.mean() / confidence))
         return cyclicity
 
     def adapt_lambda(self, trend_indicator: float) -> None:

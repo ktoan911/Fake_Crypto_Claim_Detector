@@ -128,20 +128,41 @@ class LLMScorer:
             # CPU: bfloat16 halves RAM (8GB for 4B model). float32 = 16GB = instant OOM on 16GB machines.
             dtype = torch.float16 if use_cuda else torch.bfloat16
 
+            load_in_4bit = use_cuda and os.getenv("LLM_LOAD_IN_4BIT", "0") == "1"
+
             kwargs = {
                 "trust_remote_code": False,
-                "low_cpu_mem_usage": True,  # Avoids 2x peak spike during weight loading.
+                "low_cpu_mem_usage": True,
             }
             if use_cuda:
                 kwargs["device_map"] = "auto"
-                # Flash Attention 2 giảm VRAM O(n) → O(n/block) và tăng tốc attention 2-4x.
-                # Cần package flash-attn: pip install flash-attn --no-build-isolation
-                try:
-                    import flash_attn  # noqa: F401
-                    kwargs["attn_implementation"] = "flash_attention_2"
-                    logger.info("[llm_scorer] Flash Attention 2 enabled.")
-                except ImportError:
-                    logger.info("[llm_scorer] flash-attn not installed, using default attention.")
+                if load_in_4bit:
+                    # 4-bit NF4 quantization: 8GB model → ~2GB VRAM.
+                    # Cần: pip install bitsandbytes
+                    try:
+                        from transformers import BitsAndBytesConfig
+                        kwargs["quantization_config"] = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=torch.float16,
+                            bnb_4bit_use_double_quant=True,
+                            bnb_4bit_quant_type="nf4",
+                        )
+                        # torch_dtype phải để auto khi dùng quantization
+                        dtype = torch.float16
+                        logger.info("[llm_scorer] 4-bit NF4 quantization enabled (LLM_LOAD_IN_4BIT=1).")
+                    except ImportError:
+                        logger.warning("[llm_scorer] bitsandbytes not installed, falling back to float16. Run: pip install bitsandbytes")
+                        load_in_4bit = False
+
+                if not load_in_4bit:
+                    # Flash Attention 2 giảm VRAM O(n) → O(n/block) và tăng tốc attention 2-4x.
+                    # Cần package flash-attn: pip install flash-attn --no-build-isolation
+                    try:
+                        import flash_attn  # noqa: F401
+                        kwargs["attn_implementation"] = "flash_attention_2"
+                        logger.info("[llm_scorer] Flash Attention 2 enabled.")
+                    except ImportError:
+                        logger.info("[llm_scorer] flash-attn not installed, using default attention.")
             else:
                 # Be explicit to avoid accidental accelerate dispatch metadata on CPU.
                 kwargs["device_map"] = None
@@ -154,6 +175,7 @@ class LLMScorer:
                     f"Model load failed ({exc}). Retrying with local cache only."
                 )
                 kwargs.pop("attn_implementation", None)
+                kwargs.pop("quantization_config", None)
                 return AutoModelForCausalLM.from_pretrained(
                     model_path, torch_dtype=dtype, local_files_only=True, **kwargs
                 )

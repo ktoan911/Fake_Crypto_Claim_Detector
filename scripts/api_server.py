@@ -126,6 +126,9 @@ async def lifespan(app: FastAPI):
             debug=True,
         )
         logger.info(f"[startup] FusionClaimVerifier ready ✓ | timeout={_inference_timeout_s}s")
+        logger.info("[startup] Running model warmup (torch.compile kernel compilation) …")
+        _verifier.warmup()
+        logger.info("[startup] Model warmup complete ✓")
     except Exception:
         import traceback
         logger.error(f"[startup] Failed to load verifier:\n{traceback.format_exc()}")
@@ -285,6 +288,7 @@ async def verify_claim(request: ClaimRequest, http_request: Request):
             "evidence": prediction.evidence,
             "source_links": prediction.source_links,
             "confidence": prediction.confidence,
+            "timing_ms": prediction.timing_ms,
         }
         _claim_cache.set(cache_key, result)
         return result

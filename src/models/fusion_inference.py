@@ -216,14 +216,13 @@ class OpenSearchHybridRetriever:
         Fetch a sufficiently large pool for RRF ranking without fetching the entire DB.
         During inference, fetching 10k full documents takes >100 seconds over HTTP.
         """
-        pool = max(rrf_top_k * 5, 200)
+        hard_cap = int(os.getenv("RETRIEVAL_POOL_SIZE_CAP", "100"))
+        pool = min(max(rrf_top_k * 2, 50), hard_cap)
         try:
             count = int(self.kb.client.count(index=self.kb.index).get("count", pool))
             if count > 0:
-                # Cap the inference search pool at 200 to keep retrieval < 1 second.
-                pool = min(count, max(rrf_top_k * 5, 200))
+                pool = min(count, pool)
         except Exception as exc:
-            pool = max(pool, 200)
             logger.warning(
                 f"Could not fetch OpenSearch count, using pool={pool}: {exc}"
             )
@@ -281,7 +280,7 @@ class OpenSearchHybridRetriever:
         if expand_query and self.query_expander is not None and not verbatim_query:
             expanded_query = self.query_expander.expand_query(normalized_query)
 
-        effective_rrf_top_k = max(rrf_top_k, top_k * 10)
+        effective_rrf_top_k = max(rrf_top_k, top_k * 3)
         search_pool_k = self._get_search_pool_size(rrf_top_k=effective_rrf_top_k)
         semantic_enabled = use_semantic and not verbatim_query
         if debug:
@@ -420,6 +419,7 @@ class ClaimPrediction:
     confidence: float
     evidence: List[str]
     source_links: List[str]
+    timing_ms: Optional[Dict[str, float]] = None
 
 
 class FusionClaimVerifier:
@@ -559,7 +559,7 @@ class FusionClaimVerifier:
         self.llm = LLMScorer(
             model_name=model_name,
             device=self.device,
-            max_length=2048,
+            max_length=int(os.getenv("LLM_MAX_LENGTH", "1024")),
             labels=self.label_list,
             prompt_template=PROMPT_TEMPLATE,
         )
@@ -588,6 +588,43 @@ class FusionClaimVerifier:
             use_query_expansion=True,
             rrf_k=rrf_k,
             device=self.device,
+        )
+
+    # ------------------------------------------------------------------
+    # Warmup
+    # ------------------------------------------------------------------
+    def warmup(self) -> None:
+        """Trigger torch.compile lazy Triton compilation during startup.
+
+        torch.compile defers kernel compilation to the first real forward pass,
+        which stalls the initial user request for 3-10 minutes on GPU. Running a
+        dummy forward here during server startup moves that cost out of the
+        critical path.
+        """
+        if self.device == "cpu":
+            return
+
+        logger.info(
+            "[fusion_inference] warmup: triggering torch.compile kernel compilation"
+            " — may take a few minutes on first boot …"
+        )
+        t0 = perf_counter()
+        with torch.inference_mode():
+            dummy_retrieval = torch.zeros(
+                1, self.top_k, 4, dtype=torch.float32, device=self.device
+            )
+            dummy_encoded = self.retrieval_encoder(dummy_retrieval)
+            dummy_llm = torch.zeros(
+                1, len(self.label_list), dtype=torch.float32, device=self.device
+            )
+            self.fusion(dummy_llm, dummy_encoded)
+
+            dummy_ids = torch.zeros(1, 16, dtype=torch.long, device=self.device)
+            dummy_mask = torch.ones(1, 16, dtype=torch.long, device=self.device)
+            self.llm.model(input_ids=dummy_ids, attention_mask=dummy_mask)
+
+        logger.info(
+            f"[fusion_inference] warmup done | elapsed_ms={1000.0 * (perf_counter() - t0):.0f}"
         )
 
     # ------------------------------------------------------------------
@@ -1111,6 +1148,13 @@ class FusionClaimVerifier:
             if url and url not in source_links:
                 source_links.append(url)
 
+        t_total = perf_counter() - t0
+        timing_ms = {
+            "retrieval_ms": round(1000.0 * (t_retrieval1 - t_retrieval0), 1),
+            "llm_ms": round(1000.0 * (t_llm1 - t_llm0), 1),
+            "total_ms": round(1000.0 * t_total, 1),
+        }
+
         prediction = ClaimPrediction(
             claim=text,
             verdict=verdict,
@@ -1119,6 +1163,7 @@ class FusionClaimVerifier:
             confidence=confidence,
             evidence=llm_evidence,
             source_links=source_links,
+            timing_ms=timing_ms,
         )
 
         self._log_predictions_to_claims_index([prediction])
