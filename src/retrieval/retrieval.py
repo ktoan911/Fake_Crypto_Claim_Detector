@@ -770,6 +770,8 @@ class KnowledgeAugmentedRetriever:
                 [expanded_query], convert_to_numpy=True
             )
             faiss.normalize_L2(query_embedding)
+            # Store L2-normalised query embedding for claim-evidence interaction features
+            self._last_query_embedding = query_embedding[0].copy()
 
             # Search all documents to get complete ranking
             n_docs = len(self.documents)
@@ -777,6 +779,7 @@ class KnowledgeAugmentedRetriever:
             faiss_ranks = {idx: rank for rank, idx in enumerate(indices[0].tolist())}
             faiss_cosine = {int(indices[0][i]): float(distances[0][i]) for i in range(len(indices[0]))}
         else:
+            self._last_query_embedding = None
             # No FAISS available: use uniform ranks
             faiss_ranks = {i: i for i in range(len(self.documents))}
 

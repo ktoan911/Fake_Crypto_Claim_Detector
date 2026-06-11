@@ -279,8 +279,12 @@ if TORCH_AVAILABLE:
 
         Two optional branches:
         - Score branch: attention-weighted scoring features → output_dim
-        - Embedding branch (if emb_dim > 0): mean-pool doc embeddings → output_dim
-        Both are concatenated and projected back to output_dim when both are present.
+        - Interaction branch (if interaction_dim > 0):
+            claim-evidence interaction [q⊙mean_d, |q-mean_d|] → output_dim
+            Uses a single linear projection + dropout to avoid overfitting on
+            small datasets.  The interaction signal encodes whether the claim
+            ALIGNS or CONTRADICTS the retrieved evidence per semantic dimension.
+        Both branches are concatenated then projected back to output_dim.
         """
 
         def __init__(
@@ -289,12 +293,12 @@ if TORCH_AVAILABLE:
             score_features: int = 5,
             hidden_dim: int = 64,
             output_dim: int = 64,
-            emb_dim: int = 0,
+            interaction_dim: int = 0,
         ):
             super().__init__()
 
             self.num_retrieved = num_retrieved
-            self.emb_dim = emb_dim
+            self.interaction_dim = interaction_dim
             input_dim = num_retrieved * score_features
 
             self.encoder = nn.Sequential(
@@ -307,29 +311,28 @@ if TORCH_AVAILABLE:
                 nn.Linear(score_features, 16), nn.Tanh(), nn.Linear(16, 1)
             )
 
-            if emb_dim > 0:
-                # Projects mean-pooled doc embeddings to output_dim
-                self.emb_projection = nn.Sequential(
-                    nn.Linear(emb_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(hidden_dim, output_dim),
+            if interaction_dim > 0:
+                # Single linear layer + dropout (no hidden layer to limit overfitting
+                # when training set is small, e.g. ~274 samples).
+                self.interaction_proj = nn.Sequential(
+                    nn.Dropout(0.3),
+                    nn.Linear(interaction_dim, output_dim),
                 )
-                # Fuses score branch + embedding branch → output_dim
+                # Fuses score branch + interaction branch → output_dim
                 self.fusion_proj = nn.Linear(output_dim * 2, output_dim)
             else:
-                self.emb_projection = None
+                self.interaction_proj = None
                 self.fusion_proj = None
 
         def forward(
             self,
             retrieval_scores: torch.Tensor,
-            doc_embeddings: Optional[torch.Tensor] = None,
+            interaction_features: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """
             Args:
-                retrieval_scores: [B, num_retrieved, score_features]
-                doc_embeddings:   [B, num_retrieved, emb_dim] or None
+                retrieval_scores:     [B, num_retrieved, score_features]
+                interaction_features: [B, interaction_dim] or None
             Returns:
                 [B, output_dim]
             """
@@ -342,10 +345,9 @@ if TORCH_AVAILABLE:
             flat = weighted.view(batch_size, -1)
             score_out = self.encoder(flat)  # [B, output_dim]
 
-            if self.emb_projection is not None and doc_embeddings is not None:
-                mean_emb = doc_embeddings.mean(dim=1)          # [B, emb_dim]
-                emb_out = self.emb_projection(mean_emb)         # [B, output_dim]
-                combined = torch.cat([score_out, emb_out], dim=-1)  # [B, output_dim*2]
-                return self.fusion_proj(combined)               # [B, output_dim]
+            if self.interaction_proj is not None and interaction_features is not None:
+                int_out = self.interaction_proj(interaction_features)  # [B, output_dim]
+                combined = torch.cat([score_out, int_out], dim=-1)    # [B, output_dim*2]
+                return self.fusion_proj(combined)                       # [B, output_dim]
 
             return score_out

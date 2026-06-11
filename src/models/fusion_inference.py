@@ -152,16 +152,15 @@ def _build_retrieval_features_train_compatible(
 ) -> "tuple[np.ndarray, Optional[np.ndarray], List[str], List[RetrievalResult]]":
     """
     Same feature construction used in training.
-    Returns (score_features_array, doc_embeddings_array, evidence_texts, results).
-    doc_embeddings_array is [top_k, emb_dim] or None if embeddings unavailable.
+    Returns (score_features_array, interaction_features, evidence_texts, results).
+    interaction_features is [2*emb_dim] = concat(q⊙mean_d, |q-mean_d|) or None.
     """
     results = retriever.retrieve(
         text, top_k=top_k, rrf_top_k=rrf_top_k, precomputed_vector=precomputed_vector
     )
     features = []
-    embeddings = []
+    doc_embs = []
     evidence_texts = []
-    has_embeddings = False
 
     for r in results:
         row = [r.score, r.rrf_score, r.recency_score, r.cyclicity_score]
@@ -169,8 +168,7 @@ def _build_retrieval_features_train_compatible(
             row.append(r.cosine_similarity)
         features.append(row)
         if r.embedding is not None:
-            embeddings.append(r.embedding)
-            has_embeddings = True
+            doc_embs.append(r.embedding)
         ts = (
             r.timestamp.astimezone(timezone.utc)
             if isinstance(r.timestamp, datetime)
@@ -182,12 +180,16 @@ def _build_retrieval_features_train_compatible(
     pad = top_k - len(features)
     if pad > 0:
         features.extend([[0.0] * score_features] * pad)
-        if has_embeddings:
-            emb_dim = embeddings[0].shape[0] if embeddings else 1
-            embeddings.extend([np.zeros(emb_dim, dtype=np.float32)] * pad)
 
-    emb_array = np.array(embeddings, dtype=np.float32) if has_embeddings else None
-    return np.array(features, dtype=np.float32), emb_array, evidence_texts, results
+    interaction = None
+    q_emb = getattr(retriever, "_last_query_embedding", None)
+    if q_emb is not None and doc_embs:
+        mean_d = np.array(doc_embs, dtype=np.float32).mean(axis=0)
+        interaction = np.concatenate(
+            [q_emb * mean_d, np.abs(q_emb - mean_d)], dtype=np.float32
+        )
+
+    return np.array(features, dtype=np.float32), interaction, evidence_texts, results
 
 
 class OpenSearchHybridRetriever:
@@ -530,13 +532,13 @@ class FusionClaimVerifier:
             )
 
         self.score_features = int(self.saved_config.get("score_features", 5))
-        self.emb_dim = int(self.saved_config.get("emb_dim", 0))
+        self.interaction_dim = int(self.saved_config.get("interaction_dim", 0))
         self.retrieval_encoder = RetrievalFeatureEncoder(
             num_retrieved=self.top_k,
             score_features=self.score_features,
             hidden_dim=64,
             output_dim=64,
-            emb_dim=self.emb_dim,
+            interaction_dim=self.interaction_dim,
         ).to(self.device)
 
         self.fusion = ConfidenceAwareFusion(
@@ -862,13 +864,13 @@ class FusionClaimVerifier:
                 batch_vectors = self.retriever.batch_encode(batch_texts_list)
                 vec_map: dict[str, List[float]] = dict(zip(batch_texts_list, batch_vectors))
 
-                all_retrieval_doc_embeddings = []
+                all_retrieval_interactions = []
 
                 def _retrieve_one(
                     item: Tuple[int, str],
                 ) -> Tuple[int, str, Any, Any, List[str], List[str]]:
                     _idx, _text = item
-                    _feat, _emb, _evidence, _results = _build_retrieval_features_train_compatible(
+                    _feat, _interaction, _evidence, _results = _build_retrieval_features_train_compatible(
                         self.retriever, _text, self.top_k,
                         precomputed_vector=vec_map.get(_text),
                         score_features=self.score_features,
@@ -885,19 +887,19 @@ class FusionClaimVerifier:
                         ).strip()
                         if _url and _url not in _links:
                             _links.append(_url)
-                    return _idx, _text, _feat, _emb, _evidence[: self.llm_evidence_top_k], _links
+                    return _idx, _text, _feat, _interaction, _evidence[: self.llm_evidence_top_k], _links
 
                 retrieved: dict[int, Tuple] = {}
                 for item in batch:
-                    r_idx, r_text, r_feat, r_emb, r_ev, r_links = _retrieve_one(item)
-                    retrieved[r_idx] = (r_text, r_feat, r_emb, r_ev, r_links)
+                    r_idx, r_text, r_feat, r_int, r_ev, r_links = _retrieve_one(item)
+                    retrieved[r_idx] = (r_text, r_feat, r_int, r_ev, r_links)
 
                 for idx, text in batch:
                     valid_indices.append(idx)
                     valid_claims.append(text)
-                    _, feat, emb, ev, links = retrieved[idx]
+                    _, feat, interaction, ev, links = retrieved[idx]
                     all_retrieval_features.append(feat)
-                    all_retrieval_doc_embeddings.append(emb)
+                    all_retrieval_interactions.append(interaction)
                     all_llm_evidences.append(ev)
                     all_source_links.append(links)
 
@@ -906,10 +908,10 @@ class FusionClaimVerifier:
                     dtype=torch.float32,
                     device=self.device,
                 )
-                doc_emb_tensor = None
-                if all_retrieval_doc_embeddings and all_retrieval_doc_embeddings[0] is not None:
-                    doc_emb_tensor = torch.tensor(
-                        np.stack(all_retrieval_doc_embeddings), dtype=torch.float32, device=self.device
+                interaction_tensor = None
+                if all_retrieval_interactions and all_retrieval_interactions[0] is not None:
+                    interaction_tensor = torch.tensor(
+                        np.stack(all_retrieval_interactions), dtype=torch.float32, device=self.device
                     )
 
                 t_llm0 = perf_counter()
@@ -919,7 +921,7 @@ class FusionClaimVerifier:
                 t_llm1 = perf_counter()
                 total_llm_ms += 1000.0 * (t_llm1 - t_llm0)
 
-                retrieval_encoded = self.retrieval_encoder(retrieval_features, doc_emb_tensor)
+                retrieval_encoded = self.retrieval_encoder(retrieval_features, interaction_tensor)
                 fusion_output = self.fusion(llm_logits, retrieval_encoded)
 
                 probs_batch = fusion_output.final_probs
@@ -1111,11 +1113,11 @@ class FusionClaimVerifier:
                     )
                 )
 
-            doc_emb_tensor = (
+            interaction_tensor = (
                 torch.tensor(doc_emb_np, dtype=torch.float32, device=self.device).unsqueeze(0)
                 if doc_emb_np is not None else None
             )
-            retrieval_encoded = self.retrieval_encoder(retrieval_features, doc_emb_tensor)
+            retrieval_encoded = self.retrieval_encoder(retrieval_features, interaction_tensor)
             if self.debug:
                 enc = retrieval_encoded.detach().cpu()
                 logger.info(
