@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -49,6 +51,10 @@ class OpenSearchKB:
             connection_class=RequestsHttpConnection,
             pool_maxsize=20,
         )
+        self._count_cache: Optional[int] = None
+        self._count_cache_ts: float = 0.0
+        self._count_cache_ttl: float = 60.0
+        self._count_lock = threading.Lock()
 
     def create_index(self, overwrite: bool = False) -> None:
         """
@@ -81,13 +87,15 @@ class OpenSearchKB:
                     "embedding": {
                         "type": "knn_vector",
                         "dimension": self.embedding_dim,
-                        # optional: method tuning (HNSW)
-                        # "method": {
-                        #   "name": "hnsw",
-                        #   "engine": "nmslib",
-                        #   "space_type": "cosinesimil",
-                        #   "parameters": {"ef_construction": 128, "m": 16}
-                        # }
+                        "method": {
+                            "name": "hnsw",
+                            "engine": "nmslib",
+                            "space_type": "cosinesimil",
+                            "parameters": {
+                                "ef_construction": 256,
+                                "m": 16,
+                            },
+                        },
                     },
                 }
             },
@@ -373,6 +381,21 @@ class OpenSearchKB:
             for h in hits
         ]
 
+    def count_docs(self) -> int:
+        """Return document count, cached for 60 s to avoid a round-trip on every retrieve."""
+        now = time.monotonic()
+        with self._count_lock:
+            if self._count_cache is not None and now - self._count_cache_ts < self._count_cache_ttl:
+                return self._count_cache
+        try:
+            count = int(self.client.count(index=self.index).get("count", 0))
+        except Exception:
+            count = self._count_cache or 0
+        with self._count_lock:
+            self._count_cache = count
+            self._count_cache_ts = time.monotonic()
+        return count
+
     def search_vector(
         self,
         query_vector: List[float],
@@ -384,17 +407,16 @@ class OpenSearchKB:
         """
         Vector k-NN search on 'embedding'.
 
-        Note:
-        - Some OpenSearch versions accept: {"query": {"knn": {...}}}
-        - Others support newer "knn" query styles.
-        This implementation uses the common pattern.
+        Uses HNSW knn query (O(log n)) when the index was created with the HNSW method.
+        Falls back to exact script_score cosinesimil if the knn query fails (e.g. old index
+        without HNSW mapping).  Re-index with create_index(overwrite=True) to get full speed.
         """
         if len(query_vector) != self.embedding_dim:
             raise ValueError(
                 f"query_vector dim mismatch: got {len(query_vector)} expected {self.embedding_dim}"
             )
 
-        filter_clauses = []
+        filter_clauses: List[JsonDict] = []
         if filters:
             if "term" in filters or "range" in filters or "bool" in filters:
                 filter_clauses.append(filters)
@@ -410,16 +432,41 @@ class OpenSearchKB:
                 range_body["lte"] = max_timestamp
             filter_clauses.append({"range": {"timestamp": range_body}})
 
-        # OpenSearch embeddings were inserted without normalization
-        # So we must use script_score with exact cosinesimil instead of L2 HNSW algorithm
-        # which fails horribly on unnormalized vectors.
-        body: JsonDict = {
+        # HNSW knn query — O(log n), uses the index built at insert time.
+        ef_search = int(os.getenv("KNN_EF_SEARCH", "200"))
+        knn_clause: JsonDict = {
+            "vector": query_vector,
+            "k": k,
+            "method_parameters": {"ef_search": ef_search},
+        }
+        if filter_clauses:
+            knn_clause["filter"] = {"bool": {"filter": filter_clauses}}
+
+        knn_body: JsonDict = {
+            "size": k,
+            "query": {"knn": {"embedding": knn_clause}},
+        }
+
+        try:
+            resp = self.client.search(index=self.index, body=knn_body)
+            hits = resp.get("hits", {}).get("hits", [])
+            return [
+                SearchHit(
+                    id=str(h.get("_id")),
+                    score=float(h.get("_score", 0.0) or 0.0),
+                    source=h.get("_source", {}) or {},
+                )
+                for h in hits
+            ]
+        except Exception:
+            pass
+
+        # Fallback: exact script_score (old index without HNSW mapping).
+        script_body: JsonDict = {
             "size": k,
             "query": {
                 "script_score": {
-                    "query": {
-                        "bool": {"filter": filter_clauses if filter_clauses else []}
-                    },
+                    "query": {"bool": {"filter": filter_clauses if filter_clauses else []}},
                     "script": {
                         "source": "knn_score",
                         "lang": "knn",
@@ -432,12 +479,7 @@ class OpenSearchKB:
                 }
             },
         }
-
-        try:
-            resp = self.client.search(index=self.index, body=body)
-        except Exception:
-            raise
-
+        resp = self.client.search(index=self.index, body=script_body)
         hits = resp.get("hits", {}).get("hits", [])
         return [
             SearchHit(

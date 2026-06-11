@@ -8,10 +8,12 @@ current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 PROMPT_TEMPLATE = """You are an expert fact-checker verifying Vietnamese claims based on the provided evidence.
 
-Classify the claim based on ALL the evidence and answer with ONLY a single letter:
-- A: The evidence supports the claim
-- B: The evidence contradicts the claim
-- C: There is not enough evidence to support or refute the claim
+Each evidence item includes a timestamp [Thời gian của thông tin: ...]. Financial data changes over time — only classify as B if the evidence and claim refer to the same time period.
+
+Answer with ONLY a single letter:
+- A: Evidence supports the claim
+- B: Evidence contradicts the claim (same time period)
+- C: Not enough evidence, or evidence is from a different time period
 
 Claim: {claim}
 

@@ -264,7 +264,7 @@ def train_fusion_from_dataframe(
     knowledge_base: List[Dict],
     labeled_df,
     config: Optional[FusionTrainingConfig] = None,
-    save_path: str = "models/fusion_model.pt",
+    save_path: str = "models/acf_fusion_model.pt",
     resume_checkpoint_path: Optional[str] = None,
     resume_strict: bool = False,
 ) -> str:

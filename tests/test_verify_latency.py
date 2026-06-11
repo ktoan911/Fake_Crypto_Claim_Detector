@@ -13,7 +13,7 @@ import urllib.request
 import urllib.error
 
 DEFAULT_URL = "http://localhost:7860"
-DEFAULT_CLAIM = "Bitcoin sẽ tăng lên 200,000 USD vào cuối năm 2025 theo dự báo của các chuyên gia tài chính hàng đầu."
+DEFAULT_CLAIM = "Bitcoin sẽ tăng lên 200,000 USD vào cuối năm 2025"
 
 
 def verify(base_url: str, claim: str) -> tuple[dict, float]:

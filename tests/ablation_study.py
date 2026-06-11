@@ -56,6 +56,7 @@ _DEFAULT_RETRIEVER_MODEL = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Emb
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _free(obj) -> None:
     """Delete object, collect garbage, empty CUDA cache."""
     del obj
@@ -64,10 +65,13 @@ def _free(obj) -> None:
         torch.cuda.empty_cache()
 
 
-def _resolve_fusion_path(path_or_repo: str, filename: str = "time_fusion_model_v2.pt") -> str:
+def _resolve_fusion_path(
+    path_or_repo: str, filename: str = "acf_fusion_model.pt"
+) -> str:
     if os.path.isfile(path_or_repo):
         return path_or_repo
     from huggingface_hub import hf_hub_download
+
     local = hf_hub_download(repo_id=path_or_repo, filename=filename)
     logger.info(f"Downloaded {filename} → {local}")
     return local
@@ -107,6 +111,7 @@ def _pseudo_timestamps(n: int, days_spread: int = 365) -> List[datetime]:
 # Phase 1: Retrieval — compute features, then free retriever
 # ---------------------------------------------------------------------------
 
+
 def phase1_retrieval(
     claims: List[str],
     gold_evidences: List[List[str]],
@@ -145,7 +150,11 @@ def phase1_retrieval(
     for ev_list in gold_evidences:
         for ev_text in ev_list:
             all_docs.append(
-                {"id": f"d{ts_cursor}", "text": str(ev_text), "timestamp": timestamps[ts_cursor]}
+                {
+                    "id": f"d{ts_cursor}",
+                    "text": str(ev_text),
+                    "timestamp": timestamps[ts_cursor],
+                }
             )
             ts_cursor += 1
 
@@ -158,7 +167,15 @@ def phase1_retrieval(
         doc_embs = []
         rows = []
         for r in results:
-            rows.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score, r.cosine_similarity])
+            rows.append(
+                [
+                    r.score,
+                    r.rrf_score,
+                    r.recency_score,
+                    r.cyclicity_score,
+                    r.cosine_similarity,
+                ]
+            )
             if r.embedding is not None:
                 doc_embs.append(r.embedding)
         while len(rows) < top_k:
@@ -180,8 +197,16 @@ def phase1_retrieval(
 
     feats_temporal = np.zeros((len(claims), top_k, 5), dtype=np.float32)
     feats_no_temporal = np.zeros((len(claims), top_k, 5), dtype=np.float32)
-    interactions_temporal = np.zeros((len(claims), interaction_dim), dtype=np.float32) if interaction_dim > 0 else None
-    interactions_no_temporal = np.zeros((len(claims), interaction_dim), dtype=np.float32) if interaction_dim > 0 else None
+    interactions_temporal = (
+        np.zeros((len(claims), interaction_dim), dtype=np.float32)
+        if interaction_dim > 0
+        else None
+    )
+    interactions_no_temporal = (
+        np.zeros((len(claims), interaction_dim), dtype=np.float32)
+        if interaction_dim > 0
+        else None
+    )
 
     for i, claim in enumerate(tqdm(claims, desc="Phase 1 — retrieval")):
         s_t, i_t = _feats(claim, use_temporal=True)
@@ -195,12 +220,18 @@ def phase1_retrieval(
 
     _free(retriever)
     logger.info("Phase 1 done — retriever freed")
-    return feats_temporal, feats_no_temporal, interactions_temporal, interactions_no_temporal
+    return (
+        feats_temporal,
+        feats_no_temporal,
+        interactions_temporal,
+        interactions_no_temporal,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Phase 2: LLM — compute logits, then free LLM
 # ---------------------------------------------------------------------------
+
 
 def phase2_llm(
     claims: List[str],
@@ -245,6 +276,7 @@ def phase2_llm(
 # Phase 3: Fusion — 3 configs, tiny model, use cached tensors
 # ---------------------------------------------------------------------------
 
+
 def _build_fusion(
     ckpt: dict,
     saved_config: dict,
@@ -274,13 +306,17 @@ def _build_fusion(
         num_classes=num_classes,
         initial_beta=float(saved_config.get("initial_beta", 0.8)),
         lambda_reg=float(saved_config.get("lambda_reg", 0.01)),
-        normalize_branch_logits=bool(saved_config.get("normalize_branch_logits", False)),
+        normalize_branch_logits=bool(
+            saved_config.get("normalize_branch_logits", False)
+        ),
         adaptive_beta=effective,
     ).to(device)
 
     if not effective and has_gate:
         # Drop beta_gate.* keys — simulate fixed-β (weights other than gate are loaded)
-        compatible = {k: v for k, v in fusion_state.items() if not k.startswith("beta_gate.")}
+        compatible = {
+            k: v for k, v in fusion_state.items() if not k.startswith("beta_gate.")
+        }
         fus.load_state_dict(compatible, strict=False)
     else:
         fus.load_state_dict(fusion_state, strict=(effective == has_gate))
@@ -306,7 +342,9 @@ def _eval_config(
     for start in tqdm(range(0, n, batch_size), desc=config_name):
         end = min(start + batch_size, n)
         feat_t = torch.tensor(feats_np[start:end], dtype=torch.float32, device=device)
-        llm_t = torch.tensor(llm_logits_np[start:end], dtype=torch.float32, device=device)
+        llm_t = torch.tensor(
+            llm_logits_np[start:end], dtype=torch.float32, device=device
+        )
         int_t = (
             torch.tensor(interactions_np[start:end], dtype=torch.float32, device=device)
             if interactions_np is not None
@@ -321,12 +359,20 @@ def _eval_config(
         preds.extend(batch_preds)
 
     label_ids = list(range(len(LABEL_LIST)))
-    f1_macro = f1_score(y_true, preds, average="macro", zero_division=0, labels=label_ids)
-    f1_weighted = f1_score(y_true, preds, average="weighted", zero_division=0, labels=label_ids)
+    f1_macro = f1_score(
+        y_true, preds, average="macro", zero_division=0, labels=label_ids
+    )
+    f1_weighted = f1_score(
+        y_true, preds, average="weighted", zero_division=0, labels=label_ids
+    )
     per_class = f1_score(y_true, preds, average=None, zero_division=0, labels=label_ids)
     acc = accuracy_score(y_true, preds)
-    prec = precision_score(y_true, preds, average="macro", zero_division=0, labels=label_ids)
-    rec = recall_score(y_true, preds, average="macro", zero_division=0, labels=label_ids)
+    prec = precision_score(
+        y_true, preds, average="macro", zero_division=0, labels=label_ids
+    )
+    rec = recall_score(
+        y_true, preds, average="macro", zero_division=0, labels=label_ids
+    )
 
     row: dict = {
         "Configuration": config_name,
@@ -382,7 +428,7 @@ def phase3_fusion(
 
     results = []
     for cfg in ablation_configs:
-        logger.info(f"\n{'='*60}\nPhase 3 — config: {cfg['name']}\n{'='*60}")
+        logger.info(f"\n{'=' * 60}\nPhase 3 — config: {cfg['name']}\n{'=' * 60}")
         enc, fus = _build_fusion(ckpt, saved_config, device, cfg["adaptive_beta"])
         row = _eval_config(
             config_name=cfg["name"],
@@ -404,6 +450,7 @@ def phase3_fusion(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -431,11 +478,15 @@ def main() -> None:
     logger.info(f"Loading {args.csv}")
     df = pd.read_csv(args.csv)
     if args.limit:
-        df = df.sample(n=min(args.limit, len(df)), random_state=42).reset_index(drop=True)
+        df = df.sample(n=min(args.limit, len(df)), random_state=42).reset_index(
+            drop=True
+        )
 
     claims: List[str] = df["claim"].tolist()
     y_true: List[int] = [_normalize_label(lbl) for lbl in df["label"].tolist()]
-    gold_evidences: List[List[str]] = [_parse_evidence(e) for e in df["evidence"].tolist()]
+    gold_evidences: List[List[str]] = [
+        _parse_evidence(e) for e in df["evidence"].tolist()
+    ]
     logger.info(
         f"{len(claims)} samples | labels: {pd.Series(y_true).value_counts().to_dict()}"
     )
@@ -453,7 +504,12 @@ def main() -> None:
     )
 
     # ---- Phase 1: Retrieval (SentenceTransformer + FAISS + BM25) ----
-    feats_temporal, feats_no_temporal, interactions_temporal, interactions_no_temporal = phase1_retrieval(
+    (
+        feats_temporal,
+        feats_no_temporal,
+        interactions_temporal,
+        interactions_no_temporal,
+    ) = phase1_retrieval(
         claims=claims,
         gold_evidences=gold_evidences,
         retriever_model=retriever_model,
@@ -498,7 +554,9 @@ def main() -> None:
         f" → {results_df.loc[best_idx, 'F1 (macro)']:.4f}"
     )
 
-    full_f1_rows = results_df.loc[results_df["Configuration"] == "Full Model", "F1 (macro)"]
+    full_f1_rows = results_df.loc[
+        results_df["Configuration"] == "Full Model", "F1 (macro)"
+    ]
     if not full_f1_rows.empty:
         full_f1 = full_f1_rows.values[0]
         print("\nΔ F1 (macro) vs Full Model:")

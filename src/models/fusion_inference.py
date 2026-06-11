@@ -19,7 +19,7 @@ from src.llm_call import split_claim
 from src.retrieval.retrieval import QueryExpander, RetrievalResult, TemporalScorer
 
 
-def _resolve_fusion_model_path(path_or_repo: str, filename: str = "time_fusion_model_v2.pt") -> str:
+def _resolve_fusion_model_path(path_or_repo: str, filename: str = "acf_fusion_model.pt") -> str:
     if os.path.isfile(path_or_repo):
         return path_or_repo
     try:
@@ -142,6 +142,8 @@ def _token_overlap_ratio(query_text: str, doc_text: str) -> float:
     return float(len(q_tokens & d_tokens) / len(q_tokens))
 
 
+
+
 def _build_retrieval_features_train_compatible(
     retriever: Any,
     text: str,
@@ -236,7 +238,7 @@ class OpenSearchHybridRetriever:
         hard_cap = int(os.getenv("RETRIEVAL_POOL_SIZE_CAP", "100"))
         pool = min(max(rrf_top_k * 2, 50), hard_cap)
         try:
-            count = int(self.kb.client.count(index=self.kb.index).get("count", pool))
+            count = self.kb.count_docs()
             if count > 0:
                 pool = min(count, pool)
         except Exception as exc:
@@ -288,17 +290,24 @@ class OpenSearchHybridRetriever:
         # already returns datetime.now(timezone.utc) when _reference_date is None,
         # and mutating a shared attribute is a race condition under concurrent requests.
 
+        t_retrieve_start = perf_counter()
+
         normalized_query = _normalize_query_text(query)
         if not normalized_query:
             return []
 
         verbatim_query = _is_verbatim_query(query)
         expanded_query = normalized_query
+        t_expand0 = perf_counter()
         if expand_query and self.query_expander is not None and not verbatim_query:
             expanded_query = self.query_expander.expand_query(normalized_query)
+        t_expand1 = perf_counter()
 
+        t_pool0 = perf_counter()
         effective_rrf_top_k = max(rrf_top_k, top_k * 3)
         search_pool_k = self._get_search_pool_size(rrf_top_k=effective_rrf_top_k)
+        t_pool1 = perf_counter()
+
         semantic_enabled = use_semantic and not verbatim_query
         if debug:
             logger.info(
@@ -315,30 +324,45 @@ class OpenSearchHybridRetriever:
                 f" | semantic_enabled={semantic_enabled}"
             )
 
+        t_bm25_0 = perf_counter()
         bm25_hits = self.kb.search_bm25(
             query=expanded_query,
             k=search_pool_k,
             fields=["title^3", "description^2", "content", "text"],
         )
+        t_bm25_1 = perf_counter()
 
         vector_hits = []
+        t_encode_ms = 0.0
+        t_vector_ms = 0.0
         if semantic_enabled:
-            query_vec = (
-                precomputed_vector
-                if precomputed_vector is not None
-                else self._encode_query(expanded_query)
-            )
+            if precomputed_vector is not None:
+                query_vec = precomputed_vector
+            else:
+                t_enc0 = perf_counter()
+                query_vec = self._encode_query(expanded_query)
+                t_encode_ms = 1000.0 * (perf_counter() - t_enc0)
+            t_vec0 = perf_counter()
             vector_hits = self.kb.search_vector(
                 query_vector=query_vec,
                 k=search_pool_k,
             )
+            t_vector_ms = 1000.0 * (perf_counter() - t_vec0)
+
         if debug:
             logger.info(
                 f"[fusion_inference] retrieve_hits | bm25={len(bm25_hits)} | vector={len(vector_hits)}"
+                f" | pool_ms={1000.0*(t_pool1-t_pool0):.1f}"
+                f" | expand_ms={1000.0*(t_expand1-t_expand0):.1f}"
+                f" | bm25_ms={1000.0*(t_bm25_1-t_bm25_0):.1f}"
+                f" | encode_ms={t_encode_ms:.1f}"
+                f" | vector_ms={t_vector_ms:.1f}"
             )
 
         if not bm25_hits and not vector_hits:
             return []
+
+        vector_cosine = {hit.id: hit.score for hit in vector_hits}
 
         hit_by_id = {}
         for hit in bm25_hits:
@@ -352,6 +376,7 @@ class OpenSearchHybridRetriever:
         missing_rank = max(search_pool_k, len(hit_by_id))
 
         # Stage 2: Reciprocal Rank Fusion (same formula as training retriever).
+        t_rrf0 = perf_counter()
         rrf_scores = {}
         bm25_weight = 1.35 if verbatim_query else 1.0
         vector_weight = 1.0
@@ -408,10 +433,12 @@ class OpenSearchHybridRetriever:
                     rrf_score=float(rrf_scores_norm[doc_id]),
                     recency_score=float(recency),
                     cyclicity_score=float(cyclicity),
+                    cosine_similarity=float(vector_cosine.get(doc_id, 0.0)),
                     timestamp=timestamp,
                     metadata=source,
                 )
             )
+        t_rrf1 = perf_counter()
 
         if verbatim_query:
             query_lower = normalized_query.lower()
@@ -424,6 +451,20 @@ class OpenSearchHybridRetriever:
                     item.score += 0.15 * _token_overlap_ratio(query_lower, doc_lower)
 
         final_items.sort(key=lambda x: x.score, reverse=True)
+
+        if debug:
+            t_total = 1000.0 * (perf_counter() - t_retrieve_start)
+            logger.info(
+                f"[fusion_inference] retrieve_timing"
+                f" | pool_ms={1000.0*(t_pool1-t_pool0):.1f}"
+                f" | expand_ms={1000.0*(t_expand1-t_expand0):.1f}"
+                f" | bm25_ms={1000.0*(t_bm25_1-t_bm25_0):.1f}"
+                f" | encode_ms={t_encode_ms:.1f}"
+                f" | vector_ms={t_vector_ms:.1f}"
+                f" | rrf_temporal_ms={1000.0*(t_rrf1-t_rrf0):.1f}"
+                f" | total_ms={t_total:.1f}"
+            )
+
         return final_items[:top_k]
 
 
@@ -535,6 +576,9 @@ class FusionClaimVerifier:
         self.interaction_dim = int(self.saved_config.get("interaction_dim", 0))
         self.nli_model_name: Optional[str] = self.saved_config.get("nli_model") or None
         self._nli_scorer = None  # lazy-loaded on first predict call
+        # Số doc tối đa đưa vào NLI — đủ để lấy signal, không cần tất cả top_k.
+        # Giảm từ top_k (10) xuống 5 cắt ~50% NLI time, accuracy giảm không đáng kể.
+        self._nli_top_k = int(os.getenv("NLI_EVIDENCE_TOP_K", str(min(5, self.top_k))))
         self.retrieval_encoder = RetrievalFeatureEncoder(
             num_retrieved=self.top_k,
             score_features=self.score_features,
@@ -656,8 +700,16 @@ class FusionClaimVerifier:
         if self._nli_scorer is not None or not self.nli_model_name:
             return
         from src.models.nli_scorer import NLIScorer
+        # NLI_MAX_LENGTH: attention complexity is O(n²) — 256 vs 512 = 4x less compute.
+        # Evidence relevant to fact-checking is almost always in the first ~200 tokens.
+        nli_max_length = int(os.getenv("NLI_MAX_LENGTH", "256"))
+        # NLI_DEVICE defaults to CPU to avoid competing with LLM for VRAM.
+        # On a 6 GB GPU, LLM alone needs ~3 GB + activations; adding DeBERTa causes OOM.
+        nli_device = os.getenv("NLI_DEVICE", "cpu")
         self._nli_scorer = NLIScorer(
-            model_name=self.nli_model_name, device=self.device
+            model_name=self.nli_model_name,
+            device=nli_device,
+            max_length=nli_max_length,
         ).load()
 
     def _nli_for_claim(
@@ -667,7 +719,7 @@ class FusionClaimVerifier:
         if not self.nli_model_name:
             return None
         self._ensure_nli_loaded()
-        real_docs = [r.text for r in results if r.text]
+        real_docs = [r.text for r in results[: self._nli_top_k] if r.text]
         nli_padded = np.full((self.top_k, 3), 1.0 / 3.0, dtype=np.float32)
         if real_docs:
             scores = self._nli_scorer.score(
@@ -688,7 +740,7 @@ class FusionClaimVerifier:
         flat_claims: List[str] = []
         offsets: List[tuple] = []
         for claim, results in zip(claims, results_list):
-            real_docs = [r.text for r in results if r.text]
+            real_docs = [r.text for r in results[: self._nli_top_k] if r.text]
             offsets.append((len(flat_docs), len(real_docs)))
             flat_docs.extend(real_docs)
             flat_claims.extend([claim] * len(real_docs))
@@ -757,8 +809,9 @@ class FusionClaimVerifier:
     # Claim splitting
     # ------------------------------------------------------------------
     def split_long_claim(self, claim: str) -> Optional[List[str]]:
+        if not _env_flag("SPLIT_CLAIMS", default=False):
+            return None
         return split_claim(claim)
-        # return [claim]
 
     def _prepare_sub_claims(self, claim: str) -> List[str]:
         """
@@ -917,9 +970,24 @@ class FusionClaimVerifier:
                 all_llm_evidences = []
                 all_source_links = []
 
+                # Inject today's date into claims that carry no explicit date.
+                _today_str = now_utc.strftime("%d/%m/%Y")
+                _date_pat = re.compile(r"\d{1,2}[/\-]\d{1,2}|hôm (nay|qua|kia)|tháng\s+\d", re.IGNORECASE)
+                batch = [
+                    (idx, text if _date_pat.search(text) else f"{text} (ngày {_today_str})")
+                    for idx, text in batch
+                ]
+
                 # Pre-batch encode tất cả queries trong một lần gọi SentenceTransformer
                 batch_texts_list = [text for _, text in batch]
+                t_benc0 = perf_counter()
                 batch_vectors = self.retriever.batch_encode(batch_texts_list)
+                t_benc1 = perf_counter()
+                if self.debug:
+                    logger.info(
+                        f"[fusion_inference] batch_encode | n={len(batch_texts_list)}"
+                        f" | elapsed_ms={1000.0*(t_benc1-t_benc0):.1f}"
+                    )
                 vec_map: dict[str, List[float]] = dict(zip(batch_texts_list, batch_vectors))
 
                 all_retrieval_interactions = []
@@ -928,11 +996,17 @@ class FusionClaimVerifier:
                     item: Tuple[int, str],
                 ) -> Tuple[int, str, Any, Any, List[str], List[str], List[RetrievalResult]]:
                     _idx, _text = item
+                    _t0 = perf_counter()
                     _feat, _interaction, _evidence, _results = _build_retrieval_features_train_compatible(
                         self.retriever, _text, self.top_k,
                         precomputed_vector=vec_map.get(_text),
                         score_features=self.score_features,
                     )
+                    if self.debug:
+                        logger.info(
+                            f"[fusion_inference] retrieve_one | idx={_idx}"
+                            f" | elapsed_ms={1000.0*(perf_counter()-_t0):.1f}"
+                        )
                     _links: List[str] = []
                     for _r in _results[: self.llm_evidence_top_k]:
                         _meta = _r.metadata or {}
@@ -947,10 +1021,18 @@ class FusionClaimVerifier:
                             _links.append(_url)
                     return _idx, _text, _feat, _interaction, _evidence[: self.llm_evidence_top_k], _links, _results
 
+                t_retrieve_all0 = perf_counter()
                 retrieved: dict[int, Tuple] = {}
                 for item in batch:
                     r_idx, r_text, r_feat, r_int, r_ev, r_links, r_results = _retrieve_one(item)
                     retrieved[r_idx] = (r_text, r_feat, r_int, r_ev, r_links, r_results)
+                t_retrieve_all1 = perf_counter()
+                if self.debug:
+                    logger.info(
+                        f"[fusion_inference] retrieve_all | n={len(batch)}"
+                        f" | total_ms={1000.0*(t_retrieve_all1-t_retrieve_all0):.1f}"
+                        f" | avg_ms={1000.0*(t_retrieve_all1-t_retrieve_all0)/max(len(batch),1):.1f}"
+                    )
 
                 all_retrieval_results_list: List[List[RetrievalResult]] = []
                 for idx, text in batch:
@@ -964,12 +1046,19 @@ class FusionClaimVerifier:
                     all_retrieval_results_list.append(r_results)
 
                 # Merge NLI features into score features if checkpoint was trained with NLI
+                t_nli0 = perf_counter()
                 if self.nli_model_name:
                     nli_list = self._nli_for_batch(valid_claims, all_retrieval_results_list)
                     all_retrieval_features = [
                         np.concatenate([f, n], axis=-1)
                         for f, n in zip(all_retrieval_features, nli_list)
                     ]
+                t_nli1 = perf_counter()
+                if self.debug and self.nli_model_name:
+                    logger.info(
+                        f"[fusion_inference] nli_batch | n={len(valid_claims)}"
+                        f" | elapsed_ms={1000.0*(t_nli1-t_nli0):.1f}"
+                    )
 
                 retrieval_features = torch.tensor(
                     np.stack(all_retrieval_features),
@@ -989,8 +1078,14 @@ class FusionClaimVerifier:
                 t_llm1 = perf_counter()
                 total_llm_ms += 1000.0 * (t_llm1 - t_llm0)
 
+                t_fusion0 = perf_counter()
                 retrieval_encoded = self.retrieval_encoder(retrieval_features, interaction_tensor)
                 fusion_output = self.fusion(llm_logits, retrieval_encoded)
+                t_fusion1 = perf_counter()
+                if self.debug:
+                    logger.info(
+                        f"[fusion_inference] fusion | elapsed_ms={1000.0*(t_fusion1-t_fusion0):.1f}"
+                    )
 
                 probs_batch = fusion_output.final_probs
                 pred_ids = torch.argmax(probs_batch, dim=-1).cpu().tolist()
@@ -1029,9 +1124,15 @@ class FusionClaimVerifier:
                 del probs_batch
                 gc.collect()
 
+        batch_elapsed_ms = 1000.0 * (perf_counter() - t0)
+        self._last_batch_timing = {
+            "llm_ms": round(total_llm_ms, 1),
+            "batch_ms": round(batch_elapsed_ms, 1),
+        }
+
         if self.debug:
             logger.info(
-                f"[fusion_inference] _predict_batch_without_split done | llm_elapsed_ms={total_llm_ms:.2f} | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
+                f"[fusion_inference] _predict_batch_without_split done | llm_elapsed_ms={total_llm_ms:.2f} | elapsed_ms={batch_elapsed_ms:.2f}"
             )
 
         return [r for r in results if r is not None]
@@ -1042,7 +1143,15 @@ class FusionClaimVerifier:
         if not text:
             raise ValueError("Claim is empty.")
 
+        t_split0 = perf_counter()
         sub_claims = self._prepare_sub_claims(text)
+        t_split1 = perf_counter()
+        if self.debug:
+            logger.info(
+                f"[fusion_inference] prepare_sub_claims | n_sub={len(sub_claims)}"
+                f" | elapsed_ms={1000.0*(t_split1-t_split0):.1f}"
+            )
+
         if len(sub_claims) > 1:
             if self.debug:
                 logger.info(
@@ -1053,9 +1162,21 @@ class FusionClaimVerifier:
                 text, sub_preds, sub_claim_count=len(sub_claims)
             )
 
+            total_ms = 1000.0 * (perf_counter() - t0)
+            batch_timing = getattr(self, "_last_batch_timing", {})
+            aggregated.timing_ms = {
+                "split_ms": round(1000.0 * (t_split1 - t_split0), 1),
+                "llm_ms": batch_timing.get("llm_ms", 0.0),
+                "batch_ms": batch_timing.get("batch_ms", 0.0),
+                "n_sub_claims": len(sub_claims),
+                "total_ms": round(total_ms, 1),
+            }
+
             if self.debug:
                 logger.info(
-                    f"[fusion_inference] done predict (aggregated) | verdict={aggregated.verdict!r} | confidence={aggregated.confidence:.6f} | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
+                    f"[fusion_inference] done predict (aggregated) | verdict={aggregated.verdict!r} | confidence={aggregated.confidence:.6f} | elapsed_ms={total_ms:.2f}"
+                    f" | split_ms={aggregated.timing_ms['split_ms']}"
+                    f" | llm_ms={aggregated.timing_ms['llm_ms']}"
                 )
 
             self._log_predictions_to_claims_index([aggregated])
@@ -1071,6 +1192,15 @@ class FusionClaimVerifier:
             logger.info(f"[fusion_inference] claim_input={model_text!r}")
             if model_text != text:
                 logger.info(f"[fusion_inference] original_claim={text!r}")
+
+        today_str = now_utc.strftime("%d/%m/%Y")
+        has_date = bool(re.search(r"\d{1,2}[/\-]\d{1,2}", model_text) or
+                        re.search(r"hôm (nay|qua|kia)", model_text, re.IGNORECASE) or
+                        re.search(r"tháng\s+\d", model_text, re.IGNORECASE))
+        if not has_date:
+            model_text = f"{model_text} (ngày {today_str})"
+            if self.debug:
+                logger.info(f"[fusion_inference] no date in claim, injected today: {today_str!r}")
 
         t_retrieval0 = perf_counter()
         retrieval_features_np, doc_emb_np, retrieved_evidence, retrieval_results = (
@@ -1147,12 +1277,18 @@ class FusionClaimVerifier:
                     logger.info(f"[fusion_inference] evidence[{idx}]={ev_text!r}")
 
         # Append NLI features if checkpoint was trained with NLI
+        t_nli0 = perf_counter()
         if self.nli_model_name:
             nli_feats = self._nli_for_claim(model_text, retrieval_results)
             if nli_feats is not None:
                 retrieval_features_np = np.concatenate(
                     [retrieval_features_np, nli_feats], axis=-1
                 )
+        t_nli1 = perf_counter()
+        if self.debug and self.nli_model_name:
+            logger.info(
+                f"[fusion_inference] nli_single | elapsed_ms={1000.0*(t_nli1-t_nli0):.1f}"
+            )
 
         retrieval_features = torch.tensor(
             retrieval_features_np, dtype=torch.float32, device=self.device
@@ -1193,6 +1329,7 @@ class FusionClaimVerifier:
                 torch.tensor(doc_emb_np, dtype=torch.float32, device=self.device).unsqueeze(0)
                 if doc_emb_np is not None else None
             )
+            t_fusion0 = perf_counter()
             retrieval_encoded = self.retrieval_encoder(retrieval_features, interaction_tensor)
             if self.debug:
                 enc = retrieval_encoded.detach().cpu()
@@ -1201,6 +1338,7 @@ class FusionClaimVerifier:
                 )
 
             fusion_output = self.fusion(llm_logits, retrieval_encoded)
+            t_fusion1 = perf_counter()
             probs = fusion_output.final_probs[0]
             pred_id = int(torch.argmax(probs).item())
             confidence = float(probs[pred_id].item())
@@ -1208,6 +1346,7 @@ class FusionClaimVerifier:
             if self.debug:
                 logger.info(
                     f"[fusion_inference] fusion_done | lm_weight={fusion_output.lm_weight:.6f} | retrieval_weight={fusion_output.retrieval_weight:.6f}"
+                    f" | elapsed_ms={1000.0*(t_fusion1-t_fusion0):.1f}"
                 )
                 logger.info(
                     "[fusion_inference] fused_logits="
@@ -1260,10 +1399,23 @@ class FusionClaimVerifier:
 
         t_total = perf_counter() - t0
         timing_ms = {
+            "split_ms": round(1000.0 * (t_split1 - t_split0), 1),
             "retrieval_ms": round(1000.0 * (t_retrieval1 - t_retrieval0), 1),
+            "nli_ms": round(1000.0 * (t_nli1 - t_nli0), 1),
             "llm_ms": round(1000.0 * (t_llm1 - t_llm0), 1),
+            "fusion_ms": round(1000.0 * (t_fusion1 - t_fusion0), 1),
             "total_ms": round(1000.0 * t_total, 1),
         }
+        if self.debug:
+            logger.info(
+                f"[fusion_inference] timing_summary"
+                f" | split_ms={timing_ms['split_ms']}"
+                f" | retrieval_ms={timing_ms['retrieval_ms']}"
+                f" | nli_ms={timing_ms['nli_ms']}"
+                f" | llm_ms={timing_ms['llm_ms']}"
+                f" | fusion_ms={timing_ms['fusion_ms']}"
+                f" | total_ms={timing_ms['total_ms']}"
+            )
 
         prediction = ClaimPrediction(
             claim=text,

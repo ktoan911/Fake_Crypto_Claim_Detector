@@ -5,6 +5,9 @@ import os
 import sys
 import threading
 import time
+
+# Phải set trước khi import torch để có hiệu lực.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -247,6 +250,8 @@ def health(request: Request):
 
 @app.post("/verify")
 async def verify_claim(request: ClaimRequest, http_request: Request):
+    t_api_start = time.perf_counter()
+
     if _verifier is None:
         return {
             "verdict": "Lỗi xử lý",
@@ -270,25 +275,54 @@ async def verify_claim(request: ClaimRequest, http_request: Request):
     domain = http_request.headers.get("host", "unknown")
     logger.info(f"[verify] domain={domain} claim={claim_text!r}")
 
+    t_cache0 = time.perf_counter()
     cache_key = hashlib.sha1(claim_text.encode("utf-8", errors="replace")).hexdigest()
     cached = _claim_cache.get(cache_key)
+    t_cache1 = time.perf_counter()
     if cached is not None:
-        logger.info(f"[verify] cache_hit key={cache_key[:8]}…")
-        return cached
+        cache_ms = round(1000.0 * (t_cache1 - t_cache0), 1)
+        api_total_ms = round(1000.0 * (time.perf_counter() - t_api_start), 1)
+        logger.info(f"[verify] cache_hit key={cache_key[:8]}… cache_ms={cache_ms}")
+        return {
+            **cached,
+            "timing_ms": {
+                "cache_hit": True,
+                "cache_check_ms": cache_ms,
+                "api_total_ms": api_total_ms,
+            },
+        }
 
     try:
         loop = asyncio.get_running_loop()
+        t_inference0 = time.perf_counter()
         prediction = await asyncio.wait_for(
             loop.run_in_executor(_inference_executor, _verifier.predict, claim_text),
             timeout=_inference_timeout_s,
         )
+        t_inference1 = time.perf_counter()
+
+        api_timing = {
+            "cache_check_ms": round(1000.0 * (t_cache1 - t_cache0), 1),
+            "executor_queue_ms": round(1000.0 * (t_inference0 - t_cache1), 1),
+            "inference_ms": round(1000.0 * (t_inference1 - t_inference0), 1),
+            "api_total_ms": round(1000.0 * (time.perf_counter() - t_api_start), 1),
+        }
+        logger.info(
+            f"[verify] timing"
+            f" | cache_ms={api_timing['cache_check_ms']}"
+            f" | queue_ms={api_timing['executor_queue_ms']}"
+            f" | inference_ms={api_timing['inference_ms']}"
+            f" | api_total_ms={api_timing['api_total_ms']}"
+        )
+
+        inference_timing = prediction.timing_ms or {}
         result = {
             "verdict": prediction.verdict,
             "status": "success",
             "evidence": prediction.evidence,
             "source_links": prediction.source_links,
             "confidence": prediction.confidence,
-            "timing_ms": prediction.timing_ms,
+            "timing_ms": {**inference_timing, **api_timing},
         }
         _claim_cache.set(cache_key, result)
         return result
