@@ -1,3 +1,4 @@
+import gc
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -63,6 +64,9 @@ class FusionTrainingConfig:
     save_best_checkpoint: bool = (
         True  # Save best epoch on training-set metrics instead of last epoch only.
     )
+    use_nli: bool = True
+    nli_model: str = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+    nli_batch_size: int = 64
 
 
 def _build_retrieval_features(
@@ -359,6 +363,25 @@ def train_fusion_from_dataframe(
                 )
                 config.lambda_reg = float(checkpoint_lambda_reg)
 
+            # Override use_nli / nli_model if checkpoint was trained with NLI
+            checkpoint_nli_model = resume_config.get("nli_model")
+            checkpoint_score_features = resume_config.get("score_features")
+            if checkpoint_score_features is not None:
+                expected_sf = 8 if config.use_nli else 5
+                if int(checkpoint_score_features) != expected_sf:
+                    logger.warning(
+                        f"Overriding score_features {expected_sf} -> {checkpoint_score_features} "
+                        "to match resume checkpoint architecture."
+                    )
+                    config.use_nli = int(checkpoint_score_features) == 8
+            if checkpoint_nli_model and not config.use_nli:
+                logger.warning(
+                    f"Checkpoint was trained with NLI ({checkpoint_nli_model}). "
+                    "Forcing use_nli=True to match architecture."
+                )
+                config.use_nli = True
+                config.nli_model = checkpoint_nli_model
+
             if config.align_runtime_with_resume_checkpoint:
                 runtime_keys = (
                     "model_name",
@@ -413,26 +436,22 @@ def train_fusion_from_dataframe(
     )
     logger.info(f"Indexed {len(knowledge_base)} documents in retriever")
 
-    # Initialize LLM scorer (returns LOGITS per paper Eq.2)
-    llm = LLMScorer(
-        model_name=config.model_name,
-        device=config.device,
-        max_length=config.max_length,
-        labels=config.label_list,
-        prompt_template=PROMPT_TEMPLATE,
-    )
+    # Determine score_features upfront (5 base + 3 NLI if use_nli)
+    score_features = 8 if config.use_nli else 5
 
     # Initialize retrieval encoder
     raw_emb_dim = retriever.embedding_dim if retriever.encoder is not None else 0
     interaction_dim = 2 * raw_emb_dim  # q⊙mean_d + |q-mean_d|
     retrieval_encoder = RetrievalFeatureEncoder(
-        num_retrieved=config.top_k, score_features=5, hidden_dim=64, output_dim=64,
+        num_retrieved=config.top_k,
+        score_features=score_features,
+        hidden_dim=64,
+        output_dim=64,
         interaction_dim=interaction_dim,
     ).to(config.device)
     logger.info(
-        f"RetrievalFeatureEncoder: raw_emb_dim={raw_emb_dim}, "
-        f"interaction_dim={interaction_dim}, "
-        f"interaction branch={'ON' if interaction_dim > 0 else 'OFF'}"
+        f"RetrievalFeatureEncoder: score_features={score_features}, "
+        f"raw_emb_dim={raw_emb_dim}, interaction_dim={interaction_dim}"
     )
 
     # Initialize fusion layer
@@ -541,53 +560,97 @@ def train_fusion_from_dataframe(
     else:
         class_weights = None
 
-    # --- PRE-COMPUTATION PHASE ---
-    logger.info("Starting pre-computation of retrieval features and LLM logits...")
-    all_retrieval_features = []
+    # ---------------------------------------------------------------
+    # PHASE 1: Retrieval features (base 5 per doc)
+    # ---------------------------------------------------------------
+    logger.info("Pre-computation phase 1/3: retrieval features...")
+    all_retrieval_base: List[np.ndarray] = []   # each [top_k, 5]
     all_interactions: List[Optional[np.ndarray]] = []
-    all_llm_logits = []
+    all_evidence_raw: List[List[str]] = []       # raw texts for NLI
+    all_retrieved_evidences: List[List[str]] = []  # top-3 for LLM
 
-    # Ensure LLM is in eval mode and cache is disabled
+    for idx, text in enumerate(texts):
+        feats, interaction, evidence = _build_retrieval_features(retriever, text, config.top_k)
+        all_retrieval_base.append(feats)
+        all_interactions.append(interaction)
+        all_evidence_raw.append(evidence)
+        all_retrieved_evidences.append(evidence[:3])
+        if (idx + 1) % 50 == 0:
+            logger.info(f"  Retrieved {idx + 1}/{len(texts)} samples")
+
+    # ---------------------------------------------------------------
+    # PHASE 2: NLI features (optional, loaded/unloaded before LLM)
+    # ---------------------------------------------------------------
+    all_retrieval_features: List[np.ndarray] = all_retrieval_base
+
+    if config.use_nli:
+        from src.models.nli_scorer import NLIScorer
+
+        logger.info("Pre-computation phase 2/3: NLI stance features...")
+        nli_scorer = NLIScorer(
+            model_name=config.nli_model,
+            device=config.device,
+            batch_size=config.nli_batch_size,
+        )
+        nli_scorer.load()
+
+        flat_docs: List[str] = []
+        flat_claims: List[str] = []
+        for text, evidences in zip(texts, all_evidence_raw):
+            for doc in evidences:
+                flat_docs.append(doc)
+                flat_claims.append(text)
+
+        logger.info(f"  Running NLI on {len(flat_docs)} (claim, evidence) pairs...")
+        nli_flat = nli_scorer.score(premises=flat_docs, hypotheses=flat_claims)
+        nli_scorer.unload()
+        del nli_scorer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        cursor = 0
+        all_retrieval_features = []
+        for base_feats, evidences in zip(all_retrieval_base, all_evidence_raw):
+            n_real = len(evidences)
+            nli_padded = np.full((config.top_k, 3), 1.0 / 3.0, dtype=np.float32)
+            if n_real > 0:
+                nli_padded[:n_real] = nli_flat[cursor : cursor + n_real]
+            cursor += n_real
+            all_retrieval_features.append(
+                np.concatenate([base_feats, nli_padded], axis=-1)  # [top_k, 8]
+            )
+        logger.info(f"  NLI merged. score_features={score_features}, pairs={len(flat_docs)}")
+
+    # ---------------------------------------------------------------
+    # PHASE 3: LLM logits (loaded here to avoid co-loading with NLI)
+    # ---------------------------------------------------------------
+    logger.info("Pre-computation phase 3/3: LLM logits...")
+    llm = LLMScorer(
+        model_name=config.model_name,
+        device=config.device,
+        max_length=config.max_length,
+        labels=config.label_list,
+        prompt_template=PROMPT_TEMPLATE,
+    )
     llm.model.eval()
     llm.model.config.use_cache = False
     for p in llm.model.parameters():
         p.requires_grad_(False)
 
-    # Use CUDA AMP only on CUDA device.
     use_cuda_amp = str(config.device).startswith("cuda") and torch.cuda.is_available()
     amp_dtype = (
         torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     ) if use_cuda_amp else None
 
-    # Process in batches for pre-computation
+    all_llm_logits = []
     for i in range(0, len(texts), config.batch_size):
         batch_texts = texts[i : i + config.batch_size]
-        batch_gold_evidences = gold_evidences[i : i + config.batch_size]
-
-        # 1. Retrieval
-        batch_feats = []
-        batch_embs = []
-        batch_retrieved_evidences = []
-        for t in batch_texts:
-            feats, emb_array, retrieved_evidence = _build_retrieval_features(
-                retriever, t, config.top_k
-            )
-            batch_feats.append(feats)
-            batch_embs.append(emb_array)
-            batch_retrieved_evidences.append(
-                retrieved_evidence[:3]
-            )  # Cắt xuống đúng 3 top evidence để huấn luyện không bị nhiễu LM
-
-        all_retrieval_features.extend(batch_feats)
-        all_interactions.extend(batch_embs)
-
-        # 2. LLM Scoring
         if config.evidence_mode == "retrieved":
-            batch_evidences = batch_retrieved_evidences
+            batch_evidences = all_retrieved_evidences[i : i + config.batch_size]
         else:
-            batch_evidences = batch_gold_evidences
+            batch_evidences = gold_evidences[i : i + config.batch_size]
 
-        # Micro-batching for LLM inference
         batch_logits_list = []
         with torch.inference_mode():
             amp_context = (
@@ -597,32 +660,26 @@ def train_fusion_from_dataframe(
             )
             with amp_context:
                 for j in range(0, len(batch_texts), config.llm_batch_size):
-                    sub_texts = batch_texts[j : j + config.llm_batch_size]
-                    sub_evidences = batch_evidences[j : j + config.llm_batch_size]
-
-                    logits = llm.score_logits(sub_texts, sub_evidences)
+                    logits = llm.score_logits(
+                        batch_texts[j : j + config.llm_batch_size],
+                        batch_evidences[j : j + config.llm_batch_size],
+                    )
                     batch_logits_list.append(logits)
 
-        # Concatenate micro-batches
-        lm_logits = torch.cat(batch_logits_list, dim=0)
-        all_llm_logits.append(lm_logits.cpu())  # Store on CPU to save GPU memory
-
+        all_llm_logits.append(torch.cat(batch_logits_list, dim=0).cpu())
         if (i // config.batch_size) % 10 == 0:
-            logger.info(f"Pre-computed {i + len(batch_texts)}/{len(texts)} samples")
+            logger.info(f"  LLM scored {i + len(batch_texts)}/{len(texts)} samples")
 
     # Convert to tensors
-    tensor_retrieval = torch.tensor(
-        np.array(all_retrieval_features), dtype=torch.float32
-    )
+    tensor_retrieval = torch.tensor(np.array(all_retrieval_features), dtype=torch.float32)
     tensor_llm_logits = torch.cat(all_llm_logits, dim=0)
     tensor_labels = torch.tensor(labels, dtype=torch.long)
-    llm_baseline_preds = torch.argmax(tensor_llm_logits, dim=-1)
-    llm_baseline_acc = (llm_baseline_preds == tensor_labels).float().mean().item()
-    logger.info(
-        f"LLM baseline (argmax on pre-computed logits) acc: {llm_baseline_acc:.4f}"
+    llm_baseline_acc = (
+        (torch.argmax(tensor_llm_logits, dim=-1) == tensor_labels).float().mean().item()
     )
+    logger.info(f"LLM baseline acc: {llm_baseline_acc:.4f}")
 
-    # Build interaction tensor if available [N, 2*emb_dim]
+    # Build interaction tensor [N, 2*emb_dim]
     tensor_interactions: Optional[torch.Tensor] = None
     _non_none_interactions = [x for x in all_interactions if x is not None]
     if _non_none_interactions:
@@ -631,17 +688,11 @@ def train_fusion_from_dataframe(
             x if x is not None else np.zeros(emb_shape, dtype=np.float32)
             for x in all_interactions
         ]
-        tensor_interactions = torch.tensor(
-            np.array(_filled, dtype=np.float32), dtype=torch.float32
-        )
+        tensor_interactions = torch.tensor(np.array(_filled, dtype=np.float32), dtype=torch.float32)
         logger.info(f"Interaction features tensor: {tensor_interactions.shape}")
 
     logger.info("Pre-computation complete. Unloading LLM...")
-
-    # Unload LLM to free memory
     del llm
-    import gc
-
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -869,7 +920,8 @@ def train_fusion_from_dataframe(
                 "adaptive_beta": bool(config.adaptive_beta),
                 "retrieval_aux_loss_weight": float(config.retrieval_aux_loss_weight),
                 "save_best_checkpoint": bool(config.save_best_checkpoint),
-                "score_features": 5,
+                "score_features": score_features,
+                "nli_model": config.nli_model if config.use_nli else None,
                 "interaction_dim": interaction_dim,
             },
         },

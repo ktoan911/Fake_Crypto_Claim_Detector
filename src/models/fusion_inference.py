@@ -533,6 +533,8 @@ class FusionClaimVerifier:
 
         self.score_features = int(self.saved_config.get("score_features", 5))
         self.interaction_dim = int(self.saved_config.get("interaction_dim", 0))
+        self.nli_model_name: Optional[str] = self.saved_config.get("nli_model") or None
+        self._nli_scorer = None  # lazy-loaded on first predict call
         self.retrieval_encoder = RetrievalFeatureEncoder(
             num_retrieved=self.top_k,
             score_features=self.score_features,
@@ -631,7 +633,7 @@ class FusionClaimVerifier:
         t0 = perf_counter()
         with torch.inference_mode():
             dummy_retrieval = torch.zeros(
-                1, self.top_k, 4, dtype=torch.float32, device=self.device
+                1, self.top_k, self.score_features, dtype=torch.float32, device=self.device
             )
             dummy_encoded = self.retrieval_encoder(dummy_retrieval)
             dummy_llm = torch.zeros(
@@ -646,6 +648,62 @@ class FusionClaimVerifier:
         logger.info(
             f"[fusion_inference] warmup done | elapsed_ms={1000.0 * (perf_counter() - t0):.0f}"
         )
+
+    # ------------------------------------------------------------------
+    # NLI helpers
+    # ------------------------------------------------------------------
+    def _ensure_nli_loaded(self) -> None:
+        if self._nli_scorer is not None or not self.nli_model_name:
+            return
+        from src.models.nli_scorer import NLIScorer
+        self._nli_scorer = NLIScorer(
+            model_name=self.nli_model_name, device=self.device
+        ).load()
+
+    def _nli_for_claim(
+        self, claim: str, results: List[RetrievalResult]
+    ) -> Optional[np.ndarray]:
+        """Returns [top_k, 3] NLI features or None if NLI not available."""
+        if not self.nli_model_name:
+            return None
+        self._ensure_nli_loaded()
+        real_docs = [r.text for r in results if r.text]
+        nli_padded = np.full((self.top_k, 3), 1.0 / 3.0, dtype=np.float32)
+        if real_docs:
+            scores = self._nli_scorer.score(
+                premises=real_docs, hypotheses=[claim] * len(real_docs)
+            )
+            nli_padded[: len(real_docs)] = scores
+        return nli_padded
+
+    def _nli_for_batch(
+        self, claims: List[str], results_list: List[List[RetrievalResult]]
+    ) -> List[Optional[np.ndarray]]:
+        """Returns list of [top_k, 3] NLI features, one per claim."""
+        if not self.nli_model_name:
+            return [None] * len(claims)
+        self._ensure_nli_loaded()
+
+        flat_docs: List[str] = []
+        flat_claims: List[str] = []
+        offsets: List[tuple] = []
+        for claim, results in zip(claims, results_list):
+            real_docs = [r.text for r in results if r.text]
+            offsets.append((len(flat_docs), len(real_docs)))
+            flat_docs.extend(real_docs)
+            flat_claims.extend([claim] * len(real_docs))
+
+        if not flat_docs:
+            return [np.full((self.top_k, 3), 1.0 / 3.0, dtype=np.float32)] * len(claims)
+
+        nli_flat = self._nli_scorer.score(premises=flat_docs, hypotheses=flat_claims)
+        out = []
+        for start, n_real in offsets:
+            nli_padded = np.full((self.top_k, 3), 1.0 / 3.0, dtype=np.float32)
+            if n_real > 0:
+                nli_padded[:n_real] = nli_flat[start : start + n_real]
+            out.append(nli_padded)
+        return out
 
     # ------------------------------------------------------------------
     # Claims index
@@ -868,7 +926,7 @@ class FusionClaimVerifier:
 
                 def _retrieve_one(
                     item: Tuple[int, str],
-                ) -> Tuple[int, str, Any, Any, List[str], List[str]]:
+                ) -> Tuple[int, str, Any, Any, List[str], List[str], List[RetrievalResult]]:
                     _idx, _text = item
                     _feat, _interaction, _evidence, _results = _build_retrieval_features_train_compatible(
                         self.retriever, _text, self.top_k,
@@ -887,21 +945,31 @@ class FusionClaimVerifier:
                         ).strip()
                         if _url and _url not in _links:
                             _links.append(_url)
-                    return _idx, _text, _feat, _interaction, _evidence[: self.llm_evidence_top_k], _links
+                    return _idx, _text, _feat, _interaction, _evidence[: self.llm_evidence_top_k], _links, _results
 
                 retrieved: dict[int, Tuple] = {}
                 for item in batch:
-                    r_idx, r_text, r_feat, r_int, r_ev, r_links = _retrieve_one(item)
-                    retrieved[r_idx] = (r_text, r_feat, r_int, r_ev, r_links)
+                    r_idx, r_text, r_feat, r_int, r_ev, r_links, r_results = _retrieve_one(item)
+                    retrieved[r_idx] = (r_text, r_feat, r_int, r_ev, r_links, r_results)
 
+                all_retrieval_results_list: List[List[RetrievalResult]] = []
                 for idx, text in batch:
                     valid_indices.append(idx)
                     valid_claims.append(text)
-                    _, feat, interaction, ev, links = retrieved[idx]
+                    _, feat, interaction, ev, links, r_results = retrieved[idx]
                     all_retrieval_features.append(feat)
                     all_retrieval_interactions.append(interaction)
                     all_llm_evidences.append(ev)
                     all_source_links.append(links)
+                    all_retrieval_results_list.append(r_results)
+
+                # Merge NLI features into score features if checkpoint was trained with NLI
+                if self.nli_model_name:
+                    nli_list = self._nli_for_batch(valid_claims, all_retrieval_results_list)
+                    all_retrieval_features = [
+                        np.concatenate([f, n], axis=-1)
+                        for f, n in zip(all_retrieval_features, nli_list)
+                    ]
 
                 retrieval_features = torch.tensor(
                     np.stack(all_retrieval_features),
@@ -1077,6 +1145,14 @@ class FusionClaimVerifier:
                     if not self.log_full_evidence:
                         ev_text = _truncate(ev_text, self.log_evidence_chars)
                     logger.info(f"[fusion_inference] evidence[{idx}]={ev_text!r}")
+
+        # Append NLI features if checkpoint was trained with NLI
+        if self.nli_model_name:
+            nli_feats = self._nli_for_claim(model_text, retrieval_results)
+            if nli_feats is not None:
+                retrieval_features_np = np.concatenate(
+                    [retrieval_features_np, nli_feats], axis=-1
+                )
 
         retrieval_features = torch.tensor(
             retrieval_features_np, dtype=torch.float32, device=self.device
