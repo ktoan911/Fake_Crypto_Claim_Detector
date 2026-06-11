@@ -812,7 +812,7 @@ def train_lora_classification(
         warmup_ratio=0.1,
         weight_decay=0.01,
         optim=_optim,
-        group_by_length=True,
+
         logging_nan_inf_filter=False,
         eval_strategy="steps",
         eval_steps=200,
