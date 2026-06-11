@@ -149,22 +149,28 @@ def _build_retrieval_features_train_compatible(
     rrf_top_k: int = 100,
     precomputed_vector: Optional[List[float]] = None,
     score_features: int = 5,
-) -> tuple[np.ndarray, List[str], List[RetrievalResult]]:
+) -> "tuple[np.ndarray, Optional[np.ndarray], List[str], List[RetrievalResult]]":
     """
-    Same feature construction used in training:
-    [score, rrf_score, recency_score, cyclicity_score, cosine_similarity] for top_k docs.
+    Same feature construction used in training.
+    Returns (score_features_array, doc_embeddings_array, evidence_texts, results).
+    doc_embeddings_array is [top_k, emb_dim] or None if embeddings unavailable.
     """
     results = retriever.retrieve(
         text, top_k=top_k, rrf_top_k=rrf_top_k, precomputed_vector=precomputed_vector
     )
     features = []
+    embeddings = []
     evidence_texts = []
+    has_embeddings = False
 
     for r in results:
         row = [r.score, r.rrf_score, r.recency_score, r.cyclicity_score]
         if score_features >= 5:
             row.append(r.cosine_similarity)
         features.append(row)
+        if r.embedding is not None:
+            embeddings.append(r.embedding)
+            has_embeddings = True
         ts = (
             r.timestamp.astimezone(timezone.utc)
             if isinstance(r.timestamp, datetime)
@@ -173,10 +179,15 @@ def _build_retrieval_features_train_compatible(
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
         evidence_texts.append(f"[Thời gian của thông tin: {time_str}] {r.text}")
 
-    if len(features) < top_k:
-        features.extend([[0.0] * score_features] * (top_k - len(features)))
+    pad = top_k - len(features)
+    if pad > 0:
+        features.extend([[0.0] * score_features] * pad)
+        if has_embeddings:
+            emb_dim = embeddings[0].shape[0] if embeddings else 1
+            embeddings.extend([np.zeros(emb_dim, dtype=np.float32)] * pad)
 
-    return np.array(features, dtype=np.float32), evidence_texts, results
+    emb_array = np.array(embeddings, dtype=np.float32) if has_embeddings else None
+    return np.array(features, dtype=np.float32), emb_array, evidence_texts, results
 
 
 class OpenSearchHybridRetriever:
@@ -519,11 +530,13 @@ class FusionClaimVerifier:
             )
 
         self.score_features = int(self.saved_config.get("score_features", 5))
+        self.emb_dim = int(self.saved_config.get("emb_dim", 0))
         self.retrieval_encoder = RetrievalFeatureEncoder(
             num_retrieved=self.top_k,
             score_features=self.score_features,
             hidden_dim=64,
             output_dim=64,
+            emb_dim=self.emb_dim,
         ).to(self.device)
 
         self.fusion = ConfidenceAwareFusion(
@@ -849,11 +862,13 @@ class FusionClaimVerifier:
                 batch_vectors = self.retriever.batch_encode(batch_texts_list)
                 vec_map: dict[str, List[float]] = dict(zip(batch_texts_list, batch_vectors))
 
+                all_retrieval_doc_embeddings = []
+
                 def _retrieve_one(
                     item: Tuple[int, str],
-                ) -> Tuple[int, str, Any, List[str], List[str]]:
+                ) -> Tuple[int, str, Any, Any, List[str], List[str]]:
                     _idx, _text = item
-                    _feat, _evidence, _results = _build_retrieval_features_train_compatible(
+                    _feat, _emb, _evidence, _results = _build_retrieval_features_train_compatible(
                         self.retriever, _text, self.top_k,
                         precomputed_vector=vec_map.get(_text),
                         score_features=self.score_features,
@@ -870,18 +885,19 @@ class FusionClaimVerifier:
                         ).strip()
                         if _url and _url not in _links:
                             _links.append(_url)
-                    return _idx, _text, _feat, _evidence[: self.llm_evidence_top_k], _links
+                    return _idx, _text, _feat, _emb, _evidence[: self.llm_evidence_top_k], _links
 
                 retrieved: dict[int, Tuple] = {}
                 for item in batch:
-                    r_idx, r_text, r_feat, r_ev, r_links = _retrieve_one(item)
-                    retrieved[r_idx] = (r_text, r_feat, r_ev, r_links)
+                    r_idx, r_text, r_feat, r_emb, r_ev, r_links = _retrieve_one(item)
+                    retrieved[r_idx] = (r_text, r_feat, r_emb, r_ev, r_links)
 
                 for idx, text in batch:
                     valid_indices.append(idx)
                     valid_claims.append(text)
-                    _, feat, ev, links = retrieved[idx]
+                    _, feat, emb, ev, links = retrieved[idx]
                     all_retrieval_features.append(feat)
+                    all_retrieval_doc_embeddings.append(emb)
                     all_llm_evidences.append(ev)
                     all_source_links.append(links)
 
@@ -890,6 +906,11 @@ class FusionClaimVerifier:
                     dtype=torch.float32,
                     device=self.device,
                 )
+                doc_emb_tensor = None
+                if all_retrieval_doc_embeddings and all_retrieval_doc_embeddings[0] is not None:
+                    doc_emb_tensor = torch.tensor(
+                        np.stack(all_retrieval_doc_embeddings), dtype=torch.float32, device=self.device
+                    )
 
                 t_llm0 = perf_counter()
                 llm_logits = self.llm.score_logits(valid_claims, all_llm_evidences).to(
@@ -898,7 +919,7 @@ class FusionClaimVerifier:
                 t_llm1 = perf_counter()
                 total_llm_ms += 1000.0 * (t_llm1 - t_llm0)
 
-                retrieval_encoded = self.retrieval_encoder(retrieval_features)
+                retrieval_encoded = self.retrieval_encoder(retrieval_features, doc_emb_tensor)
                 fusion_output = self.fusion(llm_logits, retrieval_encoded)
 
                 probs_batch = fusion_output.final_probs
@@ -982,7 +1003,7 @@ class FusionClaimVerifier:
                 logger.info(f"[fusion_inference] original_claim={text!r}")
 
         t_retrieval0 = perf_counter()
-        retrieval_features_np, retrieved_evidence, retrieval_results = (
+        retrieval_features_np, doc_emb_np, retrieved_evidence, retrieval_results = (
             _build_retrieval_features_train_compatible(
                 self.retriever, model_text, self.top_k,
                 score_features=self.score_features,
@@ -1090,7 +1111,11 @@ class FusionClaimVerifier:
                     )
                 )
 
-            retrieval_encoded = self.retrieval_encoder(retrieval_features)
+            doc_emb_tensor = (
+                torch.tensor(doc_emb_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+                if doc_emb_np is not None else None
+            )
+            retrieval_encoded = self.retrieval_encoder(retrieval_features, doc_emb_tensor)
             if self.debug:
                 enc = retrieval_encoded.detach().cpu()
                 logger.info(

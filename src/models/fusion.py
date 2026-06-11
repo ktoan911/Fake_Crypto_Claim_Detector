@@ -275,18 +275,26 @@ if TORCH_AVAILABLE:
             return contrastive_loss + beta_reg
 
     class RetrievalFeatureEncoder(nn.Module):
-        """Encodes retrieval results into features for fusion."""
+        """Encodes retrieval results into features for fusion.
+
+        Two optional branches:
+        - Score branch: attention-weighted scoring features → output_dim
+        - Embedding branch (if emb_dim > 0): mean-pool doc embeddings → output_dim
+        Both are concatenated and projected back to output_dim when both are present.
+        """
 
         def __init__(
             self,
             num_retrieved: int = 5,
-            score_features: int = 4,
+            score_features: int = 5,
             hidden_dim: int = 64,
             output_dim: int = 64,
+            emb_dim: int = 0,
         ):
             super().__init__()
 
             self.num_retrieved = num_retrieved
+            self.emb_dim = emb_dim
             input_dim = num_retrieved * score_features
 
             self.encoder = nn.Sequential(
@@ -299,11 +307,32 @@ if TORCH_AVAILABLE:
                 nn.Linear(score_features, 16), nn.Tanh(), nn.Linear(16, 1)
             )
 
+            if emb_dim > 0:
+                # Projects mean-pooled doc embeddings to output_dim
+                self.emb_projection = nn.Sequential(
+                    nn.Linear(emb_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.2),
+                    nn.Linear(hidden_dim, output_dim),
+                )
+                # Fuses score branch + embedding branch → output_dim
+                self.fusion_proj = nn.Linear(output_dim * 2, output_dim)
+            else:
+                self.emb_projection = None
+                self.fusion_proj = None
+
         def forward(
             self,
             retrieval_scores: torch.Tensor,
-            retrieval_features: Optional[torch.Tensor] = None,
+            doc_embeddings: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
+            """
+            Args:
+                retrieval_scores: [B, num_retrieved, score_features]
+                doc_embeddings:   [B, num_retrieved, emb_dim] or None
+            Returns:
+                [B, output_dim]
+            """
             batch_size = retrieval_scores.size(0)
 
             attn_logits = self.attention(retrieval_scores)
@@ -311,6 +340,12 @@ if TORCH_AVAILABLE:
 
             weighted = retrieval_scores * attn_weights
             flat = weighted.view(batch_size, -1)
-            encoded = self.encoder(flat)
+            score_out = self.encoder(flat)  # [B, output_dim]
 
-            return encoded
+            if self.emb_projection is not None and doc_embeddings is not None:
+                mean_emb = doc_embeddings.mean(dim=1)          # [B, emb_dim]
+                emb_out = self.emb_projection(mean_emb)         # [B, output_dim]
+                combined = torch.cat([score_out, emb_out], dim=-1)  # [B, output_dim*2]
+                return self.fusion_proj(combined)               # [B, output_dim]
+
+            return score_out

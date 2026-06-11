@@ -68,21 +68,33 @@ class FusionTrainingConfig:
 def _build_retrieval_features(
     retriever: KnowledgeAugmentedRetriever, text: str, top_k: int, rrf_top_k: int = 20
 ) -> tuple:
-    """Returns (features, retrieved_evidence_text)."""
-    # RRF hybrid: top 20 candidates, then Temporal scoring to get top_k
+    """Returns (score_features, doc_embeddings, retrieved_evidence_text).
+
+    score_features: [top_k, 5]
+    doc_embeddings: [top_k, emb_dim] or None if retriever has no encoder
+    """
     results = retriever.retrieve(text, top_k=top_k, rrf_top_k=rrf_top_k)
     features = []
+    embeddings = []
     evidence_texts = []
+    has_embeddings = False
 
     for r in results:
         features.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score, r.cosine_similarity])
         evidence_texts.append(r.text)
+        if r.embedding is not None:
+            embeddings.append(r.embedding)
+            has_embeddings = True
 
-    if len(features) < top_k:
-        features.extend([[0.0, 0.0, 0.0, 0.0, 0.0]] * (top_k - len(features)))
+    pad = top_k - len(features)
+    if pad > 0:
+        features.extend([[0.0, 0.0, 0.0, 0.0, 0.0]] * pad)
+        if has_embeddings:
+            emb_dim = embeddings[0].shape[0] if embeddings else 1
+            embeddings.extend([np.zeros(emb_dim, dtype=np.float32)] * pad)
 
-    # Return list of evidence texts (for smart truncation in LLMScorer)
-    return np.array(features, dtype=np.float32), evidence_texts
+    emb_array = np.array(embeddings, dtype=np.float32) if has_embeddings else None
+    return np.array(features, dtype=np.float32), emb_array, evidence_texts
 
 
 def _save_training_curves(
@@ -399,9 +411,11 @@ def train_fusion_from_dataframe(
     )
 
     # Initialize retrieval encoder
+    emb_dim = retriever.embedding_dim if retriever.encoder is not None else 0
     retrieval_encoder = RetrievalFeatureEncoder(
-        num_retrieved=config.top_k, score_features=5, hidden_dim=64, output_dim=64
+        num_retrieved=config.top_k, score_features=5, hidden_dim=64, output_dim=64, emb_dim=emb_dim
     ).to(config.device)
+    logger.info(f"RetrievalFeatureEncoder: emb_dim={emb_dim}, embedding branch={'ON' if emb_dim > 0 else 'OFF'}")
 
     # Initialize fusion layer
     num_classes = len(config.label_list)
@@ -512,6 +526,7 @@ def train_fusion_from_dataframe(
     # --- PRE-COMPUTATION PHASE ---
     logger.info("Starting pre-computation of retrieval features and LLM logits...")
     all_retrieval_features = []
+    all_retrieval_embeddings: List[Optional[np.ndarray]] = []
     all_llm_logits = []
 
     # Ensure LLM is in eval mode and cache is disabled
@@ -533,17 +548,20 @@ def train_fusion_from_dataframe(
 
         # 1. Retrieval
         batch_feats = []
+        batch_embs = []
         batch_retrieved_evidences = []
         for t in batch_texts:
-            feats, retrieved_evidence = _build_retrieval_features(
+            feats, emb_array, retrieved_evidence = _build_retrieval_features(
                 retriever, t, config.top_k
             )
             batch_feats.append(feats)
+            batch_embs.append(emb_array)
             batch_retrieved_evidences.append(
                 retrieved_evidence[:3]
             )  # Cắt xuống đúng 3 top evidence để huấn luyện không bị nhiễu LM
 
         all_retrieval_features.extend(batch_feats)
+        all_retrieval_embeddings.extend(batch_embs)
 
         # 2. LLM Scoring
         if config.evidence_mode == "retrieved":
@@ -585,6 +603,14 @@ def train_fusion_from_dataframe(
     logger.info(
         f"LLM baseline (argmax on pre-computed logits) acc: {llm_baseline_acc:.4f}"
     )
+
+    # Build document embedding tensor if available [N, top_k, emb_dim]
+    tensor_doc_embeddings: Optional[torch.Tensor] = None
+    if all_retrieval_embeddings and all_retrieval_embeddings[0] is not None:
+        tensor_doc_embeddings = torch.tensor(
+            np.array(all_retrieval_embeddings), dtype=torch.float32
+        )
+        logger.info(f"Document embeddings tensor: {tensor_doc_embeddings.shape}")
 
     logger.info("Pre-computation complete. Unloading LLM...")
 
@@ -636,9 +662,13 @@ def train_fusion_from_dataframe(
             b_retrieval = tensor_retrieval[batch_indices].to(config.device)
             b_llm_logits = tensor_llm_logits[batch_indices].to(config.device)
             b_labels = tensor_labels[batch_indices].to(config.device)
+            b_doc_emb = (
+                tensor_doc_embeddings[batch_indices].to(config.device)
+                if tensor_doc_embeddings is not None else None
+            )
 
             # Encode retrieval features
-            retrieval_features = retrieval_encoder(b_retrieval)
+            retrieval_features = retrieval_encoder(b_retrieval, b_doc_emb)
 
             # Fusion: β·pLM + (1-β)·MLP(pret) per Eq.2
             output = fusion(b_llm_logits, retrieval_features)
@@ -702,7 +732,11 @@ def train_fusion_from_dataframe(
                 b_retrieval = tensor_retrieval[batch_indices].to(config.device)
                 b_llm_logits = tensor_llm_logits[batch_indices].to(config.device)
                 b_labels_eval = tensor_labels[batch_indices]
-                retrieval_features_eval = retrieval_encoder(b_retrieval)
+                b_doc_emb_eval = (
+                    tensor_doc_embeddings[batch_indices].to(config.device)
+                    if tensor_doc_embeddings is not None else None
+                )
+                retrieval_features_eval = retrieval_encoder(b_retrieval, b_doc_emb_eval)
                 output_eval = fusion(b_llm_logits, retrieval_features_eval)
                 preds_eval = torch.argmax(output_eval.final_probs, dim=-1).cpu()
                 all_preds.append(preds_eval)
@@ -808,6 +842,7 @@ def train_fusion_from_dataframe(
                 "retrieval_aux_loss_weight": float(config.retrieval_aux_loss_weight),
                 "save_best_checkpoint": bool(config.save_best_checkpoint),
                 "score_features": 5,
+                "emb_dim": emb_dim,
             },
         },
         save_path,

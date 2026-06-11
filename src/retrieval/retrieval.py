@@ -2,7 +2,7 @@ import os
 import pickle
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from loguru import logger
@@ -137,6 +137,7 @@ class RetrievalResult:
     cosine_similarity: float  # Raw FAISS inner-product (cosine sim after L2 norm)
     timestamp: datetime
     metadata: Dict
+    embedding: Optional[np.ndarray] = None  # L2-normalised BGE embedding of this document
 
 
 class TemporalScorer:
@@ -857,6 +858,11 @@ class KnowledgeAugmentedRetriever:
         results = []
         for item in top_results:
             doc = self.documents[item["index"]]
+            doc_emb = (
+                self.document_embeddings[item["index"]]
+                if self.document_embeddings is not None
+                else None
+            )
             results.append(
                 RetrievalResult(
                     document_id=doc["id"],
@@ -868,6 +874,7 @@ class KnowledgeAugmentedRetriever:
                     cosine_similarity=item["cosine_similarity"],
                     timestamp=doc["timestamp"],
                     metadata=doc["metadata"],
+                    embedding=doc_emb,
                 )
             )
 
