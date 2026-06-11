@@ -1,7 +1,7 @@
 # Script to train LoRA for 3-class claim classification (A=Đúng/B=Sai/C=Thiếu)
-from collections import Counter
-from dataclasses import dataclass
-from typing import List, Optional
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 from loguru import logger
 
@@ -600,6 +600,89 @@ def _prepare_classification_dataset(
     return tokenized
 
 
+class TrainingPlotCallback(TrainerCallback):
+    """Collect training/eval metrics and save plots to output_dir/plots/ at the end."""
+
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        self.train_steps: List[int] = []
+        self.train_loss: List[float] = []
+        self.eval_steps: List[int] = []
+        self.eval_metrics: Dict[str, List[float]] = defaultdict(list)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        step = state.global_step
+        if "loss" in logs and "eval_loss" not in logs:
+            self.train_steps.append(step)
+            self.train_loss.append(float(logs["loss"]))
+        if "eval_loss" in logs:
+            self.eval_steps.append(step)
+            for key, val in logs.items():
+                if key.startswith("eval_"):
+                    try:
+                        self.eval_metrics[key].append(float(val))
+                    except (TypeError, ValueError):
+                        pass
+
+    def on_train_end(self, args, state, control, **kwargs):
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib not installed — skipping training plots.")
+            return
+
+        plots_dir = os.path.join(self.output_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+
+        # ── 1. Loss ──────────────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(9, 4))
+        if self.train_steps:
+            ax.plot(self.train_steps, self.train_loss, label="Train loss", color="steelblue")
+        if self.eval_steps and "eval_loss" in self.eval_metrics:
+            ax.plot(self.eval_steps, self.eval_metrics["eval_loss"],
+                    label="Eval loss", color="tomato", marker="o", markersize=3)
+        ax.set_xlabel("Step"); ax.set_ylabel("Loss"); ax.set_title("Loss")
+        ax.legend(); ax.grid(alpha=0.3); fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, "loss.png"), dpi=120)
+        plt.close(fig)
+
+        # ── 2. F1 (macro + per-class) ────────────────────────────────────────
+        f1_keys = [k for k in self.eval_metrics if "f1" in k]
+        if f1_keys and self.eval_steps:
+            fig, ax = plt.subplots(figsize=(9, 4))
+            colors = ["royalblue", "darkorange", "green", "purple", "brown"]
+            for color, key in zip(colors, sorted(f1_keys)):
+                label = key.replace("eval_", "")
+                ax.plot(self.eval_steps, self.eval_metrics[key],
+                        label=label, marker="o", markersize=3, color=color)
+            ax.set_xlabel("Step"); ax.set_ylabel("F1"); ax.set_title("F1 scores")
+            ax.set_ylim(0, 1); ax.legend(); ax.grid(alpha=0.3); fig.tight_layout()
+            fig.savefig(os.path.join(plots_dir, "f1.png"), dpi=120)
+            plt.close(fig)
+
+        # ── 3. Precision / Recall / Accuracy ────────────────────────────────
+        pra_keys = [k for k in self.eval_metrics
+                    if any(x in k for x in ("precision", "recall", "accuracy"))]
+        if pra_keys and self.eval_steps:
+            fig, ax = plt.subplots(figsize=(9, 4))
+            colors = ["darkorange", "green", "purple", "brown"]
+            for color, key in zip(colors, sorted(pra_keys)):
+                label = key.replace("eval_", "")
+                ax.plot(self.eval_steps, self.eval_metrics[key],
+                        label=label, marker="o", markersize=3, color=color)
+            ax.set_xlabel("Step"); ax.set_ylabel("Score")
+            ax.set_title("Precision / Recall / Accuracy")
+            ax.set_ylim(0, 1); ax.legend(); ax.grid(alpha=0.3); fig.tight_layout()
+            fig.savefig(os.path.join(plots_dir, "precision_recall_accuracy.png"), dpi=120)
+            plt.close(fig)
+
+        logger.info(f"📊 Training plots saved to {plots_dir}/")
+
+
 def train_lora_classification(
     claims: List[str],
     evidences: List[str],
@@ -893,6 +976,7 @@ def train_lora_classification(
             EarlyStoppingCallback(
                 early_stopping_patience=config.early_stopping_patience
             ),
+            TrainingPlotCallback(output_dir=config.output_dir),
         ],
     )
 
