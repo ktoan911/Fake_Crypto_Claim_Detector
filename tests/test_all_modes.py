@@ -402,26 +402,66 @@ def main():
     # but feed Gold Evidence to LLM.
 
     logger.info("Step 1/3: Running Retrieval...")
-    all_retrieval_features = []
+    all_retrieval_base = []
     all_retrieval_interactions = []
     all_retrieved_evidences = []
+    all_evidence_raw = []  # raw texts for NLI
 
     for text in tqdm(texts, desc="Retrieving"):
         feats, interaction, retrieved_evidence_list = _build_retrieval_features(
             retriever, text, top_k
         )
-        all_retrieval_features.append(feats)
+        all_retrieval_base.append(feats)
         all_retrieval_interactions.append(interaction)
         all_retrieved_evidences.append(retrieved_evidence_list)
+        all_evidence_raw.append(retrieved_evidence_list)
+
+    # Append NLI features if checkpoint was trained with NLI
+    all_retrieval_features = all_retrieval_base
+    nli_model_name = fusion_config.get("nli_model") or None
+    if nli_model_name:
+        from src.models.nli_scorer import NLIScorer
+        import gc as _gc
+
+        logger.info(f"Running NLI scoring with {nli_model_name}...")
+        _nli = NLIScorer(model_name=nli_model_name, device=args.device).load()
+
+        flat_docs, flat_claims = [], []
+        for text, evidences in zip(texts, all_evidence_raw):
+            for doc in evidences:
+                flat_docs.append(doc)
+                flat_claims.append(text)
+
+        nli_flat = _nli.score(premises=flat_docs, hypotheses=flat_claims)
+        _nli.unload(); del _nli; _gc.collect()
+
+        cursor = 0
+        all_retrieval_features = []
+        for base_feats, evidences in zip(all_retrieval_base, all_evidence_raw):
+            n_real = len(evidences)
+            nli_padded = np.full((top_k, 3), 1.0 / 3.0, dtype=np.float32)
+            if n_real > 0:
+                nli_padded[:n_real] = nli_flat[cursor : cursor + n_real]
+            cursor += n_real
+            all_retrieval_features.append(
+                np.concatenate([base_feats, nli_padded], axis=-1)
+            )
+        logger.info(f"NLI merged. score_features=8, pairs={len(flat_docs)}")
 
     tensor_retrieval_features = torch.tensor(
         np.array(all_retrieval_features), dtype=torch.float32
     ).to(args.device)
 
     tensor_interactions = None
-    if all_retrieval_interactions and all_retrieval_interactions[0] is not None:
+    _non_none = [x for x in all_retrieval_interactions if x is not None]
+    if _non_none:
+        emb_shape = _non_none[0].shape[0]
+        _filled = [
+            x if x is not None else np.zeros(emb_shape, dtype=np.float32)
+            for x in all_retrieval_interactions
+        ]
         tensor_interactions = torch.tensor(
-            np.array(all_retrieval_interactions, dtype=np.float32), dtype=torch.float32
+            np.array(_filled, dtype=np.float32), dtype=torch.float32
         ).to(args.device)
 
     logger.info("Step 2/3: Running LLM Inference (Retrieval & Gold)...")
