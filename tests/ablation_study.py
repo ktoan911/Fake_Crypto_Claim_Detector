@@ -152,23 +152,50 @@ def phase1_retrieval(
     retriever.index_documents(all_docs)
     logger.info(f"  Indexed {len(all_docs)} passages")
 
-    def _feats(claim: str, use_temporal: bool) -> np.ndarray:
+    def _feats(claim: str, use_temporal: bool):
+        """Returns (score_feats [top_k, 5], interaction [2*emb_dim] or None)."""
         results = retriever.retrieve(claim, top_k=top_k, use_temporal=use_temporal)
-        rows = [[r.score, r.rrf_score, r.recency_score, r.cyclicity_score] for r in results]
+        doc_embs = []
+        rows = []
+        for r in results:
+            rows.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score, r.cosine_similarity])
+            if r.embedding is not None:
+                doc_embs.append(r.embedding)
         while len(rows) < top_k:
-            rows.append([0.0, 0.0, 0.0, 0.0])
-        return np.array(rows[:top_k], dtype=np.float32)
+            rows.append([0.0, 0.0, 0.0, 0.0, 0.0])
+        score_arr = np.array(rows[:top_k], dtype=np.float32)
 
-    feats_temporal = np.zeros((len(claims), top_k, 4), dtype=np.float32)
-    feats_no_temporal = np.zeros((len(claims), top_k, 4), dtype=np.float32)
+        interaction = None
+        q_emb = getattr(retriever, "_last_query_embedding", None)
+        if q_emb is not None and doc_embs:
+            mean_d = np.array(doc_embs, dtype=np.float32).mean(axis=0)
+            interaction = np.concatenate(
+                [q_emb * mean_d, np.abs(q_emb - mean_d)], dtype=np.float32
+            )
+        return score_arr, interaction
+
+    # Determine interaction_dim from first sample
+    _s0, _i0 = _feats(claims[0], use_temporal=True)
+    interaction_dim = _i0.shape[0] if _i0 is not None else 0
+
+    feats_temporal = np.zeros((len(claims), top_k, 5), dtype=np.float32)
+    feats_no_temporal = np.zeros((len(claims), top_k, 5), dtype=np.float32)
+    interactions_temporal = np.zeros((len(claims), interaction_dim), dtype=np.float32) if interaction_dim > 0 else None
+    interactions_no_temporal = np.zeros((len(claims), interaction_dim), dtype=np.float32) if interaction_dim > 0 else None
 
     for i, claim in enumerate(tqdm(claims, desc="Phase 1 — retrieval")):
-        feats_temporal[i] = _feats(claim, use_temporal=True)
-        feats_no_temporal[i] = _feats(claim, use_temporal=False)
+        s_t, i_t = _feats(claim, use_temporal=True)
+        s_nt, i_nt = _feats(claim, use_temporal=False)
+        feats_temporal[i] = s_t
+        feats_no_temporal[i] = s_nt
+        if interactions_temporal is not None and i_t is not None:
+            interactions_temporal[i] = i_t
+        if interactions_no_temporal is not None and i_nt is not None:
+            interactions_no_temporal[i] = i_nt
 
     _free(retriever)
     logger.info("Phase 1 done — retriever freed")
-    return feats_temporal, feats_no_temporal
+    return feats_temporal, feats_no_temporal, interactions_temporal, interactions_no_temporal
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +259,11 @@ def _build_fusion(
     top_k = saved_config.get("top_k", 10)
 
     enc = RetrievalFeatureEncoder(
-        num_retrieved=top_k, score_features=4, hidden_dim=64, output_dim=64
+        num_retrieved=top_k,
+        score_features=int(saved_config.get("score_features", 5)),
+        hidden_dim=64,
+        output_dim=64,
+        interaction_dim=int(saved_config.get("interaction_dim", 0)),
     ).to(device)
     enc.load_state_dict(ckpt["retrieval_encoder"])
     enc.eval()
@@ -260,13 +291,14 @@ def _build_fusion(
 
 def _eval_config(
     config_name: str,
-    feats_np: np.ndarray,         # [N, top_k, 4]
-    llm_logits_np: np.ndarray,    # [N, num_classes]
+    feats_np: np.ndarray,
+    llm_logits_np: np.ndarray,
     y_true: List[int],
     enc: RetrievalFeatureEncoder,
     fus: ConfidenceAwareFusion,
     device: str,
     batch_size: int = 64,
+    interactions_np: Optional[np.ndarray] = None,
 ) -> dict:
     n = len(y_true)
     preds: List[int] = []
@@ -275,9 +307,14 @@ def _eval_config(
         end = min(start + batch_size, n)
         feat_t = torch.tensor(feats_np[start:end], dtype=torch.float32, device=device)
         llm_t = torch.tensor(llm_logits_np[start:end], dtype=torch.float32, device=device)
+        int_t = (
+            torch.tensor(interactions_np[start:end], dtype=torch.float32, device=device)
+            if interactions_np is not None
+            else None
+        )
 
         with torch.inference_mode():
-            enc_out = enc(feat_t)
+            enc_out = enc(feat_t, int_t)
             fus_out = fus(llm_t, enc_out)
             batch_preds = torch.argmax(fus_out.final_probs, dim=-1).cpu().tolist()
 
@@ -315,6 +352,8 @@ def phase3_fusion(
     saved_config: dict,
     feats_temporal: np.ndarray,
     feats_no_temporal: np.ndarray,
+    interactions_temporal: "Optional[np.ndarray]",
+    interactions_no_temporal: "Optional[np.ndarray]",
     llm_logits: np.ndarray,
     y_true: List[int],
     device: str,
@@ -324,16 +363,19 @@ def phase3_fusion(
         {
             "name": "w/o Temporal Scoring",
             "feats": feats_no_temporal,
+            "interactions": interactions_no_temporal,
             "adaptive_beta": None,
         },
         {
             "name": "w/o Beta-Gate (Fixed β)",
             "feats": feats_temporal,
+            "interactions": interactions_temporal,
             "adaptive_beta": False,
         },
         {
             "name": "Full Model",
             "feats": feats_temporal,
+            "interactions": interactions_temporal,
             "adaptive_beta": None,
         },
     ]
@@ -345,6 +387,7 @@ def phase3_fusion(
         row = _eval_config(
             config_name=cfg["name"],
             feats_np=cfg["feats"],
+            interactions_np=cfg["interactions"],
             llm_logits_np=llm_logits,
             y_true=y_true,
             enc=enc,
@@ -410,7 +453,7 @@ def main() -> None:
     )
 
     # ---- Phase 1: Retrieval (SentenceTransformer + FAISS + BM25) ----
-    feats_temporal, feats_no_temporal = phase1_retrieval(
+    feats_temporal, feats_no_temporal, interactions_temporal, interactions_no_temporal = phase1_retrieval(
         claims=claims,
         gold_evidences=gold_evidences,
         retriever_model=retriever_model,
@@ -434,6 +477,8 @@ def main() -> None:
         saved_config=saved_config,
         feats_temporal=feats_temporal,
         feats_no_temporal=feats_no_temporal,
+        interactions_temporal=interactions_temporal,
+        interactions_no_temporal=interactions_no_temporal,
         llm_logits=llm_logits,
         y_true=y_true,
         device=args.device,

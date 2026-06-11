@@ -129,9 +129,10 @@ def load_fusion_model(model_path, device, num_classes=None):
 
     retrieval_encoder = RetrievalFeatureEncoder(
         num_retrieved=saved_config.get("top_k", 10),
-        score_features=4,
+        score_features=int(saved_config.get("score_features", 5)),
         hidden_dim=64,
         output_dim=64,
+        interaction_dim=int(saved_config.get("interaction_dim", 0)),
     ).to(device)
 
     has_adaptive_state = any(k.startswith("beta_gate.") for k in fusion_state.keys())
@@ -402,18 +403,26 @@ def main():
 
     logger.info("Step 1/3: Running Retrieval...")
     all_retrieval_features = []
+    all_retrieval_interactions = []
     all_retrieved_evidences = []
 
     for text in tqdm(texts, desc="Retrieving"):
-        feats, retrieved_evidence_list = _build_retrieval_features(
+        feats, interaction, retrieved_evidence_list = _build_retrieval_features(
             retriever, text, top_k
         )
         all_retrieval_features.append(feats)
+        all_retrieval_interactions.append(interaction)
         all_retrieved_evidences.append(retrieved_evidence_list)
 
     tensor_retrieval_features = torch.tensor(
         np.array(all_retrieval_features), dtype=torch.float32
     ).to(args.device)
+
+    tensor_interactions = None
+    if all_retrieval_interactions and all_retrieval_interactions[0] is not None:
+        tensor_interactions = torch.tensor(
+            np.array(all_retrieval_interactions, dtype=np.float32), dtype=torch.float32
+        ).to(args.device)
 
     logger.info("Step 2/3: Running LLM Inference (Retrieval & Gold)...")
 
@@ -472,7 +481,7 @@ def main():
     # --- Mode 3: Fusion + Retrieval ---
     # Fusion(logits_retrieval, features_retrieval)
     with torch.no_grad():
-        encoded_feats = retrieval_encoder(tensor_retrieval_features)
+        encoded_feats = retrieval_encoder(tensor_retrieval_features, tensor_interactions)
         fusion_out_ret = fusion_layer(tensor_logits_retrieval, encoded_feats)
         # Final probs or logits? Fusion returns FusionOutput with final_probs
         # Use simple argmax on final_probs

@@ -142,6 +142,57 @@ def _token_overlap_ratio(query_text: str, doc_text: str) -> float:
     return float(len(q_tokens & d_tokens) / len(q_tokens))
 
 
+def _compute_lexical_numeric_features(claim: str, evidence: str) -> List[float]:
+    """4 features capturing factual alignment for financial claims.
+    Returns [num_max_ratio, num_mean_ratio, num_exact_match, char_bigram_f1].
+    """
+    from collections import Counter
+
+    def _nums(text: str) -> List[float]:
+        nums = []
+        for m in re.findall(r"\d+(?:[.,]\d+)?", text):
+            try:
+                v = float(m.replace(",", "."))
+                if 0 < v < 1e12:
+                    nums.append(v)
+            except ValueError:
+                pass
+        return nums
+
+    c_nums, e_nums = _nums(claim), _nums(evidence)
+    if c_nums and e_nums:
+        ratios = [
+            min(cn / en, en / cn)
+            for cn in c_nums
+            for en in e_nums
+            if cn > 0 and en > 0
+        ]
+        num_max = float(max(ratios)) if ratios else 0.0
+        num_mean = float(np.mean(ratios)) if ratios else 0.0
+        num_exact = float(
+            any(
+                any(abs(cn - en) / max(abs(cn), 1e-9) < 0.02 for en in e_nums)
+                for cn in c_nums
+            )
+        )
+    else:
+        num_max = num_mean = num_exact = 0.0
+
+    t_c = re.sub(r"\s+", "", claim.lower())
+    t_e = re.sub(r"\s+", "", evidence.lower())
+    cb = Counter(t_c[i : i + 2] for i in range(len(t_c) - 1))
+    eb = Counter(t_e[i : i + 2] for i in range(len(t_e) - 1))
+    if cb and eb:
+        common = sum((cb & eb).values())
+        p = common / (sum(eb.values()) + 1e-9)
+        r = common / (sum(cb.values()) + 1e-9)
+        f1 = float(2 * p * r / (p + r + 1e-9))
+    else:
+        f1 = 0.0
+
+    return [num_max, num_mean, num_exact, f1]
+
+
 def _build_retrieval_features_train_compatible(
     retriever: Any,
     text: str,
@@ -166,6 +217,8 @@ def _build_retrieval_features_train_compatible(
         row = [r.score, r.rrf_score, r.recency_score, r.cyclicity_score]
         if score_features >= 5:
             row.append(r.cosine_similarity)
+        if score_features >= 9:
+            row.extend(_compute_lexical_numeric_features(text, r.text))
         features.append(row)
         if r.embedding is not None:
             doc_embs.append(r.embedding)
@@ -631,7 +684,7 @@ class FusionClaimVerifier:
         t0 = perf_counter()
         with torch.inference_mode():
             dummy_retrieval = torch.zeros(
-                1, self.top_k, 4, dtype=torch.float32, device=self.device
+                1, self.top_k, self.score_features, dtype=torch.float32, device=self.device
             )
             dummy_encoded = self.retrieval_encoder(dummy_retrieval)
             dummy_llm = torch.zeros(

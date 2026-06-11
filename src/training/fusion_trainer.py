@@ -1,4 +1,6 @@
 import os
+import re
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -65,18 +67,70 @@ class FusionTrainingConfig:
     )
 
 
+def _compute_lexical_numeric_features(claim: str, evidence: str) -> List[float]:
+    """4 features capturing factual alignment for financial claims.
+
+    Embedding similarity is trained on semantic proximity, not numerical accuracy —
+    "GDP tăng 8%" and "GDP tăng 1000%" look nearly identical to a bi-encoder.
+    These features directly measure whether claim numbers match evidence numbers.
+
+    Returns [num_max_ratio, num_mean_ratio, num_exact_match, char_bigram_f1]
+    """
+    def _nums(text: str) -> List[float]:
+        nums = []
+        for m in re.findall(r"\d+(?:[.,]\d+)?", text):
+            try:
+                v = float(m.replace(",", "."))
+                if 0 < v < 1e12:
+                    nums.append(v)
+            except ValueError:
+                pass
+        return nums
+
+    c_nums, e_nums = _nums(claim), _nums(evidence)
+    if c_nums and e_nums:
+        ratios = [
+            min(cn / en, en / cn)
+            for cn in c_nums
+            for en in e_nums
+            if cn > 0 and en > 0
+        ]
+        num_max = float(max(ratios)) if ratios else 0.0
+        num_mean = float(np.mean(ratios)) if ratios else 0.0
+        num_exact = float(
+            any(
+                any(abs(cn - en) / max(abs(cn), 1e-9) < 0.02 for en in e_nums)
+                for cn in c_nums
+            )
+        )
+    else:
+        num_max = num_mean = num_exact = 0.0
+
+    t_c = re.sub(r"\s+", "", claim.lower())
+    t_e = re.sub(r"\s+", "", evidence.lower())
+    cb = Counter(t_c[i : i + 2] for i in range(len(t_c) - 1))
+    eb = Counter(t_e[i : i + 2] for i in range(len(t_e) - 1))
+    if cb and eb:
+        common = sum((cb & eb).values())
+        p = common / (sum(eb.values()) + 1e-9)
+        r = common / (sum(cb.values()) + 1e-9)
+        f1 = float(2 * p * r / (p + r + 1e-9))
+    else:
+        f1 = 0.0
+
+    return [num_max, num_mean, num_exact, f1]
+
+
 def _build_retrieval_features(
     retriever: KnowledgeAugmentedRetriever, text: str, top_k: int, rrf_top_k: int = 20
 ) -> tuple:
     """Returns (score_features, interaction_features, retrieved_evidence_text).
 
-    score_features:       [top_k, 5]
-    interaction_features: [2*emb_dim] claim-evidence interaction, or None
-                          = concat(q ⊙ mean_d, |q − mean_d|) where q is the
-                            L2-normalised query embedding and mean_d is the
-                            mean of the top-k retrieved document embeddings.
-                          Directly encodes whether the claim MATCHES or
-                          CONTRADICTS the retrieved evidence on each dimension.
+    score_features: [top_k, 9]
+      - 5 retrieval scoring signals: score, rrf_score, recency, cyclicity, cosine_sim
+      - 4 lexical/numeric features per doc: num_max_ratio, num_mean_ratio,
+        num_exact_match, char_bigram_f1
+    interaction_features: legacy embedding interaction (kept for API compat, not used).
     """
     results = retriever.retrieve(text, top_k=top_k, rrf_top_k=rrf_top_k)
     features = []
@@ -84,14 +138,18 @@ def _build_retrieval_features(
     evidence_texts = []
 
     for r in results:
-        features.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score, r.cosine_similarity])
+        lex = _compute_lexical_numeric_features(text, r.text)
+        features.append(
+            [r.score, r.rrf_score, r.recency_score, r.cyclicity_score, r.cosine_similarity]
+            + lex
+        )
         evidence_texts.append(r.text)
         if r.embedding is not None:
             doc_embs.append(r.embedding)
 
     pad = top_k - len(features)
     if pad > 0:
-        features.extend([[0.0, 0.0, 0.0, 0.0, 0.0]] * pad)
+        features.extend([[0.0] * 9] * pad)
 
     # Compute claim-evidence interaction: q ⊙ mean_d and |q − mean_d|
     interaction = None
@@ -419,16 +477,12 @@ def train_fusion_from_dataframe(
     )
 
     # Initialize retrieval encoder
-    raw_emb_dim = retriever.embedding_dim if retriever.encoder is not None else 0
-    interaction_dim = 2 * raw_emb_dim  # q⊙mean_d + |q-mean_d|
     retrieval_encoder = RetrievalFeatureEncoder(
-        num_retrieved=config.top_k, score_features=5, hidden_dim=64, output_dim=64,
-        interaction_dim=interaction_dim,
+        num_retrieved=config.top_k, score_features=9, hidden_dim=64, output_dim=64,
+        interaction_dim=0,
     ).to(config.device)
     logger.info(
-        f"RetrievalFeatureEncoder: raw_emb_dim={raw_emb_dim}, "
-        f"interaction_dim={interaction_dim}, "
-        f"interaction branch={'ON' if interaction_dim > 0 else 'OFF'}"
+        f"RetrievalFeatureEncoder: score_features=9 (5 scoring + 4 lexical/numeric), interaction_dim=0"
     )
 
     # Initialize fusion layer
@@ -855,8 +909,8 @@ def train_fusion_from_dataframe(
                 "adaptive_beta": bool(config.adaptive_beta),
                 "retrieval_aux_loss_weight": float(config.retrieval_aux_loss_weight),
                 "save_best_checkpoint": bool(config.save_best_checkpoint),
-                "score_features": 5,
-                "interaction_dim": interaction_dim,
+                "score_features": 9,
+                "interaction_dim": 0,
             },
         },
         save_path,
