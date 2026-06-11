@@ -75,11 +75,11 @@ def _build_retrieval_features(
     evidence_texts = []
 
     for r in results:
-        features.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score])
+        features.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score, r.cosine_similarity])
         evidence_texts.append(r.text)
 
     if len(features) < top_k:
-        features.extend([[0.0, 0.0, 0.0, 0.0]] * (top_k - len(features)))
+        features.extend([[0.0, 0.0, 0.0, 0.0, 0.0]] * (top_k - len(features)))
 
     # Return list of evidence texts (for smart truncation in LLMScorer)
     return np.array(features, dtype=np.float32), evidence_texts
@@ -400,7 +400,7 @@ def train_fusion_from_dataframe(
 
     # Initialize retrieval encoder
     retrieval_encoder = RetrievalFeatureEncoder(
-        num_retrieved=config.top_k, score_features=4, hidden_dim=64, output_dim=64
+        num_retrieved=config.top_k, score_features=5, hidden_dim=64, output_dim=64
     ).to(config.device)
 
     # Initialize fusion layer
@@ -807,6 +807,7 @@ def train_fusion_from_dataframe(
                 "adaptive_beta": bool(config.adaptive_beta),
                 "retrieval_aux_loss_weight": float(config.retrieval_aux_loss_weight),
                 "save_best_checkpoint": bool(config.save_best_checkpoint),
+                "score_features": 5,
             },
         },
         save_path,

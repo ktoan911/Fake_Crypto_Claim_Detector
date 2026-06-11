@@ -148,10 +148,11 @@ def _build_retrieval_features_train_compatible(
     top_k: int,
     rrf_top_k: int = 100,
     precomputed_vector: Optional[List[float]] = None,
+    score_features: int = 5,
 ) -> tuple[np.ndarray, List[str], List[RetrievalResult]]:
     """
     Same feature construction used in training:
-    [score, rrf_score, recency_score, cyclicity_score] for top_k docs.
+    [score, rrf_score, recency_score, cyclicity_score, cosine_similarity] for top_k docs.
     """
     results = retriever.retrieve(
         text, top_k=top_k, rrf_top_k=rrf_top_k, precomputed_vector=precomputed_vector
@@ -160,7 +161,10 @@ def _build_retrieval_features_train_compatible(
     evidence_texts = []
 
     for r in results:
-        features.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score])
+        row = [r.score, r.rrf_score, r.recency_score, r.cyclicity_score]
+        if score_features >= 5:
+            row.append(r.cosine_similarity)
+        features.append(row)
         ts = (
             r.timestamp.astimezone(timezone.utc)
             if isinstance(r.timestamp, datetime)
@@ -170,7 +174,7 @@ def _build_retrieval_features_train_compatible(
         evidence_texts.append(f"[Thời gian của thông tin: {time_str}] {r.text}")
 
     if len(features) < top_k:
-        features.extend([[0.0, 0.0, 0.0, 0.0]] * (top_k - len(features)))
+        features.extend([[0.0] * score_features] * (top_k - len(features)))
 
     return np.array(features, dtype=np.float32), evidence_texts, results
 
@@ -514,9 +518,10 @@ class FusionClaimVerifier:
                 "or pass debug=True to verify_claim_true_false()/FusionClaimVerifier."
             )
 
+        self.score_features = int(self.saved_config.get("score_features", 5))
         self.retrieval_encoder = RetrievalFeatureEncoder(
             num_retrieved=self.top_k,
-            score_features=4,
+            score_features=self.score_features,
             hidden_dim=64,
             output_dim=64,
         ).to(self.device)
@@ -851,6 +856,7 @@ class FusionClaimVerifier:
                     _feat, _evidence, _results = _build_retrieval_features_train_compatible(
                         self.retriever, _text, self.top_k,
                         precomputed_vector=vec_map.get(_text),
+                        score_features=self.score_features,
                     )
                     _links: List[str] = []
                     for _r in _results[: self.llm_evidence_top_k]:
@@ -978,7 +984,8 @@ class FusionClaimVerifier:
         t_retrieval0 = perf_counter()
         retrieval_features_np, retrieved_evidence, retrieval_results = (
             _build_retrieval_features_train_compatible(
-                self.retriever, model_text, self.top_k
+                self.retriever, model_text, self.top_k,
+                score_features=self.score_features,
             )
         )
         t_retrieval1 = perf_counter()

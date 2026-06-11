@@ -134,6 +134,7 @@ class RetrievalResult:
     rrf_score: float  # Changed from bm25_score to rrf_score
     recency_score: float
     cyclicity_score: float
+    cosine_similarity: float  # Raw FAISS inner-product (cosine sim after L2 norm)
     timestamp: datetime
     metadata: Dict
 
@@ -762,6 +763,7 @@ class KnowledgeAugmentedRetriever:
 
         # Stage 1b: FAISS semantic search (if available)
         faiss_ranks = {}
+        faiss_cosine = {}  # idx → cosine similarity (inner product after L2 norm)
         if use_semantic and self.encoder is not None and self.faiss_index is not None:
             query_embedding = self.encoder.encode(
                 [expanded_query], convert_to_numpy=True
@@ -772,6 +774,7 @@ class KnowledgeAugmentedRetriever:
             n_docs = len(self.documents)
             distances, indices = self.faiss_index.search(query_embedding, n_docs)
             faiss_ranks = {idx: rank for rank, idx in enumerate(indices[0].tolist())}
+            faiss_cosine = {int(indices[0][i]): float(distances[0][i]) for i in range(len(indices[0]))}
         else:
             # No FAISS available: use uniform ranks
             faiss_ranks = {i: i for i in range(len(self.documents))}
@@ -842,6 +845,7 @@ class KnowledgeAugmentedRetriever:
                     "rrf_score": rrf_scores_norm[idx],
                     "recency_score": recency,
                     "cyclicity_score": cyclicity,
+                    "cosine_similarity": faiss_cosine.get(idx, 0.0),
                 }
             )
 
@@ -861,6 +865,7 @@ class KnowledgeAugmentedRetriever:
                     rrf_score=item["rrf_score"],  # Changed from bm25_score
                     recency_score=item["recency_score"],
                     cyclicity_score=item["cyclicity_score"],
+                    cosine_similarity=item["cosine_similarity"],
                     timestamp=doc["timestamp"],
                     metadata=doc["metadata"],
                 )
