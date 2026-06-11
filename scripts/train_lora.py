@@ -10,7 +10,7 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
-from src.data.csv_loader import CSVLabeledLoader
+from src.data_process.csv_loader import CSVLabeledLoader
 from src.training.lora_trainer import LoRATrainingConfig, train_lora_classification
 
 # Load environment variables from .env file
