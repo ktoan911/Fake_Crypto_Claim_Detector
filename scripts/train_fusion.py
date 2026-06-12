@@ -68,6 +68,13 @@ def main():
         default=os.getenv("RETRIEVER_MODEL_PATH", "AITeamVN/Vietnamese_Embedding"),
         help="Path to trained dense retrieval model (default: models/retriever_model)",
     )
+    parser.add_argument(
+        "--evidence_mode",
+        type=str,
+        default=os.getenv("FUSION_EVIDENCE_MODE", "gold"),
+        choices=["gold", "retrieved"],
+        help="Evidence source: 'gold' = dùng cột evidence từ CSV, 'retrieved' = retriever tìm kiếm (default: gold)",
+    )
 
     args = parser.parse_args()
 
@@ -181,6 +188,7 @@ def main():
         batch_size=args.batch_size,
         llm_batch_size=args.llm_batch_size,
         epochs=args.epochs,
+        evidence_mode=args.evidence_mode,
     )
 
     train_fusion_from_dataframe(
