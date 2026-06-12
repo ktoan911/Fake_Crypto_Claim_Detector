@@ -1,4 +1,5 @@
 # Script to train LoRA for 3-class claim classification (A=Đúng/B=Sai/C=Thiếu)
+import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
