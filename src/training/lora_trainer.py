@@ -601,8 +601,55 @@ def _prepare_classification_dataset(
     return tokenized
 
 
+def _sample_hw_metrics() -> Dict[str, float]:
+    """Sample current hardware utilization. Returns empty dict on failure."""
+    metrics: Dict[str, float] = {}
+    try:
+        import psutil
+        metrics["cpu_pct"] = psutil.cpu_percent(interval=None)
+        vm = psutil.virtual_memory()
+        metrics["ram_used_gb"] = vm.used / 1024 ** 3
+        metrics["ram_total_gb"] = vm.total / 1024 ** 3
+    except Exception:
+        pass
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                metrics[f"gpu{i}_mem_alloc_gb"] = torch.cuda.memory_allocated(i) / 1024 ** 3
+                metrics[f"gpu{i}_mem_reserved_gb"] = torch.cuda.memory_reserved(i) / 1024 ** 3
+    except Exception:
+        pass
+
+    try:
+        import subprocess, re
+        out = subprocess.check_output(
+            ["nvidia-smi",
+             "--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            timeout=3, stderr=subprocess.DEVNULL,
+        ).decode()
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 6:
+                idx = parts[0]
+                metrics[f"gpu{idx}_util_pct"] = float(parts[1])
+                metrics[f"gpu{idx}_mem_used_mb"] = float(parts[2])
+                metrics[f"gpu{idx}_mem_total_mb"] = float(parts[3])
+                metrics[f"gpu{idx}_temp_c"] = float(parts[4])
+                try:
+                    metrics[f"gpu{idx}_power_w"] = float(parts[5])
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+
+    return metrics
+
+
 class TrainingPlotCallback(TrainerCallback):
-    """Collect training/eval metrics and save plots to output_dir/plots/ at the end."""
+    """Collect training/eval metrics + hardware stats; save plots at end of training."""
 
     def __init__(self, output_dir: str):
         self.output_dir = output_dir
@@ -610,6 +657,8 @@ class TrainingPlotCallback(TrainerCallback):
         self.train_loss: List[float] = []
         self.eval_steps: List[int] = []
         self.eval_metrics: Dict[str, List[float]] = defaultdict(list)
+        self.hw_steps: List[int] = []
+        self.hw_metrics: Dict[str, List[float]] = defaultdict(list)
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None:
@@ -618,6 +667,12 @@ class TrainingPlotCallback(TrainerCallback):
         if "loss" in logs and "eval_loss" not in logs:
             self.train_steps.append(step)
             self.train_loss.append(float(logs["loss"]))
+            # Sample hardware at every train-log step
+            hw = _sample_hw_metrics()
+            if hw:
+                self.hw_steps.append(step)
+                for k, v in hw.items():
+                    self.hw_metrics[k].append(v)
         if "eval_loss" in logs:
             self.eval_steps.append(step)
             for key, val in logs.items():
@@ -639,6 +694,10 @@ class TrainingPlotCallback(TrainerCallback):
         plots_dir = os.path.join(self.output_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
 
+        def _save(fig, name):
+            fig.savefig(os.path.join(plots_dir, name), dpi=120, bbox_inches="tight")
+            plt.close(fig)
+
         # ── 1. Loss ──────────────────────────────────────────────────────────
         fig, ax = plt.subplots(figsize=(9, 4))
         if self.train_steps:
@@ -648,38 +707,111 @@ class TrainingPlotCallback(TrainerCallback):
                     label="Eval loss", color="tomato", marker="o", markersize=3)
         ax.set_xlabel("Step"); ax.set_ylabel("Loss"); ax.set_title("Loss")
         ax.legend(); ax.grid(alpha=0.3); fig.tight_layout()
-        fig.savefig(os.path.join(plots_dir, "loss.png"), dpi=120)
-        plt.close(fig)
+        _save(fig, "loss.png")
 
-        # ── 2. F1 (macro + per-class) ────────────────────────────────────────
-        f1_keys = [k for k in self.eval_metrics if "f1" in k]
+        # ── 2. F1 ────────────────────────────────────────────────────────────
+        f1_keys = sorted(k for k in self.eval_metrics if "f1" in k)
         if f1_keys and self.eval_steps:
             fig, ax = plt.subplots(figsize=(9, 4))
             colors = ["royalblue", "darkorange", "green", "purple", "brown"]
-            for color, key in zip(colors, sorted(f1_keys)):
-                label = key.replace("eval_", "")
+            for color, key in zip(colors, f1_keys):
                 ax.plot(self.eval_steps, self.eval_metrics[key],
-                        label=label, marker="o", markersize=3, color=color)
+                        label=key.replace("eval_", ""), marker="o", markersize=3, color=color)
             ax.set_xlabel("Step"); ax.set_ylabel("F1"); ax.set_title("F1 scores")
             ax.set_ylim(0, 1); ax.legend(); ax.grid(alpha=0.3); fig.tight_layout()
-            fig.savefig(os.path.join(plots_dir, "f1.png"), dpi=120)
-            plt.close(fig)
+            _save(fig, "f1.png")
 
-        # ── 3. Precision / Recall / Accuracy ────────────────────────────────
-        pra_keys = [k for k in self.eval_metrics
-                    if any(x in k for x in ("precision", "recall", "accuracy"))]
+        # ── 3. Precision / Recall / Accuracy ─────────────────────────────────
+        pra_keys = sorted(k for k in self.eval_metrics
+                          if any(x in k for x in ("precision", "recall", "accuracy")))
         if pra_keys and self.eval_steps:
             fig, ax = plt.subplots(figsize=(9, 4))
             colors = ["darkorange", "green", "purple", "brown"]
-            for color, key in zip(colors, sorted(pra_keys)):
-                label = key.replace("eval_", "")
+            for color, key in zip(colors, pra_keys):
                 ax.plot(self.eval_steps, self.eval_metrics[key],
-                        label=label, marker="o", markersize=3, color=color)
+                        label=key.replace("eval_", ""), marker="o", markersize=3, color=color)
             ax.set_xlabel("Step"); ax.set_ylabel("Score")
             ax.set_title("Precision / Recall / Accuracy")
             ax.set_ylim(0, 1); ax.legend(); ax.grid(alpha=0.3); fig.tight_layout()
-            fig.savefig(os.path.join(plots_dir, "precision_recall_accuracy.png"), dpi=120)
-            plt.close(fig)
+            _save(fig, "precision_recall_accuracy.png")
+
+        # ── 4. GPU memory ─────────────────────────────────────────────────────
+        gpu_mem_keys = sorted(k for k in self.hw_metrics if "mem_alloc_gb" in k or "mem_used_mb" in k)
+        if gpu_mem_keys and self.hw_steps:
+            fig, ax = plt.subplots(figsize=(9, 4))
+            colors = ["royalblue", "darkorange", "green", "purple"]
+            for color, key in zip(colors, gpu_mem_keys):
+                vals = self.hw_metrics[key]
+                # convert MB → GB for consistency
+                if "mb" in key.lower():
+                    vals = [v / 1024 for v in vals]
+                label = key.replace("_mb", "").replace("_gb", "") + " (GB)"
+                ax.plot(self.hw_steps[:len(vals)], vals,
+                        label=label, color=color)
+            ax.set_xlabel("Step"); ax.set_ylabel("GB"); ax.set_title("GPU Memory Usage")
+            ax.legend(); ax.grid(alpha=0.3); fig.tight_layout()
+            _save(fig, "gpu_memory.png")
+
+        # ── 5. GPU utilization & temperature ─────────────────────────────────
+        gpu_util_keys = sorted(k for k in self.hw_metrics if "util_pct" in k)
+        gpu_temp_keys = sorted(k for k in self.hw_metrics if "temp_c" in k)
+        if (gpu_util_keys or gpu_temp_keys) and self.hw_steps:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
+            colors = ["royalblue", "darkorange", "green", "purple"]
+            for color, key in zip(colors, gpu_util_keys):
+                vals = self.hw_metrics[key]
+                ax1.plot(self.hw_steps[:len(vals)], vals,
+                         label=key.replace("_util_pct", " util%"), color=color)
+            ax1.set_ylabel("Utilization (%)"); ax1.set_ylim(0, 100)
+            ax1.set_title("GPU Utilization & Temperature")
+            ax1.legend(); ax1.grid(alpha=0.3)
+            for color, key in zip(colors, gpu_temp_keys):
+                vals = self.hw_metrics[key]
+                ax2.plot(self.hw_steps[:len(vals)], vals,
+                         label=key.replace("_temp_c", " °C"), color=color)
+            ax2.set_xlabel("Step"); ax2.set_ylabel("Temperature (°C)")
+            ax2.legend(); ax2.grid(alpha=0.3)
+            fig.tight_layout()
+            _save(fig, "gpu_util_temp.png")
+
+        # ── 6. GPU power draw ────────────────────────────────────────────────
+        power_keys = sorted(k for k in self.hw_metrics if "power_w" in k)
+        if power_keys and self.hw_steps:
+            fig, ax = plt.subplots(figsize=(9, 4))
+            colors = ["royalblue", "darkorange", "green", "purple"]
+            for color, key in zip(colors, power_keys):
+                vals = self.hw_metrics[key]
+                ax.plot(self.hw_steps[:len(vals)], vals,
+                        label=key.replace("_power_w", " power (W)"), color=color)
+            ax.set_xlabel("Step"); ax.set_ylabel("Power (W)")
+            ax.set_title("GPU Power Draw")
+            ax.legend(); ax.grid(alpha=0.3); fig.tight_layout()
+            _save(fig, "gpu_power.png")
+
+        # ── 7. CPU & RAM ──────────────────────────────────────────────────────
+        has_cpu = "cpu_pct" in self.hw_metrics
+        has_ram = "ram_used_gb" in self.hw_metrics
+        if (has_cpu or has_ram) and self.hw_steps:
+            fig, axes = plt.subplots(1 + int(has_ram), 1,
+                                     figsize=(9, 4 * (1 + int(has_ram))), squeeze=False)
+            if has_cpu:
+                axes[0][0].plot(self.hw_steps, self.hw_metrics["cpu_pct"],
+                                color="steelblue", label="CPU %")
+                axes[0][0].set_ylabel("CPU (%)"); axes[0][0].set_ylim(0, 100)
+                axes[0][0].set_title("CPU & RAM Usage")
+                axes[0][0].legend(); axes[0][0].grid(alpha=0.3)
+            if has_ram:
+                row = axes[int(has_cpu)][0]
+                total = self.hw_metrics["ram_total_gb"][0] if self.hw_metrics["ram_total_gb"] else None
+                row.plot(self.hw_steps, self.hw_metrics["ram_used_gb"],
+                         color="tomato", label="RAM used (GB)")
+                if total:
+                    row.axhline(total, color="gray", linestyle="--",
+                                linewidth=0.8, label=f"Total {total:.1f} GB")
+                row.set_xlabel("Step"); row.set_ylabel("RAM (GB)")
+                row.legend(); row.grid(alpha=0.3)
+            fig.tight_layout()
+            _save(fig, "cpu_ram.png")
 
         logger.info(f"📊 Training plots saved to {plots_dir}/")
 
