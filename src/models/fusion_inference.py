@@ -545,7 +545,7 @@ class FusionClaimVerifier:
 
         self.top_k = int(self.saved_config.get("top_k", 10))
         if llm_evidence_top_k is None:
-            llm_evidence_top_k = int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "3"))
+            llm_evidence_top_k = int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "5"))
         self.llm_evidence_top_k = max(1, int(llm_evidence_top_k))
         llm_batch_env = os.getenv("LLM_INFER_BATCH_SIZE") or os.getenv("FUSION_LLM_INFER_BATCH_SIZE", "1")
         try:
@@ -1217,7 +1217,23 @@ class FusionClaimVerifier:
         )
         t_retrieval1 = perf_counter()
 
-        llm_evidence = retrieved_evidence[: self.llm_evidence_top_k]
+        seen_ev_urls: set = set()
+        llm_evidence: list = []
+        for ev_text, r in zip(retrieved_evidence, retrieval_results):
+            meta = r.metadata or {}
+            url = (
+                meta.get("article_url")
+                or meta.get("url")
+                or meta.get("link")
+                or ""
+            )
+            if url and url in seen_ev_urls:
+                continue
+            if url:
+                seen_ev_urls.add(url)
+            llm_evidence.append(ev_text)
+            if len(llm_evidence) >= self.llm_evidence_top_k:
+                break
 
         if self.debug:
             logger.info(

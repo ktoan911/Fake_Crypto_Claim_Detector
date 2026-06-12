@@ -153,11 +153,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Fake Claim Detector API", lifespan=lifespan)
 
-_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
