@@ -9,7 +9,7 @@ Evaluates 4 modes:
 
 Model sources support both local paths and HuggingFace repo IDs.
 Default HF repos are read from env vars (same as .env / fusion_inference.py):
-  LLM_FINETUNE        -> LoRA model (e.g. ktoan911/fact-check-Qwen3-4B-finetune)
+  LLM_FINETUNE        -> LoRA model (e.g. ktoan911/Qwen3-4B-factcheck-finetune)
   FUSION_MODEL        -> Fusion checkpoint (e.g. ktoan911/fact-check-fusion-model)
   RETRIEVER_MODEL     -> Retriever embedding model (e.g. AITeamVN/Vietnamese_Embedding)
 """
@@ -41,7 +41,7 @@ from src.utils import normalize_text
 # ---------------------------------------------------------------------------
 # Env-var defaults (mirrors .env / fusion_inference.py convention)
 # ---------------------------------------------------------------------------
-_DEFAULT_LLM_MODEL = os.getenv("LLM_FINETUNE", "ktoan911/fact-check-Qwen3-4B-finetune")
+_DEFAULT_LLM_MODEL = os.getenv("LLM_FINETUNE", "ktoan911/Qwen3-4B-factcheck-finetune")
 _DEFAULT_FUSION_MODEL = os.getenv("FUSION_MODEL", "ktoan911/fact-check-fusion-model")
 _DEFAULT_RETRIEVER_MODEL = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding")
 

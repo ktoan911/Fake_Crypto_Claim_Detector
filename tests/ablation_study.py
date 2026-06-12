@@ -15,7 +15,7 @@ Usage:
   python tests/ablation_study.py \\
       --csv data/test.csv \\
       --fusion_model ktoan911/fact-check-fusion-model \\
-      --lora_model  ktoan911/fact-check-Qwen3-4B-finetune \\
+      --lora_model  ktoan911/Qwen3-4B-factcheck-finetune \\
       [--limit 300] [--llm_batch_size 8] [--device cpu] [--output results/ablation.csv]
 """
 
@@ -47,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.config import LABEL_LIST, PROMPT_TEMPLATE
 from src.models.fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
 
-_DEFAULT_LLM_MODEL = os.getenv("LLM_FINETUNE", "ktoan911/fact-check-Qwen3-4B-finetune")
+_DEFAULT_LLM_MODEL = os.getenv("LLM_FINETUNE", "ktoan911/Qwen3-4B-factcheck-finetune")
 _DEFAULT_FUSION_MODEL = os.getenv("FUSION_MODEL", "ktoan911/fact-check-fusion-model")
 _DEFAULT_RETRIEVER_MODEL = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding")
 

@@ -120,7 +120,7 @@ def main():
 
     # Model paths
     parser.add_argument("--model_path",
-                        default=os.getenv("LORA_MODEL_PATH", "ktoan911/fact-check-Qwen3-4B-finetune"),
+                        default=os.getenv("LORA_MODEL_PATH", "ktoan911/Qwen3-4B-factcheck-finetune"),
                         help="LoRA model path/HF repo")
     parser.add_argument("--retriever_model",
                         default=os.getenv("RETRIEVER_MODEL_PATH", "AITeamVN/Vietnamese_Embedding"),
