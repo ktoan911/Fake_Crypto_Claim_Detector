@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from dotenv import load_dotenv
+from loguru import logger
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
@@ -26,23 +27,24 @@ class SearchHit:
 class OpenSearchKB:
     def __init__(
         self,
-        host: str = os.getenv("OP_HOST"),
-        port: int = int(os.getenv("OP_PORT")),
-        auth: Tuple[str, str] = (
-            os.getenv("OP_AUTH_USERNAME"),
-            os.getenv("OP_AUTH_PASSWORD"),
-        ),
-        index_name: str = os.getenv("OP_KB_NAME"),
-        embedding_dim: int = int(os.getenv("OP_EMBEDDING_DIM")),
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        auth: Optional[Tuple[str, str]] = None,
+        index_name: Optional[str] = None,
+        embedding_dim: Optional[int] = None,
         id_field_candidates: Sequence[str] = ("_id", "id"),
     ):
-        self.index = index_name
-        self.embedding_dim = embedding_dim
+        self.index = index_name or os.getenv("OP_KB_NAME")
+        self.embedding_dim = embedding_dim or int(os.getenv("OP_EMBEDDING_DIM", "768"))
         self.id_field_candidates = tuple(id_field_candidates)
 
+        _host = host or os.getenv("OP_HOST")
+        _port = port or int(os.getenv("OP_PORT", "9200"))
+        _auth = auth or (os.getenv("OP_AUTH_USERNAME"), os.getenv("OP_AUTH_PASSWORD"))
+
         self.client = OpenSearch(
-            hosts=[{"host": host, "port": port, "scheme": "https"}],
-            http_auth=auth,
+            hosts=[{"host": _host, "port": _port, "scheme": "https"}],
+            http_auth=_auth,
             verify_certs=True,
             http_compress=True,
             timeout=60,
@@ -387,14 +389,13 @@ class OpenSearchKB:
         with self._count_lock:
             if self._count_cache is not None and now - self._count_cache_ts < self._count_cache_ttl:
                 return self._count_cache
-        try:
-            count = int(self.client.count(index=self.index).get("count", 0))
-        except Exception:
-            count = self._count_cache or 0
-        with self._count_lock:
+            try:
+                count = int(self.client.count(index=self.index).get("count", 0))
+            except Exception:
+                count = self._count_cache or 0
             self._count_cache = count
             self._count_cache_ts = time.monotonic()
-        return count
+            return count
 
     def search_vector(
         self,
@@ -458,8 +459,11 @@ class OpenSearchKB:
                 )
                 for h in hits
             ]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                f"[opensearch] kNN query failed (falling back to script_score): {exc}",
+                exc_info=True,
+            )
 
         # Fallback: exact script_score (old index without HNSW mapping).
         script_body: JsonDict = {

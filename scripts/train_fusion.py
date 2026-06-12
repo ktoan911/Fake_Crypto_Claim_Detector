@@ -8,6 +8,8 @@ import argparse
 import os
 import sys
 
+import torch
+
 # Ensure project root is in PYTHONPATH
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -20,6 +22,16 @@ from src.training.fusion_trainer import (
 )
 from src.utils import normalize_text
 
+
+def _add_doc_if_new(unique_docs: dict, text: str, timestamp, source: str) -> None:
+    text = text.strip()
+    if not text or len(text) <= 10:
+        return
+    key = normalize_text(text)
+    if key not in unique_docs:
+        unique_docs[key] = {"text": text, "timestamp": timestamp, "source": source}
+    elif timestamp is not None and unique_docs[key]["timestamp"] is None:
+        unique_docs[key]["timestamp"] = timestamp
 
 
 def main():
@@ -50,10 +62,7 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda"
-        if os.getenv("CUDA_VISIBLE_DEVICES")
-        or os.system("nvidia-smi > /dev/null 2>&1") == 0
-        else "cpu",
+        default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to use (cuda/cpu)",
     )
     parser.add_argument(
@@ -119,25 +128,10 @@ def main():
                             timestamp = datetime.now(timezone.utc)
 
                     parts.append(content)
-
-                    if content.strip() and len(content.strip()) > 10:
-                        norm_key = normalize_text(content.strip())
-                        if norm_key not in unique_docs:
-                            unique_docs[norm_key] = {
-                                "text": content.strip(),
-                                "timestamp": timestamp,
-                                "source": "json",
-                            }
+                    _add_doc_if_new(unique_docs, content, timestamp, "json")
                 elif isinstance(ev, str):
                     parts.append(ev)
-                    if ev.strip() and len(ev.strip()) > 10:
-                        norm_key = normalize_text(ev.strip())
-                        if norm_key not in unique_docs:
-                            unique_docs[norm_key] = {
-                                "text": ev.strip(),
-                                "timestamp": None,
-                                "source": "json",
-                            }
+                    _add_doc_if_new(unique_docs, ev, None, "json")
 
             evidence_str = "|||".join(parts)
             df_rows.append({"text": claim, "label": label, "evidence": evidence_str})
@@ -158,22 +152,7 @@ def main():
             articles = evidence_str.split("|||")
 
             for article in articles:
-                article = article.strip()
-                if len(article) > 10:
-                    norm_key = normalize_text(article)
-
-                    if norm_key not in unique_docs:
-                        unique_docs[norm_key] = {
-                            "text": article,
-                            "timestamp": ts,
-                            "source": "csv",
-                        }
-                    else:
-                        if (
-                            ts is not None
-                            and unique_docs[norm_key]["timestamp"] is None
-                        ):
-                            unique_docs[norm_key]["timestamp"] = ts
+                _add_doc_if_new(unique_docs, article, ts, "csv")
 
     logger.info(f"Labeled data: {len(labeled_df)} samples")
     kb_docs = list(unique_docs.values())

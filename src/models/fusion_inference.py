@@ -4,6 +4,7 @@ import gc
 import hashlib
 import os
 import re
+import concurrent.futures
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,6 +18,12 @@ from src.config import LABEL_LIST, PROMPT_TEMPLATE
 from src.database.opensearch import OpenSearchKB
 from src.llm_call import split_claim
 from src.retrieval.retrieval import QueryExpander, RetrievalResult, TemporalScorer
+
+_URL_KEYS: Tuple[str, ...] = ("article_url", "url", "link", "source_url")
+
+
+def _extract_url(meta: Dict[str, Any]) -> str:
+    return next((str(meta[k]).strip() for k in _URL_KEYS if meta.get(k)), "")
 
 
 def _resolve_fusion_model_path(path_or_repo: str, filename: str = "acf_fusion_model.pt") -> str:
@@ -516,7 +523,9 @@ class FusionClaimVerifier:
             requested = "cpu"
         self.device = requested
         self.checkpoint = torch.load(
-            fusion_model_path, map_location=torch.device("cpu")
+            fusion_model_path,
+            map_location=torch.device("cpu"),
+            weights_only=True,
         )
         self.saved_config = self.checkpoint.get("config", {})
         fusion_state = self.checkpoint.get("fusion", {})
@@ -576,6 +585,7 @@ class FusionClaimVerifier:
         self.interaction_dim = int(self.saved_config.get("interaction_dim", 0))
         self.nli_model_name: Optional[str] = self.saved_config.get("nli_model") or None
         self._nli_scorer = None  # lazy-loaded on first predict call
+        self._nli_lock = threading.Lock()
         # Số doc tối đa đưa vào NLI — đủ để lấy signal, không cần tất cả top_k.
         # Giảm từ top_k (10) xuống 5 cắt ~50% NLI time, accuracy giảm không đáng kể.
         self._nli_top_k = int(os.getenv("NLI_EVIDENCE_TOP_K", str(min(5, self.top_k))))
@@ -655,6 +665,7 @@ class FusionClaimVerifier:
             rrf_k=rrf_k,
             device=self.device,
         )
+        self._log_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
     # ------------------------------------------------------------------
     # Warmup
@@ -699,18 +710,21 @@ class FusionClaimVerifier:
     def _ensure_nli_loaded(self) -> None:
         if self._nli_scorer is not None or not self.nli_model_name:
             return
-        from src.models.nli_scorer import NLIScorer
-        # NLI_MAX_LENGTH: attention complexity is O(n²) — 256 vs 512 = 4x less compute.
-        # Evidence relevant to fact-checking is almost always in the first ~200 tokens.
-        nli_max_length = int(os.getenv("NLI_MAX_LENGTH", "256"))
-        # NLI_DEVICE defaults to CPU to avoid competing with LLM for VRAM.
-        # On a 6 GB GPU, LLM alone needs ~3 GB + activations; adding DeBERTa causes OOM.
-        nli_device = os.getenv("NLI_DEVICE", "cpu")
-        self._nli_scorer = NLIScorer(
-            model_name=self.nli_model_name,
-            device=nli_device,
-            max_length=nli_max_length,
-        ).load()
+        with self._nli_lock:
+            if self._nli_scorer is not None:
+                return
+            from src.models.nli_scorer import NLIScorer
+            # NLI_MAX_LENGTH: attention complexity is O(n²) — 256 vs 512 = 4x less compute.
+            # Evidence relevant to fact-checking is almost always in the first ~200 tokens.
+            nli_max_length = int(os.getenv("NLI_MAX_LENGTH", "256"))
+            # NLI_DEVICE defaults to CPU to avoid competing with LLM for VRAM.
+            # On a 6 GB GPU, LLM alone needs ~3 GB + activations; adding DeBERTa causes OOM.
+            nli_device = os.getenv("NLI_DEVICE", "cpu")
+            self._nli_scorer = NLIScorer(
+                model_name=self.nli_model_name,
+                device=nli_device,
+                max_length=nli_max_length,
+            ).load()
 
     def _nli_for_claim(
         self, claim: str, results: List[RetrievalResult]
@@ -921,20 +935,17 @@ class FusionClaimVerifier:
         if not predictions:
             return
 
-        threading.Thread(
-            target=self._log_claims_to_opensearch,
-            args=(
-                [
-                    {
-                        "claim": p.claim,
-                        "verdict": p.verdict,
-                        "checked_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    for p in predictions
-                ],
-            ),
-            daemon=True,
-        ).start()
+        self._log_executor.submit(
+            self._log_claims_to_opensearch,
+            [
+                {
+                    "claim": p.claim,
+                    "verdict": p.verdict,
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                }
+                for p in predictions
+            ],
+        )
 
     def _predict_batch_without_split(self, claims: List[str]) -> List[ClaimPrediction]:
         t0 = perf_counter()
@@ -988,18 +999,19 @@ class FusionClaimVerifier:
                         f"[fusion_inference] batch_encode | n={len(batch_texts_list)}"
                         f" | elapsed_ms={1000.0*(t_benc1-t_benc0):.1f}"
                     )
-                vec_map: dict[str, List[float]] = dict(zip(batch_texts_list, batch_vectors))
+                vec_map: dict[int, List[float]] = {i: vec for i, vec in enumerate(batch_vectors)}
 
                 all_retrieval_interactions = []
 
                 def _retrieve_one(
                     item: Tuple[int, str],
+                    batch_pos: int,
                 ) -> Tuple[int, str, Any, Any, List[str], List[str], List[RetrievalResult]]:
                     _idx, _text = item
                     _t0 = perf_counter()
                     _feat, _interaction, _evidence, _results = _build_retrieval_features_train_compatible(
                         self.retriever, _text, self.top_k,
-                        precomputed_vector=vec_map.get(_text),
+                        precomputed_vector=vec_map.get(batch_pos),
                         score_features=self.score_features,
                     )
                     if self.debug:
@@ -1010,21 +1022,15 @@ class FusionClaimVerifier:
                     _links: List[str] = []
                     for _r in _results[: self.llm_evidence_top_k]:
                         _meta = _r.metadata or {}
-                        _url = str(
-                            _meta.get("article_url")
-                            or _meta.get("url")
-                            or _meta.get("link")
-                            or _meta.get("source_url")
-                            or ""
-                        ).strip()
+                        _url = _extract_url(_meta)
                         if _url and _url not in _links:
                             _links.append(_url)
                     return _idx, _text, _feat, _interaction, _evidence[: self.llm_evidence_top_k], _links, _results
 
                 t_retrieve_all0 = perf_counter()
                 retrieved: dict[int, Tuple] = {}
-                for item in batch:
-                    r_idx, r_text, r_feat, r_int, r_ev, r_links, r_results = _retrieve_one(item)
+                for batch_pos, item in enumerate(batch):
+                    r_idx, r_text, r_feat, r_int, r_ev, r_links, r_results = _retrieve_one(item, batch_pos)
                     retrieved[r_idx] = (r_text, r_feat, r_int, r_ev, r_links, r_results)
                 t_retrieve_all1 = perf_counter()
                 if self.debug:
@@ -1227,15 +1233,7 @@ class FusionClaimVerifier:
                     age_s = (now_utc - ts).total_seconds()
                     meta = r.metadata or {}
                     title = _truncate(str(meta.get("title") or ""), 120)
-                    url = _truncate(
-                        str(
-                            meta.get("url")
-                            or meta.get("link")
-                            or meta.get("source_url")
-                            or ""
-                        ),
-                        200,
-                    )
+                    url = _truncate(_extract_url(meta), 200)
                     source_name = str(meta.get("source") or meta.get("type") or "")
                     logger.info(
                         "[fusion_inference] retrieved"
@@ -1383,14 +1381,7 @@ class FusionClaimVerifier:
         source_links = []
         for r in retrieval_results[: self.llm_evidence_top_k]:
             meta = r.metadata or {}
-            # Ưu tiên article_url
-            url = str(
-                meta.get("article_url")
-                or meta.get("url")
-                or meta.get("link")
-                or meta.get("source_url")
-                or ""
-            ).strip()
+            url = _extract_url(meta)
             logger.info(
                 f"[fusion_inference:predict] link_debug | url={url} | article_url={meta.get('article_url')} | url={meta.get('url')} | link={meta.get('link')} | source_url={meta.get('source_url')} | all_meta_keys={list(meta.keys())}"
             )
@@ -1503,6 +1494,55 @@ class FusionClaimVerifier:
 
 
 _VERIFIER_CACHE: Dict[str, FusionClaimVerifier] = {}
+_VERIFIER_LOCK = threading.Lock()
+
+
+def _get_or_create_verifier(
+    fusion_model_path: Optional[str],
+    opensearch_index: Optional[str],
+    llm_model_path: Optional[str],
+    retriever_model_path: Optional[str],
+    device: Optional[str],
+    llm_evidence_top_k: Optional[int],
+    effective_debug: bool,
+    use_cache: bool,
+) -> FusionClaimVerifier:
+    cache_key = "|".join([
+        fusion_model_path or "",
+        opensearch_index or "",
+        llm_model_path or "",
+        retriever_model_path or "",
+        device or "",
+        str(llm_evidence_top_k or ""),
+        f"debug={int(effective_debug)}",
+    ])
+    resolved_fusion_path = _resolve_fusion_model_path(
+        fusion_model_path or os.getenv("FUSION_MODEL")
+    )
+    resolved_llm_path = llm_model_path or os.getenv("LLM_FINETUNE")
+    logger.info(f"resolved_fusion_path: {resolved_fusion_path}")
+    logger.info(f"resolved_llm_path: {resolved_llm_path}")
+    logger.info(f"opensearch_index: {opensearch_index}")
+    logger.info(f"retriever_model_path: {retriever_model_path}")
+    logger.info(f"device: {device}")
+    logger.info(f"use_cache: {use_cache}")
+    verifier = _VERIFIER_CACHE.get(cache_key) if use_cache else None
+    if verifier is None:
+        with _VERIFIER_LOCK:
+            verifier = _VERIFIER_CACHE.get(cache_key)
+            if verifier is None:
+                verifier = FusionClaimVerifier(
+                    fusion_model_path=resolved_fusion_path,
+                    opensearch_index=opensearch_index,
+                    llm_model_path=resolved_llm_path,
+                    retriever_model_path=retriever_model_path,
+                    device=device,
+                    llm_evidence_top_k=llm_evidence_top_k,
+                    debug=effective_debug,
+                )
+                if use_cache:
+                    _VERIFIER_CACHE[cache_key] = verifier
+    return verifier
 
 
 def verify_claim_true_false(
@@ -1526,52 +1566,13 @@ def verify_claim_true_false(
         if debug is None
         else bool(debug)
     )
-
     logger.info(f"fusion_model_path: {fusion_model_path}")
-
-    cache_key = "|".join(
-        [
-            fusion_model_path or "",
-            opensearch_index or "",
-            llm_model_path or "",
-            retriever_model_path or "",
-            device or "",
-            str(llm_evidence_top_k or ""),
-            f"debug={int(effective_debug)}",
-        ]
+    verifier = _get_or_create_verifier(
+        fusion_model_path, opensearch_index, llm_model_path,
+        retriever_model_path, device, llm_evidence_top_k,
+        effective_debug, use_cache,
     )
-
-    # Resolve fusion model: env FUSION_MODEL overrides default local path
-    resolved_fusion_path = _resolve_fusion_model_path(os.getenv("FUSION_MODEL"))
-    # Resolve LLM: env LLM_FINETUNE overrides saved config
-    resolved_llm_path = llm_model_path or os.getenv("LLM_FINETUNE")
-
-    logger.info(f"resolved_fusion_path: {resolved_fusion_path}")
-    logger.info(f"resolved_llm_path: {resolved_llm_path}")
-    logger.info(f"opensearch_index: {opensearch_index}")
-    logger.info(f"retriever_model_path: {retriever_model_path}")
-    logger.info(f"device: {device}")
-    logger.info(f"use_cache: {use_cache}")
-
-    verifier = None
-    if use_cache:
-        verifier = _VERIFIER_CACHE.get(cache_key)
-
-    if verifier is None:
-        verifier = FusionClaimVerifier(
-            fusion_model_path=resolved_fusion_path,
-            opensearch_index=opensearch_index,
-            llm_model_path=resolved_llm_path,
-            retriever_model_path=retriever_model_path,
-            device=device,
-            llm_evidence_top_k=llm_evidence_top_k,
-            debug=effective_debug,
-        )
-        if use_cache:
-            _VERIFIER_CACHE[cache_key] = verifier
-
-    prediction = verifier.predict(claim)
-    return prediction.verdict
+    return verifier.predict(claim).verdict
 
 
 def verify_claims_true_false(
@@ -1596,49 +1597,11 @@ def verify_claims_true_false(
         if debug is None
         else bool(debug)
     )
-    cache_key = "|".join(
-        [
-            fusion_model_path or "",
-            opensearch_index or "",
-            llm_model_path or "",
-            retriever_model_path or "",
-            device or "",
-            str(llm_evidence_top_k or ""),
-            f"debug={int(effective_debug)}",
-        ]
+    verifier = _get_or_create_verifier(
+        fusion_model_path, opensearch_index, llm_model_path,
+        retriever_model_path, device, llm_evidence_top_k,
+        effective_debug, use_cache,
     )
-
-    # Resolve fusion model: env FUSION_MODEL overrides default local path
-    resolved_fusion_path = _resolve_fusion_model_path(
-        fusion_model_path or os.getenv("FUSION_MODEL")
-    )
-    # Resolve LLM: env LLM_FINETUNE overrides saved config
-    resolved_llm_path = llm_model_path or os.getenv("LLM_FINETUNE")
-
-    logger.info(f"resolved_fusion_path: {resolved_fusion_path}")
-    logger.info(f"resolved_llm_path: {resolved_llm_path}")
-    logger.info(f"opensearch_index: {opensearch_index}")
-    logger.info(f"retriever_model_path: {retriever_model_path}")
-    logger.info(f"device: {device}")
-    logger.info(f"use_cache: {use_cache}")
-
-    verifier = None
-    if use_cache:
-        verifier = _VERIFIER_CACHE.get(cache_key)
-
-    if verifier is None:
-        verifier = FusionClaimVerifier(
-            fusion_model_path=resolved_fusion_path,
-            opensearch_index=opensearch_index,
-            llm_model_path=resolved_llm_path,
-            retriever_model_path=retriever_model_path,
-            device=device,
-            llm_evidence_top_k=llm_evidence_top_k,
-            debug=effective_debug,
-        )
-        if use_cache:
-            _VERIFIER_CACHE[cache_key] = verifier
-
     all_verdicts = []
     for i in range(0, len(claims), batch_size):
         if effective_debug:

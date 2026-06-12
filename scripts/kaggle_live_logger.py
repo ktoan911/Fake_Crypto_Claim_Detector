@@ -5,8 +5,10 @@ Không dùng Painless script — chỉ dùng doc update với full content.
 """
 
 import os
+import queue
 import sys
 import threading
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -84,10 +86,30 @@ else:
 
     class _LiveLogger:
         def __init__(self):
-            self._line_buf = ""   # buffer dòng chưa kết thúc
-            self._content = ""    # full content đã tích lũy
-            self._pending = 0     # số dòng chưa flush
+            self._line_buf = ""                           # buffer dòng chưa kết thúc
+            self._lines: deque[str] = deque(maxlen=2000)  # ring buffer
+            self._pending = 0                             # số dòng chưa flush
             self._lock = threading.Lock()
+            self._flush_queue: queue.Queue[str] = queue.Queue()
+            threading.Thread(target=self._flush_worker, daemon=True).start()
+
+        def _flush_worker(self) -> None:
+            """Single background thread — consumes flush snapshots one at a time."""
+            while True:
+                snap = self._flush_queue.get()
+                try:
+                    _client.update(
+                        index=_INDEX,
+                        id=DOC_ID,
+                        body={"doc": {"content": snap}},
+                    )
+                except Exception as e:
+                    sys.__stdout__.write(f"[live_logger] flush failed: {e}\n")
+                finally:
+                    self._flush_queue.task_done()
+
+        def _fire_flush(self, content_snapshot: str) -> None:
+            self._flush_queue.put(content_snapshot)
 
         def write(self, msg: str):
             sys.__stdout__.write(msg)
@@ -96,30 +118,17 @@ else:
                 while "\n" in self._line_buf:
                     line, self._line_buf = self._line_buf.split("\n", 1)
                     if line.strip():
-                        self._content += line + "\n"
+                        self._lines.append(line)
                         self._pending += 1
                         if self._pending >= _FLUSH_EVERY:
-                            self._fire_flush(self._content)
+                            self._fire_flush("\n".join(self._lines) + "\n")
                             self._pending = 0
-
-        def _fire_flush(self, content_snapshot: str):
-            """Fire-and-forget: chạy flush trong daemon thread, không block main thread."""
-            def _do():
-                try:
-                    _client.update(
-                        index=_INDEX,
-                        id=DOC_ID,
-                        body={"doc": {"content": content_snapshot}},
-                    )
-                except Exception as e:
-                    sys.__stdout__.write(f"[live_logger] flush failed: {e}\n")
-            threading.Thread(target=_do, daemon=True).start()
 
         def flush(self):
             sys.__stdout__.flush()
             with self._lock:
                 if self._pending > 0:
-                    self._fire_flush(self._content)
+                    self._fire_flush("\n".join(self._lines) + "\n")
                     self._pending = 0
 
         def isatty(self):

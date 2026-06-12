@@ -8,6 +8,7 @@ from typing import List
 
 import pytz
 from dotenv import load_dotenv
+from loguru import logger
 from together import Together
 from together import error as together_error
 
@@ -18,6 +19,7 @@ load_dotenv()
 # together.APITimeoutError. Đặt timeout tường minh, dài hơn default.
 _TOGETHER_TIMEOUT = float(os.getenv("TOGETHER_TIMEOUT", "120"))
 _TOGETHER_MAX_RETRIES = int(os.getenv("TOGETHER_MAX_RETRIES", "3"))
+_MAX_TOTAL_RETRY_SLEEP = float(os.getenv("TOGETHER_MAX_RETRY_SLEEP", "10"))
 
 client = Together(
     timeout=_TOGETHER_TIMEOUT,
@@ -29,6 +31,14 @@ _RETRYABLE_ERRORS = (
     together_error.APIConnectionError,
     together_error.RateLimitError,
 )
+
+_INJECTION_TOKENS = ["</s>", "<|im_start|>", "<|im_end|>", "<|endoftext|>"]
+
+
+def _sanitize(text: str) -> str:
+    for tok in _INJECTION_TOKENS:
+        text = text.replace(tok, "")
+    return text[:2000]
 
 
 class _StreamedMessage:
@@ -61,6 +71,7 @@ def _chat_completion_with_retry(**kwargs):
     được raise ngay để không che lỗi cấu hình.
     Nếu model yêu cầu streaming, tự động retry với stream=True và gộp chunks."""
     last_err = None
+    total_slept = 0.0
     for attempt in range(_TOGETHER_MAX_RETRIES):
         try:
             return client.chat.completions.create(**kwargs)
@@ -74,14 +85,17 @@ def _chat_completion_with_retry(**kwargs):
             last_err = e
             if attempt == _TOGETHER_MAX_RETRIES - 1:
                 break
-            # Exponential backoff + jitter: 2s, 4s, 8s ...
-            sleep_s = (2**attempt) + random.uniform(0, 1)
-            print(
-                f"[WARN] Together API {type(e).__name__} "
+            remaining = _MAX_TOTAL_RETRY_SLEEP - total_slept
+            if remaining <= 0:
+                break
+            sleep_s = min((2 ** attempt) + random.uniform(0, 0.5), remaining)
+            logger.warning(
+                f"Together API {type(e).__name__} "
                 f"(attempt {attempt + 1}/{_TOGETHER_MAX_RETRIES}), "
                 f"retry sau {sleep_s:.1f}s"
             )
             time.sleep(sleep_s)
+            total_slept += sleep_s
     raise last_err
 
 
@@ -111,6 +125,7 @@ SYSTEM_PROMPT_RUMOR_GENERATION = "Bạn là hệ thống tạo tin đồn tài c
 
 
 def build_prompt_extraction(claim: str) -> str:
+    claim = _sanitize(claim)
     tz = pytz.timezone("Asia/Ho_Chi_Minh")
     today = datetime.now(tz).strftime("%Y-%m-%d")
 
@@ -180,9 +195,10 @@ _CLUSTER_SUMMARY_MAX_CLAIMS = int(os.getenv("CLUSTER_SUMMARY_MAX_CLAIMS", "30"))
 
 
 def build_prompt_summary_cluster(claims, centroid):
+    centroid = _sanitize(str(centroid))
     if len(claims) > _CLUSTER_SUMMARY_MAX_CLAIMS:
         claims = claims[:_CLUSTER_SUMMARY_MAX_CLAIMS]
-    claims_text = "\n".join([f"- {c}" for c in claims])
+    claims_text = "\n".join([f"- {_sanitize(str(c))}" for c in claims])
 
     return f"""
 Bạn là hệ thống tóm tắt chủ đề.
@@ -211,8 +227,8 @@ def build_prompt_generate_rumors_from_news(news_items, target_count=50):
     news_text = []
     for idx, item in enumerate(news_items, start=1):
         source_ref = item.get("source_ref") or idx
-        title = str(item.get("title") or "")[:220]
-        content = str(item.get("content") or item.get("description") or "")[:700]
+        title = _sanitize(str(item.get("title") or ""))[:220]
+        content = _sanitize(str(item.get("content") or item.get("description") or ""))[:700]
         news_text.append(f"[{source_ref}] {title}\n{content}")
 
     return f"""
@@ -266,8 +282,8 @@ def generate_cluster_content_with_llm(
     except _RETRYABLE_ERRORS as e:
         # Sau khi đã retry vẫn timeout/connect lỗi → fallback dùng representative
         # claim làm topic thay vì để cả pipeline cluster crash.
-        print(
-            f"[ERROR] generate_cluster_content_with_llm fallback do {type(e).__name__}: {e}"
+        logger.error(
+            f"generate_cluster_content_with_llm fallback do {type(e).__name__}: {e}"
         )
         return representative_claim
 
@@ -318,14 +334,14 @@ def safe_parse_list(text: str) -> List[str]:
 
 def _should_skip_split(text: str) -> bool:
     """Tránh gọi LLM cho input ngắn / không có dấu hiệu nhiều fact."""
-    tmp_text = text.strip()
-    if len(tmp_text) < 30:
+    text = text.strip()
+    if len(text) < 30:
         return True
     # Bắt đầu bằng số thứ tự ("1. ", "2) ") + ngắn → 1 mục trong list, không phải multi-claim
-    if re.match(r"^\s*\d+[\.\)]\s", tmp_text) and len(tmp_text) < 120:
+    if re.match(r"^\s*\d+[\.\)]\s", text) and len(text) < 120:
         return True
     # Không có dấu chấm câu kết và ngắn → có khả năng là cụm từ đơn lẻ
-    if len(tmp_text) < 80 and not re.search(r"[\n]", tmp_text):
+    if len(text) < 80 and "\n" not in text:
         return True
     return False
 
@@ -359,14 +375,14 @@ def split_claim(claim: str) -> List[str]:
             if result:
                 return result
 
-            print(
-                f"[WARN] Retry {attempt + 1}: format lỗi — raw response: "
+            logger.warning(
+                f"Retry {attempt + 1}: format lỗi — raw response: "
                 f"{output_text[:200]!r}"
             )
 
-        print("[ERROR] LLM split failed after 3 attempts, fallback to original claim")
+        logger.error("LLM split failed after 3 attempts, fallback to original claim")
         return [text]
 
     except Exception as e:
-        print(f"[ERROR] split_claim exception: {e}, fallback to original claim")
+        logger.error(f"split_claim exception: {e}, fallback to original claim")
         return [text]

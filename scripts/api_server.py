@@ -5,10 +5,11 @@ import os
 import sys
 import threading
 import time
+import traceback
 
 # Phải set trước khi import torch để có hiệu lực.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
@@ -63,8 +64,8 @@ _inference_executor: ThreadPoolExecutor | None = None
 _CRAWL_LOGS_INDEX = "crawl_logs"
 
 # ── Server log (in-memory ring buffer) ───────────────────────────────────────
-_server_log_buf: list[str] = []
 _SERVER_LOG_MAX = 500
+_server_log_buf: deque[str] = deque(maxlen=_SERVER_LOG_MAX)
 
 _inference_timeout_s = float(os.getenv("INFERENCE_TIMEOUT_S", "300"))
 _max_claim_chars = int(os.getenv("MAX_CLAIM_CHARS", "0"))
@@ -76,8 +77,6 @@ def _server_log_sink(message) -> None:
     line = str(message).rstrip("\n")
     if line.strip():
         _server_log_buf.append(line)
-        if len(_server_log_buf) > _SERVER_LOG_MAX:
-            del _server_log_buf[0]
 
 
 def _setup_server_log() -> None:
@@ -90,8 +89,6 @@ def _setup_server_log() -> None:
             ts = datetime.now().strftime("%H:%M:%S")
             line = f"{ts} - {record.levelname} - {record.getMessage()}"
             _server_log_buf.append(line)
-            if len(_server_log_buf) > _SERVER_LOG_MAX:
-                del _server_log_buf[0]
 
     _sink = _StdlibSink()
     for name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
@@ -156,9 +153,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Fake Claim Detector API", lifespan=lifespan)
 
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -253,11 +251,14 @@ async def verify_claim(request: ClaimRequest, http_request: Request):
     t_api_start = time.perf_counter()
 
     if _verifier is None:
-        return {
-            "verdict": "Lỗi xử lý",
-            "status": "error",
-            "error": "Verifier chưa được khởi tạo (xem log startup để biết lý do).",
-        }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "verdict": "Lỗi xử lý",
+                "status": "error",
+                "error": "Verifier chưa được khởi tạo (xem log startup để biết lý do).",
+            },
+        )
 
     claim_text = (request.claim or "").strip()
     if not claim_text:
@@ -337,20 +338,16 @@ async def verify_claim(request: ClaimRequest, http_request: Request):
                 "error": f"Inference quá {_inference_timeout_s}s — vui lòng thử lại.",
             },
         )
-    except Exception as e:
-        import traceback
-        error_traceback = traceback.format_exc()
-        logger.error(f"[verify] error: {error_traceback}")
-        return {
-            "verdict": "Lỗi xử lý",
-            "status": "error",
-            "error": str(e),
-            "traceback": error_traceback,
-        }
+    except Exception:
+        logger.error(f"[verify] error: {traceback.format_exc()}")
+        return JSONResponse(
+            status_code=500,
+            content={"verdict": "Lỗi xử lý", "status": "error", "error": "Lỗi máy chủ nội bộ."},
+        )
 
 
 @app.get("/claims/stats")
-async def claims_stats(date: str = None):
+async def claims_stats(date: str | None = None):
     """
     Đọc dữ liệu dashboard thống kê từ index 'stats'.
     - Input: `date` định dạng YYYY-MM-DD. Nếu không cung cấp, trả về bản ghi
@@ -425,24 +422,30 @@ async def claims_stats(date: str = None):
 # ── Kaggle notebook log endpoints ─────────────────────────────────────────────
 
 
-def _kg_os_client():
-    """OpenSearch client dùng chung với phần còn lại của project."""
-    from opensearchpy import OpenSearch, RequestsHttpConnection
+_kaggle_os_client = None
 
-    return OpenSearch(
-        hosts=[
-            {
-                "host": os.getenv("OP_HOST"),
-                "port": int(os.getenv("OP_PORT")),
-                "scheme": "https",
-            }
-        ],
-        http_auth=(os.getenv("OP_AUTH_USERNAME"), os.getenv("OP_AUTH_PASSWORD")),
-        verify_certs=True,
-        http_compress=True,
-        timeout=10,
-        connection_class=RequestsHttpConnection,
-    )
+
+def _kg_os_client():
+    """OpenSearch client — lazy singleton, created once and reused."""
+    global _kaggle_os_client
+    if _kaggle_os_client is None:
+        from opensearchpy import OpenSearch, RequestsHttpConnection
+
+        _kaggle_os_client = OpenSearch(
+            hosts=[
+                {
+                    "host": os.getenv("OP_HOST"),
+                    "port": int(os.getenv("OP_PORT", "9200")),
+                    "scheme": "https",
+                }
+            ],
+            http_auth=(os.getenv("OP_AUTH_USERNAME"), os.getenv("OP_AUTH_PASSWORD")),
+            verify_certs=True,
+            http_compress=True,
+            timeout=10,
+            connection_class=RequestsHttpConnection,
+        )
+    return _kaggle_os_client
 
 
 def _kg_get_doc_sync(doc_id: str | None) -> dict | None:

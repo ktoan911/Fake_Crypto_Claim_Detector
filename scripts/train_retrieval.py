@@ -95,18 +95,18 @@ def load_finfact_dataset(csv_path: str):
     total_rows = len(df)
     logger.info(f"Parsing {total_rows} rows from CSV...")
 
-    for idx, (_, row) in enumerate(df.iterrows()):
-        claim = str(row["claim"]).strip()
+    for idx, row in enumerate(df.itertuples(index=False)):
+        claim = str(row.claim).strip()
         if not claim or claim.lower() == "nan":
             skipped += 1
             continue
 
-        if pd.isna(row["evidence"]):
+        if pd.isna(row.evidence):
             logger.debug(f"  Row {idx}: skipped (NaN evidence)")
             skipped += 1
             continue
 
-        evs = parse_evidence_list(row["evidence"])
+        evs = parse_evidence_list(row.evidence)
         if not evs:
             logger.debug(f"  Row {idx}: skipped (no valid evidence sentences)")
             skipped += 1
@@ -246,14 +246,15 @@ def main():
         num_negatives=args.num_negatives,
     )
 
+    _num_workers = min(4, os.cpu_count() or 1)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_triplets,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
+        num_workers=_num_workers,
+        pin_memory=(args.device == "cuda"),
+        persistent_workers=(_num_workers > 0),
     )
 
     # 4. Initialize trainer

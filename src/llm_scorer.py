@@ -95,8 +95,16 @@ class LLMScorer:
                         _cfg = _json.load(_f)
                     if isinstance(_cfg.get("extra_special_tokens"), list):
                         _cfg["extra_special_tokens"] = {}
-                        with open(_tcfg, "w") as _f:
-                            _json.dump(_cfg, _f, indent=2)
+                        import shutil, tempfile
+                        with tempfile.NamedTemporaryFile(
+                            "w",
+                            dir=os.path.dirname(_tcfg),
+                            delete=False,
+                            suffix=".json",
+                        ) as _tmp:
+                            _json.dump(_cfg, _tmp, indent=2)
+                            _tmp_path = _tmp.name
+                        shutil.move(_tmp_path, _tcfg)
                 except Exception:
                     pass
 
@@ -385,21 +393,16 @@ class LLMScorer:
             padded_attention_mask, dtype=torch.long, device=self.device
         )
 
+        label_ids = [self.label_token_ids[label] for label in self.labels]
+
         with torch.no_grad():
             outputs = self.model(input_ids=input_tensor, attention_mask=mask_tensor)
-            # outputs.logits: [batch, seq_len, vocab_size] — can be ~600MB for Qwen vocab.
-            # Extract pred_logits immediately then delete outputs to free RAM before
-            # the label extraction below.
             seq_lengths = mask_tensor.sum(dim=1)
-            batch_idx = torch.arange(input_tensor.size(0), device=self.device)
             pred_pos = seq_lengths - 1
-            pred_logits = outputs.logits[batch_idx, pred_pos, :].clone()  # [batch, vocab_size]
+            label_logits = outputs.logits[
+                torch.arange(input_tensor.size(0), device=self.device), pred_pos
+            ][:, label_ids].clone()  # [batch, num_labels] only
             del outputs, input_tensor, mask_tensor
-
-        # Extract logits only for label tokens
-        label_ids = [self.label_token_ids[label] for label in self.labels]
-        label_logits = torch.stack([pred_logits[:, idx] for idx in label_ids], dim=-1)
-        del pred_logits
 
         return label_logits  # [batch, num_labels] - RAW LOGITS
 

@@ -20,6 +20,9 @@ from typing import Dict, List
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from dotenv import load_dotenv
 
+from loguru import logger
+from opensearchpy.helpers import scan
+
 from src.database.opensearch import OpenSearchKB
 from src.llm_call import generate_cluster_content_with_llm
 
@@ -215,7 +218,7 @@ def cluster_claims(
             )
         except Exception as e:
             # Một cluster fail không được phép kéo cả pipeline xuống.
-            print(f"[ERROR] cluster {_cid} summarize failed: {e}, fallback rep claim")
+            logger.error(f"cluster {_cid} summarize failed: {e}, fallback rep claim")
             return _rep
 
     workers = max(1, min(llm_workers, len(prepared)))
@@ -259,29 +262,25 @@ def load_claims_from_opensearch(timestamp_seconds: int = 86400) -> List[str]:
     cutoff_time = (now_utc - timedelta(seconds=timestamp_seconds)).isoformat()
 
     try:
-        resp = client.search(
+        hits_iter = scan(
+            client,
             index=index,
-            body={
-                "size": 10000,
-                "query": {
-                    "bool": {
-                        "must": [{"range": {"checked_at": {"gte": cutoff_time}}}],
-                        "filter": [
-                            {"terms": {"verdict.keyword": ["Sai"]}}
-                        ],
-                    }
-                },
-                "_source": ["claim"],
+            query={
+                "bool": {
+                    "must": [{"range": {"checked_at": {"gte": cutoff_time}}}],
+                    "filter": [{"terms": {"verdict.keyword": ["Sai"]}}],
+                }
             },
+            _source=["claim"],
+            size=1000,
         )
-        hits = resp.get("hits", {}).get("hits", [])
         return [
-            h["_source"].get("claim")
-            for h in hits
-            if h.get("_source") and h["_source"].get("claim")
+            h["_source"]["claim"]
+            for h in hits_iter
+            if h.get("_source", {}).get("claim")
         ]
     except Exception as e:
-        print(f"Error querying OpenSearch: {e}")
+        logger.error(f"Error querying OpenSearch: {e}")
         return []
 
 
@@ -298,9 +297,9 @@ def run_clustering_pipeline(
     """
     claims = load_claims_from_opensearch(timestamp_seconds)
     if not claims:
-        print(f"No claims found in the last {timestamp_seconds} seconds.")
+        logger.info(f"No claims found in the last {timestamp_seconds} seconds.")
         return {"error": "No claims found", "clusters": []}
 
-    print(f"Đã lấy được {len(claims)} claim từ OpenSearch cho việc cluster claim.")
+    logger.info(f"Đã lấy được {len(claims)} claim từ OpenSearch cho việc cluster claim.")
 
     return cluster_claims(claims=claims, model_name=model_name)

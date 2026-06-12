@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import traceback
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
@@ -146,10 +147,15 @@ def calculate_and_save_stats(target_date: datetime = None):
         )
         daily_false[target_date_str] = stats_24h.get("sai", 0)
 
-        result_dict_cluster = run_clustering_pipeline(
-            timestamp_seconds=864000,
-            model_name="intfloat/multilingual-e5-base",
-        )
+        try:
+            result_dict_cluster = run_clustering_pipeline(
+                timestamp_seconds=864000,
+                model_name="intfloat/multilingual-e5-base",
+            )
+            clusters = result_dict_cluster.get("clusters", [])[:5]
+        except Exception as cluster_err:
+            logger.warning(f"Clustering failed, saving stats without cluster data: {cluster_err}")
+            clusters = []
 
         doc_id = target_date.strftime("%Y-%m-%d")
 
@@ -161,7 +167,7 @@ def calculate_and_save_stats(target_date: datetime = None):
             "stats_24h": stats_24h,
             "daily_total": daily_total,
             "daily_false": daily_false,
-            "cluster": result_dict_cluster.get("clusters", [])[:5],
+            "cluster": clusters,
         }
 
         # Lưu vào OpenSearch index stats qua insert_many() của OpenSearchKB
@@ -170,12 +176,9 @@ def calculate_and_save_stats(target_date: datetime = None):
             f"Successfully saved stats for {doc_id} to index '{stats_index}': {res}"
         )
 
-    except Exception as e:
-        logger.error(f"Error calculating stats:\n{e}")
-        import traceback
-
-        logger.error(traceback.format_exc())
-        raise e
+    except Exception:
+        logger.error(f"Error calculating stats:\n{traceback.format_exc()}")
+        raise
 
 
 if __name__ == "__main__":

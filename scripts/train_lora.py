@@ -104,9 +104,8 @@ def main():
     eval_evidences = dev_df["evidence"].tolist()
 
     output_dir = args.output or os.getenv("LORA_OUTPUT_DIR", "models/lora_llm")
-    default_model_name = LoRATrainingConfig().model_name
     lora_config = LoRATrainingConfig(
-        model_name=os.getenv("LLM_MODEL_NAME", default_model_name),
+        model_name=os.getenv("LLM_MODEL_NAME") or LoRATrainingConfig.__dataclass_fields__["model_name"].default,
         output_dir=output_dir,
         epochs=args.epochs or int(os.getenv("LORA_EPOCHS", "3")),
         batch_size=args.batch_size or int(os.getenv("LORA_BATCH_SIZE", "1")),

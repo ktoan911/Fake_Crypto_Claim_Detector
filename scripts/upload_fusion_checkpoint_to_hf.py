@@ -56,7 +56,7 @@ def _upload_with_hf_hub(
     from huggingface_hub import HfApi
 
     logger.info("hf CLI upload failed, retrying with huggingface_hub.HfApi...")
-    api = HfApi()
+    api = HfApi(token=os.getenv("HF_TOKEN"))
     api.upload_file(
         path_or_fileobj=local_file,
         path_in_repo=path_in_repo,

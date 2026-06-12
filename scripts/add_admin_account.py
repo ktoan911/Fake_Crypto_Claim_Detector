@@ -123,7 +123,7 @@ def cmd_delete(client: OpenSearch, username: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Quản lý tài khoản admin")
     parser.add_argument("--username", "-u", help="Tên đăng nhập")
-    parser.add_argument("--password", "-p", help="Mật khẩu (plain text, sẽ được hash)")
+    # --password/-p bị loại bỏ: CLI args hiện thị trong ps/shell history — dùng getpass thay thế.
     parser.add_argument("--list", "-l", action="store_true", help="Liệt kê tài khoản")
     parser.add_argument("--delete", "-d", metavar="USERNAME", help="Xoá tài khoản")
     args = parser.parse_args()
@@ -144,14 +144,11 @@ def main() -> None:
         print("Tên đăng nhập không được để trống.")
         sys.exit(1)
 
-    if args.password:
-        plain_password = args.password
-    else:
-        plain_password = getpass.getpass("Mật khẩu: ")
-        confirm = getpass.getpass("Nhập lại mật khẩu: ")
-        if plain_password != confirm:
-            print("Mật khẩu không khớp.")
-            sys.exit(1)
+    plain_password = getpass.getpass("Mật khẩu: ")
+    confirm = getpass.getpass("Nhập lại mật khẩu: ")
+    if plain_password != confirm:
+        print("Mật khẩu không khớp.")
+        sys.exit(1)
 
     if not plain_password:
         print("Mật khẩu không được để trống.")
