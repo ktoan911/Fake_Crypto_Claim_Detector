@@ -87,7 +87,7 @@ def calculate_metrics(y_true, y_pred, mode_name, label_list=LABEL_LIST):
     return metrics
 
 
-def _resolve_fusion_model_path(path_or_repo: str, filename: str = "model.pt") -> str:
+def _resolve_fusion_model_path(path_or_repo: str, filename: str = "acf_fusion_model_v2.pt") -> str:
     """
     Resolve a fusion model path — mirrors fusion_inference._resolve_fusion_model_path.
     Accepts a local .pt file path OR a HuggingFace repo id.
@@ -188,7 +188,7 @@ def main():
         type=str,
         default=_DEFAULT_FUSION_MODEL,
         help=(
-            "Path to Fusion checkpoint (.pt) or HF repo id containing model.pt. "
+            "Path to Fusion checkpoint (.pt) or HF repo id containing acf_fusion_model_v2.pt. "
             f"Default: {_DEFAULT_FUSION_MODEL!r} (from env FUSION_MODEL)"
         ),
     )
