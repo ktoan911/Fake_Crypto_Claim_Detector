@@ -474,6 +474,100 @@ def _crawl_get_doc_sync(doc_id: str | None) -> dict | None:
     return doc
 
 
+_CRAWL_INFO_INDEX = "crawl_info"
+
+
+def _source_display_name(url: str) -> str:
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+        host = parsed.netloc or parsed.path.split("/")[0]
+        if host.startswith("www."):
+            host = host[4:]
+        return host or url
+    except Exception:
+        return url
+
+
+def _crawl_info_sync(days: int) -> dict:
+    client = _crawl_client()
+    if not client.indices.exists(index=_CRAWL_INFO_INDEX):
+        return {"crawl_by_day": [], "per_source": []}
+
+    resp = client.search(
+        index=_CRAWL_INFO_INDEX,
+        body={
+            "size": days,
+            "sort": [{"crawled_at": {"order": "desc"}}],
+            "_source": ["crawled_at", "total_articles"],
+        },
+    )
+    crawl_by_day = [
+        {
+            "day": hit["_source"].get("crawled_at", "")[:10],
+            "total_crawl": hit["_source"].get("total_articles", 0),
+        }
+        for hit in resp["hits"]["hits"]
+    ]
+
+    agg_resp = client.search(
+        index=_CRAWL_INFO_INDEX,
+        body={
+            "size": 0,
+            "aggs": {
+                "sources": {
+                    "nested": {"path": "per_source"},
+                    "aggs": {
+                        "by_url": {
+                            "terms": {"field": "per_source.source_url", "size": 30},
+                            "aggs": {"total": {"sum": {"field": "per_source.count"}}},
+                        }
+                    },
+                }
+            },
+        },
+    )
+    buckets = (
+        agg_resp.get("aggregations", {})
+        .get("sources", {})
+        .get("by_url", {})
+        .get("buckets", [])
+    )
+    merged: dict[str, int] = {}
+    for b in buckets:
+        name = _source_display_name(b["key"])
+        merged[name] = merged.get(name, 0) + int(b["total"]["value"])
+    per_source = [
+        {"name": name, "value": total}
+        for name, total in sorted(merged.items(), key=lambda x: -x[1])
+    ]
+
+    return {"crawl_by_day": crawl_by_day, "per_source": per_source}
+
+
+@app.get("/crawler/info")
+async def get_crawler_info(days: int = 7):
+    """Thống kê từ index 'crawl_info': số bài theo ngày và phân bố nguồn crawl."""
+    from opensearchpy.exceptions import ConnectionError as OSConnectionError
+
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _crawl_info_sync, days)
+        return result
+    except OSConnectionError as e:
+        logger.warning(f"[crawler/info] OpenSearch unreachable: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"crawl_by_day": [], "per_source": [], "error": "OpenSearch unreachable"},
+        )
+    except Exception:
+        logger.error(f"[crawler/info] {traceback.format_exc()}")
+        return JSONResponse(
+            status_code=500,
+            content={"crawl_by_day": [], "per_source": []},
+        )
+
+
 @app.get("/crawler/logs")
 async def get_crawler_logs(doc_id: str | None = None):
     """Trả log run mới nhất (hoặc theo doc_id). Field `running` = status=="running"."""

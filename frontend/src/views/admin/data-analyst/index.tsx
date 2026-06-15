@@ -1,8 +1,13 @@
+"use client";
+
 import IntroAppPage from "@/src/components/IntroAppPage";
+import { useCrawlerInfo } from "@/src/hooks/useCrawlerInfo";
 import DonutChart from "./DonutChart";
 import LineChart from "./LineChart";
 
 export default function DataAnalyst() {
+  const { data, isLoading, isSuccess } = useCrawlerInfo(7);
+
   return (
     <div className="min-w-0">
       <IntroAppPage
@@ -11,10 +16,14 @@ export default function DataAnalyst() {
       ></IntroAppPage>
       <div className="mt-10 grid min-w-0 grid-cols-1 items-stretch gap-4 md:grid-cols-2">
         <div className="min-w-0 h-full">
-          <LineChart />
+          <LineChart data={data?.crawl_by_day} isLoading={isLoading} />
         </div>
         <div className="min-w-0 h-full">
-          <DonutChart />
+          <DonutChart
+            data={data?.per_source}
+            isLoading={isLoading}
+            isSuccess={isSuccess}
+          />
         </div>
       </div>
     </div>

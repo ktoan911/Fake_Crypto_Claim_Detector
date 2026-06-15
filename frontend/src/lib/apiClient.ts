@@ -64,6 +64,32 @@ export async function fetchClaimsStats(date?: string): Promise<ClaimsStats> {
     return res.json();
 }
 
+// ── Types matching api_server.py `/crawler/info` output ────────────────────
+
+export interface CrawlByDay {
+    day: string;
+    total_crawl: number;
+}
+
+export interface CrawlSourceItem {
+    name: string;
+    value: number;
+}
+
+export interface CrawlerInfo {
+    crawl_by_day: CrawlByDay[];
+    per_source: CrawlSourceItem[];
+}
+
+export async function fetchCrawlerInfo(days?: number): Promise<CrawlerInfo> {
+    const url = days
+        ? `${API_URL}/crawler/info?days=${days}`
+        : `${API_URL}/crawler/info`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`fetchCrawlerInfo failed: ${res.status}`);
+    return res.json();
+}
+
 export async function verifyClaim(claim: string) {
     const res = await fetch(`${API_URL}/verify`, {
         method: "POST",
