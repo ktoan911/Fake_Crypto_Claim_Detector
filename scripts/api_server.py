@@ -60,7 +60,7 @@ _claim_cache: _TTLCache = _TTLCache(maxsize=500, ttl=3600.0)
 _stats_kb: OpenSearchKB | None = None
 _inference_executor: ThreadPoolExecutor | None = None
 
-# ── Kaggle log via OpenSearch ─────────────────────────────────────────────────
+# ── crawl log via OpenSearch ─────────────────────────────────────────────────
 _CRAWL_LOGS_INDEX = "crawl_logs"
 
 # ── Server log (in-memory ring buffer) ───────────────────────────────────────
@@ -177,7 +177,7 @@ async def admin_login(request: AdminLoginRequest):
     from opensearchpy.exceptions import ConnectionError as OSConnectionError
 
     try:
-        client = _kg_os_client()
+        client = _crawl_client()
         if not client.indices.exists(index="admin"):
             return JSONResponse(
                 status_code=503,
@@ -418,19 +418,17 @@ async def claims_stats(date: str | None = None):
         )
 
 
-# ── Kaggle notebook log endpoints ─────────────────────────────────────────────
+# ── Crawler log endpoints ─────────────────────────────────────────────────────
+
+_crawl_os_client = None
 
 
-_kaggle_os_client = None
-
-
-def _kg_os_client():
-    """OpenSearch client — lazy singleton, created once and reused."""
-    global _kaggle_os_client
-    if _kaggle_os_client is None:
+def _crawl_client():
+    global _crawl_os_client
+    if _crawl_os_client is None:
         from opensearchpy import OpenSearch, RequestsHttpConnection
 
-        _kaggle_os_client = OpenSearch(
+        _crawl_os_client = OpenSearch(
             hosts=[
                 {
                     "host": os.getenv("OP_HOST"),
@@ -444,15 +442,11 @@ def _kg_os_client():
             timeout=10,
             connection_class=RequestsHttpConnection,
         )
-    return _kaggle_os_client
+    return _crawl_os_client
 
 
-def _kg_get_doc_sync(doc_id: str | None) -> dict | None:
-    """
-    Lấy 1 document từ crawl_logs.
-    doc_id = None → trả document mới nhất theo start_ts.
-    """
-    client = _kg_os_client()
+def _crawl_get_doc_sync(doc_id: str | None) -> dict | None:
+    client = _crawl_client()
     if not client.indices.exists(index=_CRAWL_LOGS_INDEX):
         return None
     if doc_id:
@@ -461,7 +455,6 @@ def _kg_get_doc_sync(doc_id: str | None) -> dict | None:
             return {"doc_id": r["_id"], **r["_source"]}
         except Exception:
             return None
-    # Lấy doc mới nhất
     resp = client.search(
         index=_CRAWL_LOGS_INDEX,
         body={
@@ -481,112 +474,46 @@ def _kg_get_doc_sync(doc_id: str | None) -> dict | None:
     return doc
 
 
-def _kg_list_runs_sync(limit: int) -> list[dict]:
-    """Trả danh sách các run gần nhất (mỗi run = 1 doc)."""
-    client = _kg_os_client()
-    if not client.indices.exists(index=_CRAWL_LOGS_INDEX):
-        return []
-    resp = client.search(
-        index=_CRAWL_LOGS_INDEX,
-        body={
-            "size": limit,
-            "sort": [{"start_ts": {"order": "desc"}}],
-            "query": {"match_all": {}},
-            "_source": ["start_ts"],  # không trả content để nhẹ
-        },
-    )
-    return [{"doc_id": h["_id"], **h["_source"]} for h in resp["hits"]["hits"]]
-
-
-def _kg_status_sync() -> dict:
-    """Gọi Kaggle API để lấy trạng thái kernel (RUNNING / COMPLETE / ERROR ...)."""
-    import requests
-
-    username = os.getenv("KAGGLE_USERNAME", "")
-    key = os.getenv("KAGGLE_KEY", "")
-    kernel = os.getenv("KAGGLE_KERNEL", "")  # dạng "owner/kernel-slug"
-    if not (username and key and kernel):
-        return {"status": "UNKNOWN"}
-    owner, slug = kernel.split("/", 1)
-    resp = requests.get(
-        "https://www.kaggle.com/api/v1/kernels/status",
-        params={"userName": owner, "kernelSlug": slug},
-        auth=(username, key),
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-@app.get("/kaggle/logs")
-async def get_kaggle_logs():
-    """
-    Tự động xác định log cần trả:
-    - Notebook đang chạy → lấy document mới nhất (đang được ghi).
-    - Notebook không chạy → lấy document mới nhất (run gần nhất).
-    Trả thêm field `running` để frontend biết trạng thái.
-    """
+@app.get("/crawler/logs")
+async def get_crawler_logs(doc_id: str | None = None):
+    """Trả log run mới nhất (hoặc theo doc_id). Field `running` = status=="running"."""
     loop = asyncio.get_running_loop()
-
-    status_task = loop.run_in_executor(None, _kg_status_sync)
-    doc_task = loop.run_in_executor(None, _kg_get_doc_sync, None)
-
-    try:
-        status, doc = await asyncio.gather(
-            status_task, doc_task, return_exceptions=True
-        )
-    except Exception as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
-
-    running = isinstance(status, dict) and status.get("status") == "RUNNING"
-
-    if isinstance(doc, Exception) or doc is None:
+    doc = await loop.run_in_executor(None, _crawl_get_doc_sync, doc_id)
+    if doc is None:
         return JSONResponse(status_code=404, content={"error": "Chưa có log nào."})
+    return {**doc, "running": doc.get("status") == "running"}
 
-    return {**doc, "running": running}
 
-
-@app.get("/kaggle/logs/stream")
-async def stream_kaggle_logs(request: Request):
-    """
-    SSE — tự lấy doc mới nhất rồi stream.
-    Đang chạy: mỗi 5 giây poll content mới append vào.
-    Không chạy: gửi toàn bộ content rồi đóng stream.
-    """
+@app.get("/crawler/logs/stream")
+async def stream_crawler_logs(request: Request, doc_id: str | None = None):
+    """SSE — stream log realtime. Poll mỗi 5s; đóng khi status=="done"."""
     loop = asyncio.get_running_loop()
 
     async def event_generator():
         sent_len = 0
-
         while not await request.is_disconnected():
             try:
-                status, doc = await asyncio.gather(
-                    loop.run_in_executor(None, _kg_status_sync),
-                    loop.run_in_executor(None, _kg_get_doc_sync, None),
-                    return_exceptions=True,
-                )
+                doc = await loop.run_in_executor(None, _crawl_get_doc_sync, doc_id)
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
                 await asyncio.sleep(5)
                 continue
 
-            if isinstance(doc, Exception) or doc is None:
+            if doc is None:
                 yield ": waiting\n\n"
                 await asyncio.sleep(5)
                 continue
 
-            running = isinstance(status, dict) and status.get("status") == "RUNNING"
+            running = doc.get("status") == "running"
             content: str = doc.get("content", "")
 
             if len(content) > sent_len:
-                new_text = content[sent_len:]
-                for line in new_text.split("\n"):
+                for line in content[sent_len:].split("\n"):
                     if line.strip():
                         yield f"data: {json.dumps({'line': line, 'running': running}, ensure_ascii=False)}\n\n"
                 sent_len = len(content)
 
             if not running:
-                # Notebook đã xong, gửi hết rồi đóng
                 yield f"data: {json.dumps({'done': True})}\n\n"
                 return
 

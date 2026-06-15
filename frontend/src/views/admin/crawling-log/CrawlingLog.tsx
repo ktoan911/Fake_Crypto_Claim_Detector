@@ -113,7 +113,7 @@ export default function CrawlingLog() {
   useEffect(() => {
     async function poll() {
       try {
-        const res = await fetch(`${API_URL}/kaggle/logs`, { cache: "no-store" });
+        const res = await fetch(`${API_URL}/crawler/logs`, { cache: "no-store" });
         if (res.status === 404) { setStatus("empty"); return; }
         if (!res.ok) { setStatus((s) => s === "loading" ? "error" : s); return; }
         const data = await res.json();
@@ -167,8 +167,8 @@ export default function CrawlingLog() {
           <span className="h-5 w-px bg-white/10" />
           <Terminal className="h-4 w-4 shrink-0 text-purple-400" />
           <span className="font-mono text-sm text-slate-400">
-            kaggle.log
-            <span className="text-slate-600"> — notebook stdout</span>
+            crawler.log
+            <span className="text-slate-600"> — shell stdout</span>
           </span>
         </div>
         <div className="hidden items-center gap-1.5 rounded-full border border-purple-500/20 bg-purple-500/10 px-3 py-1 font-mono text-xs text-purple-400 sm:flex">
@@ -199,7 +199,7 @@ export default function CrawlingLog() {
       <div className="flex items-center justify-between border-t border-white/[0.06] px-5 py-2.5 font-mono text-xs text-slate-600">
         <div className="flex items-center gap-2">
           <span className={`h-1.5 w-1.5 rounded-full ${statusDot}`} />
-          <span>kaggle-notebook · {statusLabel}</span>
+          <span>crawler-shell · {statusLabel}</span>
         </div>
         <div className="hidden gap-4 sm:flex">
           {docId && <span className="text-slate-700" title="doc_id đang hiển thị">doc: {docId}</span>}
