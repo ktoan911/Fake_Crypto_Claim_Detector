@@ -41,27 +41,16 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
+import torch.multiprocessing as mp
+try:
+    mp.set_sharing_strategy('file_system')
+except Exception:
+    pass
+
 # ── project root (phải trước mọi import nặng) ─────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
-
-# ── Early GPU guard ────────────────────────────────────────────────────────────
-# Nếu user truyền --device cpu hoặc --no_semantic, ẩn CUDA TRƯỚC khi torch load
-# để SentenceTransformer không cố mount model lên GPU (tránh OOM khi GPU bận)
-def _early_device_patch() -> None:
-    hide = False
-    if "--no_semantic" in sys.argv:
-        hide = True
-    if "--device" in sys.argv:
-        idx = sys.argv.index("--device")
-        if idx + 1 < len(sys.argv) and sys.argv[idx + 1].lower() == "cpu":
-            hide = True
-    if hide:
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-_early_device_patch()
-
 import numpy as np
 import pandas as pd
 from loguru import logger
@@ -358,8 +347,8 @@ def parse_args() -> argparse.Namespace:
                    help="NLI model name for hybrid_rrf_temporal_nli mode")
     p.add_argument("--device", default=None,
                    help="torch device: cuda / cuda:0 / cpu (auto-detected if None)")
-    p.add_argument("--embed_batch_size", type=int, default=2048,
-                   help="Batch size for encoding documents (H200 80GB handles 2048+)")
+    p.add_argument("--embed_batch_size", type=int, default=256,
+                   help="Batch size for encoding documents (256 safe for Docker; increase if /dev/shm > 4GB)")
     p.add_argument("--rrf_k", type=int, default=60,
                    help="RRF constant k")
     p.add_argument("--alpha", type=float, default=0.7,
@@ -442,10 +431,19 @@ def main() -> None:
         logger.info(f"Embedding model loaded. Batch size for indexing: {args.embed_batch_size}")
 
     # ── Index / load ─────────────────────────────────────────────────────────
+    _index_loaded = False
     if args.index_path and os.path.exists(args.index_path):
-        logger.info(f"Loading pre-built index: {args.index_path}")
-        retriever.load_index(args.index_path)
-    else:
+        try:
+            logger.info(f"Loading pre-built index: {args.index_path}")
+            retriever.load_index(args.index_path)
+            _index_loaded = True
+        except Exception as _ie:
+            logger.warning(f"Failed to load index ({_ie}). Deleting corrupted file and rebuilding...")
+            try:
+                os.remove(args.index_path)
+            except OSError:
+                pass
+    if not _index_loaded:
         logger.info(f"Building index for {len(documents)} documents...")
         t0 = time.time()
         # Patch batch size để tận dụng H200 VRAM
@@ -501,9 +499,10 @@ def main() -> None:
         )
         logger.info(f"Indexing done in {time.time() - t0:.1f}s")
 
-        if args.save_index:
-            retriever.save_index(args.save_index)
-            logger.info(f"Index saved → {args.save_index}")
+        save_to = args.save_index or (args.index_path if not _index_loaded else None)
+        if save_to:
+            retriever.save_index(save_to)
+            logger.info(f"Index saved → {save_to}")
 
     # ── Init NLI Scorer ──────────────────────────────────────────────────────
     nli_scorer = None

@@ -301,11 +301,21 @@ class TemporalScorer:
         if len(sorted_ts) < 5:
             return 0.0
 
-        # Count occurrences in recent weeks
+        # Normalize timezone
         now = self.reference_date
-        week1 = sum(1 for t in sorted_ts if (now - t).days <= 7)
-        week2 = sum(1 for t in sorted_ts if 7 < (now - t).days <= 14)
-        week3 = sum(1 for t in sorted_ts if 14 < (now - t).days <= 21)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+            
+        norm_ts = []
+        for t in sorted_ts:
+            if t.tzinfo is None:
+                norm_ts.append(t.replace(tzinfo=timezone.utc))
+            else:
+                norm_ts.append(t)
+
+        week1 = sum(1 for t in norm_ts if (now - t).days <= 7)
+        week2 = sum(1 for t in norm_ts if 7 < (now - t).days <= 14)
+        week3 = sum(1 for t in norm_ts if 14 < (now - t).days <= 21)
 
         # Trend: positive if increasing, negative if decreasing
         if week3 > 0:

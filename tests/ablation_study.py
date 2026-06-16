@@ -30,6 +30,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
+import torch
+import torch.multiprocessing as mp
+try:
+    mp.set_sharing_strategy('file_system')
+except Exception:
+    pass
+
 import numpy as np
 import pandas as pd
 import torch
