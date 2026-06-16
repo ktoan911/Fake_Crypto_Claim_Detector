@@ -978,13 +978,16 @@ async def main(args):
             f"Đã lọc bỏ {filtered_by_time} bài viết đăng trước thời điểm {cutoff_time.isoformat()} (early-exit + safety net)."
         )
 
-    # --- Thống kê số bài có nội dung hợp lệ theo từng nguồn ---
-    source_content_counts = {source_url: 0 for source_url in URLS_TO_CRAWL}
+    # --- Thống kê số bài có nội dung hợp lệ theo từng nguồn (unique article_url) ---
+    unique_per_source: dict[str, set] = {}
     for item in valid_results:
-        src = item.get("source_url")
-        if not src:
+        src = item.get("source_url", "")
+        art_url = item.get("article_url", "")
+        if not src or not art_url:
             continue
-        source_content_counts[src] = source_content_counts.get(src, 0) + 1
+        unique_per_source.setdefault(src, set()).add(art_url)
+
+    source_content_counts = {src: len(urls) for src, urls in unique_per_source.items()}
 
     logging.info("[THỐNG KÊ NGUỒN] Số bài có nội dung hợp lệ theo từng nguồn:")
     for source_url in URLS_TO_CRAWL:
@@ -1017,9 +1020,10 @@ async def main(args):
         logging.info("Tất cả nguồn đều cào được ít nhất 1 bài viết hợp lệ.")
 
     # --- Ghi log thống kê phiên cào vào crawl_info (trước khi truncate max_articles) ---
+    total_unique_articles = sum(source_content_counts.values())
     _push_crawl_info(
         crawled_at=datetime.now(timezone.utc).isoformat(),
-        total_articles=len(valid_results),
+        total_articles=total_unique_articles,
         source_counts=source_content_counts,
     )
 

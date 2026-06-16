@@ -78,12 +78,35 @@ def _resolve_fusion_path(
 
 
 def _normalize_label(val) -> int:
-    v = str(val).lower().strip()
-    if v in {"true", "đúng", "dung", "supported", "legit", "0"}:
-        return LABEL_LIST.index("Đúng") if "Đúng" in LABEL_LIST else 0
-    if v in {"false", "sai", "refuted", "scam", "fake", "1"}:
-        return LABEL_LIST.index("Sai") if "Sai" in LABEL_LIST else 1
-    return LABEL_LIST.index("Chưa chắc chắn") if "Chưa chắc chắn" in LABEL_LIST else 2
+    """Map raw label strings -> integer index into LABEL_LIST = ["A", "B", "C"].
+
+    LABEL_LIST (src/config.py):
+      A (index 0) = Supported  / Đúng
+      B (index 1) = Contradicted / Sai
+      C (index 2) = Insufficient evidence / Chưa chắc chắn
+    """
+    v = str(val).strip()
+    # Direct A/B/C mapping (current format in config.py)
+    if v.upper() in ("A",):
+        return 0
+    if v.upper() in ("B",):
+        return 1
+    if v.upper() in ("C",):
+        return 2
+    # Numeric string
+    if v == "0":
+        return 0
+    if v == "1":
+        return 1
+    if v == "2":
+        return 2
+    # Legacy Vietnamese/English labels (backward compat with old CSVs)
+    v_lower = v.lower()
+    if v_lower in {"true", "supported", "legit", "\u0111u\u1ed3ng", "dung"}:
+        return 0  # A
+    if v_lower in {"false", "refuted", "scam", "fake", "sai"}:
+        return 1  # B
+    return 2      # C = default (Insufficient)
 
 
 def _parse_evidence(field) -> List[str]:
