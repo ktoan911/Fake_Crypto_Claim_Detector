@@ -173,6 +173,13 @@ EVAL_CONFIGS: Dict[str, Dict] = {
         use_semantic=True,
         use_temporal=True,
         expand_query=True,
+        use_nli=False,
+    ),
+    "hybrid_rrf_temporal_nli": dict(
+        use_semantic=True,
+        use_temporal=True,
+        expand_query=True,
+        use_nli=True,
     ),
 }
 
@@ -189,6 +196,7 @@ def run_evaluation(
     k_values: List[int],
     top_k: int,
     log_every: int = 500,
+    nli_scorer: Optional[Any] = None,
 ) -> Dict[str, float]:
 
     logger.info(f"\n{'='*64}")
@@ -206,7 +214,21 @@ def run_evaluation(
     ):
         try:
             t0 = time.perf_counter()
+            # Bỏ use_nli ra khỏi kwargs truyền cho retriever (vì retriever không biết tham số này)
+            use_nli = retrieve_kwargs.pop("use_nli", False)
             results = retriever.retrieve(query=query_text, top_k=top_k, **retrieve_kwargs)
+            # Khôi phục lại dict nếu loop sau cần dùng
+            retrieve_kwargs["use_nli"] = use_nli
+
+            if use_nli and nli_scorer is not None and results:
+                premises = [r.text for r in results]
+                hypotheses = [query_text] * len(results)
+                nli_probs = nli_scorer.score(premises, hypotheses)
+                for i, r in enumerate(results):
+                    # NLI prob ở index 0 là entailment. Cộng thẳng vào score (hoặc có thể tuỳ chỉnh weight)
+                    r.score = r.score + float(nli_probs[i, 0])
+                results.sort(key=lambda x: x.score, reverse=True)
+
             latencies.append(time.perf_counter() - t0)
             retrieved_ids = [r.document_id for r in results]
             all_metrics.append(compute_metrics(retrieved_ids, relevant_id, k_values))
@@ -332,6 +354,8 @@ def parse_args() -> argparse.Namespace:
     # ── Model / GPU ──────────────────────────────────────────────────────────
     p.add_argument("--embedding_model", default="AITeamVN/Vietnamese_Embedding",
                    help="SentenceTransformer model name or local path")
+    p.add_argument("--nli_model", default="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+                   help="NLI model name for hybrid_rrf_temporal_nli mode")
     p.add_argument("--device", default=None,
                    help="torch device: cuda / cuda:0 / cpu (auto-detected if None)")
     p.add_argument("--embed_batch_size", type=int, default=512,
@@ -477,6 +501,17 @@ def main() -> None:
             retriever.save_index(args.save_index)
             logger.info(f"Index saved → {args.save_index}")
 
+    # ── Init NLI Scorer ──────────────────────────────────────────────────────
+    nli_scorer = None
+    if any(m == "hybrid_rrf_temporal_nli" for m in selected_modes):
+        if not args.no_semantic:
+            logger.info(f"Initializing NLIScorer ({args.nli_model})...")
+            from src.models.nli_scorer import NLIScorer
+            nli_scorer = NLIScorer(model_name=args.nli_model, device=device).load()
+        else:
+            logger.warning("--no_semantic disables NLI. Removing hybrid_rrf_temporal_nli mode.")
+            selected_modes.remove("hybrid_rrf_temporal_nli")
+
     # ── Run ablation ─────────────────────────────────────────────────────────
     os.makedirs(args.output_dir, exist_ok=True)
     all_results: Dict[str, Dict[str, float]] = {}
@@ -487,6 +522,7 @@ def main() -> None:
         cfg = dict(EVAL_CONFIGS[mode])
         if args.no_semantic:
             cfg["use_semantic"] = False
+            cfg["use_nli"] = False
 
         t_mode = time.time()
         metrics = run_evaluation(
@@ -497,6 +533,7 @@ def main() -> None:
             k_values=args.k_values,
             top_k=top_k,
             log_every=args.log_every,
+            nli_scorer=nli_scorer,
         )
         metrics["wall_time_s"] = round(time.time() - t_mode, 2)
         all_results[mode] = metrics

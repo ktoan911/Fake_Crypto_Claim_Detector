@@ -345,6 +345,15 @@ def _build_fusion(
         fus.load_state_dict(fusion_state, strict=(effective == has_gate))
 
     fus.eval()
+
+    if str(device) != "cpu" and hasattr(torch, "compile"):
+        try:
+            enc = torch.compile(enc)
+            fus = torch.compile(fus)
+            logger.info("  torch.compile enabled for fusion models (H200 optimization)")
+        except Exception as e:
+            logger.warning(f"  torch.compile failed (non-fatal): {e}")
+
     return enc, fus
 
 
@@ -488,14 +497,19 @@ def main() -> None:
     parser.add_argument(
         "--llm_batch_size",
         type=int,
-        default=int(os.getenv("LLM_INFER_BATCH_SIZE", "4")),
-        help="LLM inference batch size (default 4; lower = less RAM)",
+        default=int(os.getenv("LLM_INFER_BATCH_SIZE", "32" if torch.cuda.is_available() else "4")),
+        help="LLM inference batch size (default 32 on GPU, 4 on CPU)",
     )
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--output", default="results/ablation_results.csv")
     args = parser.parse_args()
+
+    # H200 / Ampere+ optimizations
+    if torch.cuda.is_available() and hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+        logger.info("Enabled TensorFloat-32 (TF32) matmul precision for H200 GPU.")
 
     # Load test CSV
     logger.info(f"Loading {args.csv}")
