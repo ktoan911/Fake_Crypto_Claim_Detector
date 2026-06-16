@@ -494,32 +494,44 @@ def _crawl_info_sync(days: int) -> dict:
     if not client.indices.exists(index=_CRAWL_INFO_INDEX):
         return {"crawl_by_day": [], "per_source": []}
 
-    resp = client.search(
-        index=_CRAWL_INFO_INDEX,
-        body={
-            "size": days,
-            "sort": [{"crawled_at": {"order": "desc"}}],
-            "_source": ["crawled_at", "total_articles"],
-        },
-    )
-    crawl_by_day = [
-        {
-            "day": hit["_source"].get("crawled_at", "")[:10],
-            "total_crawl": hit["_source"].get("total_articles", 0),
-        }
-        for hit in resp["hits"]["hits"]
-    ]
+    date_filter = {"range": {"crawled_at": {"gte": f"now-{days}d/d", "lte": "now/d"}}}
 
-    agg_resp = client.search(
+    # Group by day, sum total_articles
+    day_resp = client.search(
         index=_CRAWL_INFO_INDEX,
         body={
             "size": 0,
+            "query": date_filter,
+            "aggs": {
+                "by_day": {
+                    "date_histogram": {
+                        "field": "crawled_at",
+                        "calendar_interval": "day",
+                        "format": "yyyy-MM-dd",
+                        "min_doc_count": 1,
+                    },
+                    "aggs": {"total": {"sum": {"field": "total_articles"}}},
+                }
+            },
+        },
+    )
+    crawl_by_day = [
+        {"day": b["key_as_string"], "total_crawl": int(b["total"]["value"])}
+        for b in day_resp.get("aggregations", {}).get("by_day", {}).get("buckets", [])
+    ]
+
+    # Aggregate per_source within same date range
+    src_resp = client.search(
+        index=_CRAWL_INFO_INDEX,
+        body={
+            "size": 0,
+            "query": date_filter,
             "aggs": {
                 "sources": {
                     "nested": {"path": "per_source"},
                     "aggs": {
                         "by_url": {
-                            "terms": {"field": "per_source.source_url", "size": 30},
+                            "terms": {"field": "per_source.source_url", "size": 50},
                             "aggs": {"total": {"sum": {"field": "per_source.count"}}},
                         }
                     },
@@ -528,7 +540,7 @@ def _crawl_info_sync(days: int) -> dict:
         },
     )
     buckets = (
-        agg_resp.get("aggregations", {})
+        src_resp.get("aggregations", {})
         .get("sources", {})
         .get("by_url", {})
         .get("buckets", [])
