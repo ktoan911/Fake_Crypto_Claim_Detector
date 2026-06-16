@@ -39,7 +39,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ── project root (phải trước mọi import nặng) ─────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -358,8 +358,8 @@ def parse_args() -> argparse.Namespace:
                    help="NLI model name for hybrid_rrf_temporal_nli mode")
     p.add_argument("--device", default=None,
                    help="torch device: cuda / cuda:0 / cpu (auto-detected if None)")
-    p.add_argument("--embed_batch_size", type=int, default=512,
-                   help="Batch size for encoding documents (H200 can handle 512+)")
+    p.add_argument("--embed_batch_size", type=int, default=2048,
+                   help="Batch size for encoding documents (H200 80GB handles 2048+)")
     p.add_argument("--rrf_k", type=int, default=60,
                    help="RRF constant k")
     p.add_argument("--alpha", type=float, default=0.7,
@@ -375,7 +375,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir",
                    default=str(PROJECT_ROOT / "tests" / "eval_results"),
                    help="Directory for result files")
-    p.add_argument("--log_every", type=int, default=1000,
+    p.add_argument("--log_every", type=int, default=500,
                    help="Log partial metrics every N queries")
 
     return p.parse_args()
@@ -420,9 +420,13 @@ def main() -> None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Device: {device}")
     if torch.cuda.is_available():
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         gpu_name = torch.cuda.get_device_name(0)
         gpu_mem  = torch.cuda.get_device_properties(0).total_memory / 1e9
-        logger.info(f"GPU: {gpu_name} | VRAM: {gpu_mem:.1f} GB")
+        logger.info(f"GPU: {gpu_name} | VRAM: {gpu_mem:.1f} GB | TF32 enabled")
 
     # ── Init retriever ───────────────────────────────────────────────────────
     logger.info("Initializing KnowledgeAugmentedRetriever...")
@@ -478,11 +482,11 @@ def main() -> None:
                     show_progress_bar=True,
                     convert_to_numpy=True,
                 )
-                # FAISS
+                # FAISS CPU index
                 try:
                     import faiss
-                    retriever.faiss_index = faiss.IndexFlatIP(retriever.embedding_dim)
                     faiss.normalize_L2(retriever.document_embeddings)
+                    retriever.faiss_index = faiss.IndexFlatIP(retriever.embedding_dim)
                     retriever.faiss_index.add(retriever.document_embeddings)
                     logger.info(f"  FAISS index: {retriever.faiss_index.ntotal} vectors")
                 except Exception as _fe:

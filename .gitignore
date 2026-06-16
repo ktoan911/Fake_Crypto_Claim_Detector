@@ -99,3 +99,4 @@ yarn-error.log*
 *.pem
 
 run_crawler_news.sh
+run_eval_h200.sh

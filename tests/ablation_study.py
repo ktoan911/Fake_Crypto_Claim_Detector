@@ -365,11 +365,12 @@ def _eval_config(
     enc: RetrievalFeatureEncoder,
     fus: ConfidenceAwareFusion,
     device: str,
-    batch_size: int = 64,
+    batch_size: int = 512,
     interactions_np: Optional[np.ndarray] = None,
 ) -> dict:
     n = len(y_true)
     preds: List[int] = []
+    _use_amp = str(device) != "cpu" and torch.cuda.is_available()
 
     for start in tqdm(range(0, n, batch_size), desc=config_name):
         end = min(start + batch_size, n)
@@ -384,8 +385,9 @@ def _eval_config(
         )
 
         with torch.inference_mode():
-            enc_out = enc(feat_t, int_t)
-            fus_out = fus(llm_t, enc_out)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=_use_amp):
+                enc_out = enc(feat_t, int_t)
+                fus_out = fus(llm_t, enc_out)
             batch_preds = torch.argmax(fus_out.final_probs, dim=-1).cpu().tolist()
 
         preds.extend(batch_preds)
@@ -435,6 +437,7 @@ def phase3_fusion(
     llm_logits: np.ndarray,
     y_true: List[int],
     device: str,
+    fusion_batch_size: int = 512,
 ) -> List[dict]:
     # Fusion model is tiny (~few MB): keep it for all 3 configs, one at a time
     ablation_configs = [
@@ -471,6 +474,7 @@ def phase3_fusion(
             enc=enc,
             fus=fus,
             device=device,
+            batch_size=fusion_batch_size,
         )
         results.append(row)
         _free(enc)
@@ -497,11 +501,17 @@ def main() -> None:
     parser.add_argument(
         "--llm_batch_size",
         type=int,
-        default=int(os.getenv("LLM_INFER_BATCH_SIZE", "32" if torch.cuda.is_available() else "4")),
-        help="LLM inference batch size (default 32 on GPU, 4 on CPU)",
+        default=int(os.getenv("LLM_INFER_BATCH_SIZE", "64" if torch.cuda.is_available() else "4")),
+        help="LLM inference batch size (default 64 on GPU, 4 on CPU)",
     )
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument(
+        "--fusion_batch_size",
+        type=int,
+        default=512,
+        help="Fusion inference batch size (default 512 — tiny model, H200 handles large batches)",
     )
     parser.add_argument("--output", default="results/ablation_results.csv")
     args = parser.parse_args()
@@ -509,7 +519,9 @@ def main() -> None:
     # H200 / Ampere+ optimizations
     if torch.cuda.is_available() and hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
-        logger.info("Enabled TensorFloat-32 (TF32) matmul precision for H200 GPU.")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("Enabled TF32 matmul + cuDNN precision for H200 GPU.")
 
     # Load test CSV
     logger.info(f"Loading {args.csv}")
@@ -575,6 +587,7 @@ def main() -> None:
         llm_logits=llm_logits,
         y_true=y_true,
         device=args.device,
+        fusion_batch_size=args.fusion_batch_size,
     )
 
     # ---- Print & save ----
