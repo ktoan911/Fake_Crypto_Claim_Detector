@@ -151,8 +151,10 @@ def phase1_retrieval(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
-        feats_temporal     : float32 [N, top_k, 4]  — with temporal scoring
-        feats_no_temporal  : float32 [N, top_k, 4]  — pure RRF only
+        feats_temporal        : float32 [N, top_k, score_features]  — with temporal scoring
+        feats_no_temporal     : float32 [N, top_k, score_features]  — pure RRF only
+        interactions_temporal : float32 [N, interaction_dim] or None
+        interactions_no_temporal: float32 [N, interaction_dim] or None
     """
     from src.retrieval.retrieval import KnowledgeAugmentedRetriever
 
@@ -160,6 +162,9 @@ def phase1_retrieval(
     lambda_decay = float(saved_config.get("lambda_decay", 0.1))
     gamma = float(saved_config.get("gamma", 0.5))
     rrf_k = int(saved_config.get("rrf_k", 60))
+    score_features = int(saved_config.get("score_features", 5))
+    nli_model_name: Optional[str] = saved_config.get("nli_model") or None
+    nli_top_k = min(5, top_k)
 
     logger.info("Phase 1 — building retriever & indexing KB …")
     retriever = KnowledgeAugmentedRetriever(
@@ -170,6 +175,22 @@ def phase1_retrieval(
         use_query_expansion=True,
         rrf_k=rrf_k,
     )
+
+    # Load NLI scorer if checkpoint was trained with NLI features
+    nli_scorer = None
+    if score_features > 5 and nli_model_name:
+        try:
+            from src.models.nli_scorer import NLIScorer
+            nli_device = os.getenv("NLI_DEVICE", "cpu")
+            nli_max_length = int(os.getenv("NLI_MAX_LENGTH", "256"))
+            nli_scorer = NLIScorer(
+                model_name=nli_model_name,
+                device=nli_device,
+                max_length=nli_max_length,
+            )
+            logger.info(f"  NLI scorer loaded: {nli_model_name} (device={nli_device})")
+        except Exception as e:
+            logger.warning(f"  NLI scorer failed to load ({e}); padding NLI dims with 1/3")
 
     # Index gold evidence with pseudo-timestamps for realistic temporal scoring
     all_docs = []
@@ -192,9 +213,10 @@ def phase1_retrieval(
     logger.info(f"  Indexed {len(all_docs)} passages")
 
     def _feats(claim: str, use_temporal: bool):
-        """Returns (score_feats [top_k, 5], interaction [2*emb_dim] or None)."""
+        """Returns (score_feats [top_k, score_features], interaction [2*emb_dim] or None)."""
         results = retriever.retrieve(claim, top_k=top_k, use_temporal=use_temporal)
         doc_embs = []
+        doc_texts = []
         rows = []
         for r in results:
             rows.append(
@@ -208,9 +230,26 @@ def phase1_retrieval(
             )
             if r.embedding is not None:
                 doc_embs.append(r.embedding)
+            if r.text:
+                doc_texts.append(r.text)
         while len(rows) < top_k:
             rows.append([0.0, 0.0, 0.0, 0.0, 0.0])
         score_arr = np.array(rows[:top_k], dtype=np.float32)
+
+        # Append NLI features if the checkpoint was trained with them
+        if score_features > 5:
+            nli_padded = np.full((top_k, 3), 1.0 / 3.0, dtype=np.float32)
+            if nli_scorer is not None and doc_texts:
+                real_docs = doc_texts[:nli_top_k]
+                try:
+                    nli_scores = nli_scorer.score(
+                        premises=real_docs,
+                        hypotheses=[claim] * len(real_docs),
+                    )
+                    nli_padded[: len(real_docs)] = nli_scores
+                except Exception as e:
+                    logger.warning(f"  NLI scoring failed ({e}); using neutral 1/3")
+            score_arr = np.concatenate([score_arr, nli_padded], axis=-1)
 
         interaction = None
         q_emb = getattr(retriever, "_last_query_embedding", None)
@@ -225,8 +264,8 @@ def phase1_retrieval(
     _s0, _i0 = _feats(claims[0], use_temporal=True)
     interaction_dim = _i0.shape[0] if _i0 is not None else 0
 
-    feats_temporal = np.zeros((len(claims), top_k, 5), dtype=np.float32)
-    feats_no_temporal = np.zeros((len(claims), top_k, 5), dtype=np.float32)
+    feats_temporal = np.zeros((len(claims), top_k, score_features), dtype=np.float32)
+    feats_no_temporal = np.zeros((len(claims), top_k, score_features), dtype=np.float32)
     interactions_temporal = (
         np.zeros((len(claims), interaction_dim), dtype=np.float32)
         if interaction_dim > 0
@@ -249,6 +288,8 @@ def phase1_retrieval(
             interactions_no_temporal[i] = i_nt
 
     _free(retriever)
+    if nli_scorer is not None:
+        _free(nli_scorer)
     logger.info("Phase 1 done — retriever freed")
     return (
         feats_temporal,
