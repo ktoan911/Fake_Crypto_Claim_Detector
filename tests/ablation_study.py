@@ -148,13 +148,18 @@ def phase1_retrieval(
     retriever_model: str,
     saved_config: dict,
     top_k: int,
+    gold_timestamps: Optional[List[List[datetime]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
-        feats_temporal        : float32 [N, top_k, score_features]  — with temporal scoring
-        feats_no_temporal     : float32 [N, top_k, score_features]  — pure RRF only
-        interactions_temporal : float32 [N, interaction_dim] or None
-        interactions_no_temporal: float32 [N, interaction_dim] or None
+        feats_temporal           : float32 [N, top_k, score_features]  — with temporal scoring
+        feats_no_temporal        : float32 [N, top_k, score_features]  — pure RRF only
+        interactions_temporal    : float32 [N, interaction_dim] or None
+        interactions_no_temporal : float32 [N, interaction_dim] or None
+        retrieved_texts_temporal : List[List[str]]  — top-k retrieved texts per claim (temporal)
+
+    gold_timestamps: real per-evidence timestamps from dataset; falls back to pseudo if None.
+    Leave-one-out: each claim retrieves from KB built without its own evidence.
     """
     from src.retrieval.retrieval import KnowledgeAugmentedRetriever
 
@@ -192,29 +197,50 @@ def phase1_retrieval(
         except Exception as e:
             logger.warning(f"  NLI scorer failed to load ({e}); padding NLI dims with 1/3")
 
-    # Index gold evidence with pseudo-timestamps for realistic temporal scoring
+    # Build per-evidence timestamps: use real ones when available, else pseudo-random
+    if gold_timestamps is not None:
+        flat_timestamps: List[datetime] = [
+            ts for tss in gold_timestamps for ts in tss
+        ]
+        logger.info("  Using real timestamps from dataset")
+    else:
+        flat_timestamps = _pseudo_timestamps(
+            sum(len(ev) for ev in gold_evidences), days_spread=365
+        )
+        logger.info("  Using pseudo-random timestamps (no real timestamps provided)")
+
+    # Build docs with structured IDs: "c{claim_idx}_e{ev_idx}" for leave-one-out filtering
     all_docs = []
-    timestamps = _pseudo_timestamps(
-        sum(len(ev) for ev in gold_evidences), days_spread=365
-    )
-    ts_cursor = 0
-    for ev_list in gold_evidences:
-        for ev_text in ev_list:
+    for claim_idx, ev_list in enumerate(gold_evidences):
+        for ev_idx, ev_text in enumerate(ev_list):
+            flat_pos = sum(len(gold_evidences[j]) for j in range(claim_idx)) + ev_idx
             all_docs.append(
                 {
-                    "id": f"d{ts_cursor}",
+                    "id": f"c{claim_idx}_e{ev_idx}",
                     "text": str(ev_text),
-                    "timestamp": timestamps[ts_cursor],
+                    "timestamp": flat_timestamps[flat_pos],
                 }
             )
-            ts_cursor += 1
 
     retriever.index_documents(all_docs)
     logger.info(f"  Indexed {len(all_docs)} passages")
 
-    def _feats(claim: str, use_temporal: bool):
-        """Returns (score_feats [top_k, score_features], interaction [2*emb_dim] or None)."""
-        results = retriever.retrieve(claim, top_k=top_k, use_temporal=use_temporal)
+    # Max own-evidence a claim can have (used to over-fetch for leave-one-out filtering)
+    max_own_ev = max(len(ev) for ev in gold_evidences) if gold_evidences else 0
+
+    def _feats(
+        claim_idx: int, claim: str, use_temporal: bool
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], List[str]]:
+        """Returns (score_feats [top_k, score_features], interaction or None, retrieved_texts).
+
+        Leave-one-out: over-fetches then strips documents belonging to claim_idx's own evidence,
+        so the retriever cannot trivially return the answer from the KB.
+        """
+        own_prefix = f"c{claim_idx}_"
+        fetch_k = top_k + max_own_ev + 5  # extra buffer for leave-one-out filtering
+        raw_results = retriever.retrieve(claim, top_k=fetch_k, use_temporal=use_temporal)
+        results = [r for r in raw_results if not r.document_id.startswith(own_prefix)][:top_k]
+
         doc_embs = []
         doc_texts = []
         rows = []
@@ -258,10 +284,10 @@ def phase1_retrieval(
             interaction = np.concatenate(
                 [q_emb * mean_d, np.abs(q_emb - mean_d)], dtype=np.float32
             )
-        return score_arr, interaction
+        return score_arr, interaction, doc_texts
 
     # Determine interaction_dim from first sample
-    _s0, _i0 = _feats(claims[0], use_temporal=True)
+    _s0, _i0, _ = _feats(0, claims[0], use_temporal=True)
     interaction_dim = _i0.shape[0] if _i0 is not None else 0
 
     feats_temporal = np.zeros((len(claims), top_k, score_features), dtype=np.float32)
@@ -276,12 +302,14 @@ def phase1_retrieval(
         if interaction_dim > 0
         else None
     )
+    retrieved_texts_temporal: List[List[str]] = []
 
     for i, claim in enumerate(tqdm(claims, desc="Phase 1 — retrieval")):
-        s_t, i_t = _feats(claim, use_temporal=True)
-        s_nt, i_nt = _feats(claim, use_temporal=False)
+        s_t, i_t, texts_t = _feats(i, claim, use_temporal=True)
+        s_nt, i_nt, _ = _feats(i, claim, use_temporal=False)
         feats_temporal[i] = s_t
         feats_no_temporal[i] = s_nt
+        retrieved_texts_temporal.append(texts_t)
         if interactions_temporal is not None and i_t is not None:
             interactions_temporal[i] = i_t
         if interactions_no_temporal is not None and i_nt is not None:
@@ -296,6 +324,7 @@ def phase1_retrieval(
         feats_no_temporal,
         interactions_temporal,
         interactions_no_temporal,
+        retrieved_texts_temporal,
     )
 
 
@@ -306,7 +335,7 @@ def phase1_retrieval(
 
 def phase2_llm(
     claims: List[str],
-    gold_evidences: List[List[str]],
+    evidence_lists: List[List[str]],
     lora_model: str,
     device: str,
     llm_top_k: int,
@@ -314,6 +343,9 @@ def phase2_llm(
 ) -> np.ndarray:
     """
     Returns llm_logits: float32 [N, num_classes]
+
+    evidence_lists: retrieved evidence texts (from phase1), keeping LLM and retriever
+    consistent — both branches now see the same input.
     """
     from src.llm_scorer import LLMScorer
 
@@ -332,7 +364,7 @@ def phase2_llm(
     for start in tqdm(range(0, n, llm_batch_size), desc="Phase 2 — LLM scoring"):
         end = min(start + llm_batch_size, n)
         batch_claims = claims[start:end]
-        batch_evs = [gold_evidences[i][:llm_top_k] for i in range(start, end)]
+        batch_evs = [evidence_lists[i][:llm_top_k] for i in range(start, end)]
 
         with torch.inference_mode():
             logits = llm.score_logits(batch_claims, batch_evs)
@@ -487,7 +519,9 @@ def phase3_fusion(
     device: str,
     fusion_batch_size: int = 512,
 ) -> List[dict]:
-    # Fusion model is tiny (~few MB): keep it for all 3 configs, one at a time
+    score_features = int(saved_config.get("score_features", 5))
+
+    # Fusion model is tiny (~few MB): keep it for all configs, one at a time
     ablation_configs = [
         {
             "name": "w/o Temporal Scoring",
@@ -508,6 +542,20 @@ def phase3_fusion(
             "adaptive_beta": None,
         },
     ]
+
+    # NLI Re-ranking ablation: replace NLI feature columns with uniform prior (1/3).
+    # Only meaningful when the checkpoint was trained with NLI features (score_features > 5).
+    if score_features > 5:
+        feats_no_nli = feats_temporal.copy()
+        feats_no_nli[:, :, 5:] = 1.0 / 3.0
+        ablation_configs.append(
+            {
+                "name": "w/o NLI Re-ranking",
+                "feats": feats_no_nli,
+                "interactions": interactions_temporal,
+                "adaptive_beta": None,
+            }
+        )
 
     results = []
     for cfg in ablation_configs:
@@ -537,10 +585,16 @@ def phase3_fusion(
 
 
 def main() -> None:
+    import json as _json
+
     parser = argparse.ArgumentParser(
         description="Ablation Study — Temporal Scoring & Beta-Gate (memory-efficient)"
     )
-    parser.add_argument("--csv", default="data/test.csv")
+    parser.add_argument("--csv", default=None, help="CSV with claim/label/evidence columns")
+    parser.add_argument(
+        "--json", default=None,
+        help="JSON dataset (preferred): preserves real evidence timestamps for temporal ablation",
+    )
     parser.add_argument("--fusion_model", default=_DEFAULT_FUSION_MODEL)
     parser.add_argument("--lora_model", default=_DEFAULT_LLM_MODEL)
     parser.add_argument("--retriever_model", default=None)
@@ -564,6 +618,9 @@ def main() -> None:
     parser.add_argument("--output", default="results/ablation_results.csv")
     args = parser.parse_args()
 
+    if args.json is None and args.csv is None:
+        args.csv = "data/test.csv"
+
     # H200 / Ampere+ optimizations
     if torch.cuda.is_available() and hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
@@ -571,19 +628,51 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
         logger.info("Enabled TF32 matmul + cuDNN precision for H200 GPU.")
 
-    # Load test CSV
-    logger.info(f"Loading {args.csv}")
-    df = pd.read_csv(args.csv)
-    if args.limit:
-        df = df.sample(n=min(args.limit, len(df)), random_state=42).reset_index(
-            drop=True
-        )
+    gold_timestamps: Optional[List[List[datetime]]] = None
 
-    claims: List[str] = df["claim"].tolist()
-    y_true: List[int] = [_normalize_label(lbl) for lbl in df["label"].tolist()]
-    gold_evidences: List[List[str]] = [
-        _parse_evidence(e) for e in df["evidence"].tolist()
-    ]
+    if args.json:
+        # JSON path: extract real timestamps (Fix 1)
+        logger.info(f"Loading {args.json}")
+        with open(args.json, encoding="utf-8") as f:
+            raw_data = _json.load(f)
+        if args.limit:
+            import random as _random
+            _random.seed(42)
+            raw_data = _random.sample(raw_data, min(args.limit, len(raw_data)))
+
+        claims: List[str] = [row["claim"] for row in raw_data]
+        y_true: List[int] = [_normalize_label(row["label"]) for row in raw_data]
+        gold_evidences: List[List[str]] = []
+        gold_timestamps = []
+        for row in raw_data:
+            texts, tss = [], []
+            for e in row.get("evidence", []):
+                if isinstance(e, dict):
+                    texts.append(e.get("content", str(e)))
+                    raw_ts = e.get("timestamp")
+                    if raw_ts:
+                        try:
+                            ts = datetime.fromisoformat(str(raw_ts)).replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            ts = datetime.now(timezone.utc)
+                    else:
+                        ts = datetime.now(timezone.utc)
+                else:
+                    texts.append(str(e))
+                    ts = datetime.now(timezone.utc)
+                tss.append(ts)
+            gold_evidences.append(texts)
+            gold_timestamps.append(tss)
+    else:
+        # CSV fallback (no real timestamps)
+        logger.info(f"Loading {args.csv}")
+        df = pd.read_csv(args.csv)
+        if args.limit:
+            df = df.sample(n=min(args.limit, len(df)), random_state=42).reset_index(drop=True)
+        claims = df["claim"].tolist()
+        y_true = [_normalize_label(lbl) for lbl in df["label"].tolist()]
+        gold_evidences = [_parse_evidence(e) for e in df["evidence"].tolist()]
+
     logger.info(
         f"{len(claims)} samples | labels: {pd.Series(y_true).value_counts().to_dict()}"
     )
@@ -606,18 +695,20 @@ def main() -> None:
         feats_no_temporal,
         interactions_temporal,
         interactions_no_temporal,
+        retrieved_texts_temporal,
     ) = phase1_retrieval(
         claims=claims,
         gold_evidences=gold_evidences,
         retriever_model=retriever_model,
         saved_config=saved_config,
         top_k=top_k,
+        gold_timestamps=gold_timestamps,
     )
 
-    # ---- Phase 2: LLM (Qwen3-4B) ----
+    # ---- Phase 2: LLM (Qwen3-4B) — uses retrieved evidence (Fix 3: consistent inputs) ----
     llm_logits = phase2_llm(
         claims=claims,
-        gold_evidences=gold_evidences,
+        evidence_lists=retrieved_texts_temporal,
         lora_model=args.lora_model,
         device=args.device,
         llm_top_k=args.llm_evidence_top_k,

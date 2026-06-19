@@ -748,6 +748,7 @@ class KnowledgeAugmentedRetriever:
         use_temporal: bool = True,
         expand_query: bool = True,
         use_semantic: bool = True,
+        use_bm25: bool = True,
         rrf_top_k: int = 20,
     ) -> List[RetrievalResult]:
 
@@ -765,17 +766,25 @@ class KnowledgeAugmentedRetriever:
             expanded_query = query
 
         # Stage 1a: BM25 scoring for all documents
-        tokenized_query = self._tokenize(expanded_query)
-        bm25_scores = self.bm25.get_scores(tokenized_query)
+        bm25_ranks = {}
+        bm25_active = bool(use_bm25 and self.bm25 is not None)
+        if bm25_active:
+            tokenized_query = self._tokenize(expanded_query)
+            bm25_scores = self.bm25.get_scores(tokenized_query)
 
-        # Create BM25 rankings (higher score = lower rank number)
-        bm25_ranked = sorted(enumerate(bm25_scores), key=lambda x: x[1], reverse=True)
-        bm25_ranks = {idx: rank for rank, (idx, score) in enumerate(bm25_ranked)}
+            # Create BM25 rankings (higher score = lower rank number)
+            bm25_ranked = sorted(
+                enumerate(bm25_scores), key=lambda x: x[1], reverse=True
+            )
+            bm25_ranks = {idx: rank for rank, (idx, score) in enumerate(bm25_ranked)}
 
         # Stage 1b: FAISS semantic search (if available)
         faiss_ranks = {}
         faiss_cosine = {}  # idx → cosine similarity (inner product after L2 norm)
-        if use_semantic and self.encoder is not None and self.faiss_index is not None:
+        semantic_active = bool(
+            use_semantic and self.encoder is not None and self.faiss_index is not None
+        )
+        if semantic_active:
             query_embedding = self.encoder.encode(
                 [expanded_query], convert_to_numpy=True
             )
@@ -790,22 +799,30 @@ class KnowledgeAugmentedRetriever:
             faiss_cosine = {int(indices[0][i]): float(distances[0][i]) for i in range(len(indices[0]))}
         else:
             self._last_query_embedding = None
-            # No FAISS available: use uniform ranks
-            faiss_ranks = {i: i for i in range(len(self.documents))}
+
+        if not bm25_active and not semantic_active:
+            logger.warning(
+                "No active retrieval scorer (BM25 and semantic are disabled/unavailable)"
+            )
+            return []
 
         # Stage 2: Reciprocal Rank Fusion (RRF)
         # RRF(d) = 1/(k + rank_bm25(d)) + 1/(k + rank_dense(d))
         rrf_scores = {}
         for i in range(len(self.documents)):
-            bm25_rank = bm25_ranks.get(i, len(self.documents))
-            faiss_rank = faiss_ranks.get(i, len(self.documents))
-            rrf_scores[i] = (1.0 / (self.rrf_k + bm25_rank)) + (
-                1.0 / (self.rrf_k + faiss_rank)
-            )
+            score = 0.0
+            if bm25_active:
+                bm25_rank = bm25_ranks.get(i, len(self.documents))
+                score += 1.0 / (self.rrf_k + bm25_rank)
+            if semantic_active:
+                faiss_rank = faiss_ranks.get(i, len(self.documents))
+                score += 1.0 / (self.rrf_k + faiss_rank)
+            rrf_scores[i] = score
 
         # Sort by RRF score and take top rrf_top_k (default 20)
         rrf_ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-        rrf_candidates = rrf_ranked[:rrf_top_k]
+        candidate_k = max(rrf_top_k, top_k)
+        rrf_candidates = rrf_ranked[:candidate_k]
 
         # Normalize RRF scores to [0,1] for final score calculation
         max_rrf = max(score for idx, score in rrf_candidates) if rrf_candidates else 1.0
@@ -817,6 +834,7 @@ class KnowledgeAugmentedRetriever:
             group_key = (
                 doc["metadata"].get("type")
                 or doc["metadata"].get("source")
+                or doc["metadata"].get("category")
                 or "default"
             )
             if group_key not in docs_by_group:
@@ -834,6 +852,7 @@ class KnowledgeAugmentedRetriever:
                 group_key = (
                     doc["metadata"].get("type")
                     or doc["metadata"].get("source")
+                    or doc["metadata"].get("category")
                     or "default"
                 )
                 group_timestamps = [

@@ -53,13 +53,25 @@ class NLIScorer:
         self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
         self._model.to(self.device).eval()
 
-        id2label = {k: v.lower() for k, v in self._model.config.id2label.items()}
-        label2id = {v: k for k, v in id2label.items()}
-        self._ent_idx = label2id.get("entailment", 0)
-        self._neu_idx = label2id.get("neutral", 1)
-        self._con_idx = label2id.get("contradiction", 2)
+        id2label = {
+            int(k): str(v).lower() for k, v in self._model.config.id2label.items()
+        }
+
+        def _label_index(label: str) -> int:
+            for idx, name in id2label.items():
+                if name == label or label in name:
+                    return idx
+            raise ValueError(
+                f"NLI model {self.model_name!r} does not expose a clear "
+                f"{label!r} label in id2label={id2label}. Refusing to guess."
+            )
+
+        self._ent_idx = _label_index("entailment")
+        self._neu_idx = _label_index("neutral")
+        self._con_idx = _label_index("contradiction")
         logger.info(
-            f"NLI loaded | ent={self._ent_idx}, neu={self._neu_idx}, con={self._con_idx}"
+            f"NLI loaded | id2label={id2label} | "
+            f"ent={self._ent_idx}, neu={self._neu_idx}, con={self._con_idx}"
         )
         return self
 
