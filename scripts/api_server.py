@@ -494,7 +494,7 @@ def _crawl_info_sync(days: int) -> dict:
     if not client.indices.exists(index=_CRAWL_INFO_INDEX):
         return {"crawl_by_day": [], "per_source": []}
 
-    date_filter = {"range": {"crawled_at": {"gte": f"now-{days}d/d", "lte": "now/d"}}}
+    date_filter = {"range": {"crawled_at": {"gte": f"now-{days - 1}d/d", "lte": "now/d"}}}
 
     # Group by day, sum total_articles
     day_resp = client.search(

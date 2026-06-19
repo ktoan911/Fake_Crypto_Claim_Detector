@@ -340,6 +340,7 @@ def phase2_llm(
     device: str,
     llm_top_k: int,
     llm_batch_size: int,
+    max_length: int = 2048,
 ) -> np.ndarray:
     """
     Returns llm_logits: float32 [N, num_classes]
@@ -353,6 +354,7 @@ def phase2_llm(
     llm = LLMScorer(
         model_name=lora_model,
         device=device,
+        max_length=max_length,
         labels=LABEL_LIST,
         prompt_template=PROMPT_TEMPLATE,
     )
@@ -616,6 +618,12 @@ def main() -> None:
         help="Fusion inference batch size (default 512 — tiny model, H200 handles large batches)",
     )
     parser.add_argument("--output", default="results/ablation_results.csv")
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=2048,
+        help="Max token length for LLM input (reduce to 1024 on 16GB GPUs to save VRAM)",
+    )
     args = parser.parse_args()
 
     if args.json is None and args.csv is None:
@@ -713,6 +721,7 @@ def main() -> None:
         device=args.device,
         llm_top_k=args.llm_evidence_top_k,
         llm_batch_size=args.llm_batch_size,
+        max_length=args.max_length,
     )
 
     # ---- Phase 3: Fusion (tiny) × 3 configs ----

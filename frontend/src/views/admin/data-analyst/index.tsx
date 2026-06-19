@@ -6,7 +6,8 @@ import DonutChart from "./DonutChart";
 import LineChart from "./LineChart";
 
 export default function DataAnalyst() {
-  const { data, isLoading, isSuccess } = useCrawlerInfo(7);
+  const { data, isLoading } = useCrawlerInfo(7);
+  const { data: todayData, isLoading: isTodayLoading, isSuccess: isTodaySuccess } = useCrawlerInfo(1);
 
   return (
     <div className="min-w-0">
@@ -20,9 +21,9 @@ export default function DataAnalyst() {
         </div>
         <div className="min-w-0 h-full">
           <DonutChart
-            data={data?.per_source}
-            isLoading={isLoading}
-            isSuccess={isSuccess}
+            data={todayData?.per_source}
+            isLoading={isTodayLoading}
+            isSuccess={isTodaySuccess}
           />
         </div>
       </div>
