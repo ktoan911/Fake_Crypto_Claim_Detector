@@ -265,9 +265,11 @@ def load_claims_from_opensearch(timestamp_seconds: int = 86400) -> List[str]:
             client,
             index=index,
             query={
-                "bool": {
-                    "must": [{"range": {"checked_at": {"gte": cutoff_time}}}],
-                    "filter": [{"terms": {"verdict.keyword": ["Sai"]}}],
+                "query": {
+                    "bool": {
+                        "must": [{"range": {"checked_at": {"gte": cutoff_time}}}],
+                        "filter": [{"terms": {"verdict.keyword": ["Sai"]}}],
+                    }
                 }
             },
             _source=["claim"],

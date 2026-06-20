@@ -73,6 +73,15 @@ const LEVEL_COLOR: Record<Level, string> = {
   RAW:   "text-slate-500",
 };
 
+const FILTER_LEVELS = ["ERROR", "WARN", "INFO"] as const;
+type FilterLevel = typeof FILTER_LEVELS[number];
+
+const FILTER_STYLE: Record<FilterLevel, { active: string; idle: string }> = {
+  ERROR: { active: "bg-red-500/20 text-red-300 border-red-500/40",       idle: "text-slate-500 border-white/[0.06] hover:border-red-500/30 hover:text-red-400" },
+  WARN:  { active: "bg-yellow-500/15 text-yellow-300 border-yellow-500/40", idle: "text-slate-500 border-white/[0.06] hover:border-yellow-500/30 hover:text-yellow-300" },
+  INFO:  { active: "bg-emerald-500/15 text-emerald-300 border-emerald-500/40", idle: "text-slate-500 border-white/[0.06] hover:border-emerald-500/30 hover:text-emerald-400" },
+};
+
 const MSG_COLOR: Record<Level, string> = {
   INFO:  "text-slate-200",
   WARN:  "text-yellow-100",
@@ -107,6 +116,7 @@ export default function CrawlingLog() {
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState<Status>("loading");
   const [docId, setDocId] = useState<string | null>(null);
+  const [filterLevel, setFilterLevel] = useState<FilterLevel | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const prevLenRef = useRef(0);
 
@@ -137,6 +147,10 @@ export default function CrawlingLog() {
     }
     prevLenRef.current = lines.length;
   }, [lines]);
+
+  const displayed = filterLevel
+    ? lines.filter((l) => parseLine(l).level === filterLevel)
+    : lines;
 
   const statusDot =
     status === "connected" ? "bg-emerald-400 animate-pulse"
@@ -171,9 +185,35 @@ export default function CrawlingLog() {
             <span className="text-slate-600"> — shell stdout</span>
           </span>
         </div>
-        <div className="hidden items-center gap-1.5 rounded-full border border-purple-500/20 bg-purple-500/10 px-3 py-1 font-mono text-xs text-purple-400 sm:flex">
-          <Activity className="h-3 w-3" />
-          tail -f
+        <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1 font-mono text-[11px]">
+            <button
+              onClick={() => setFilterLevel(null)}
+              className={`rounded-full border px-2.5 py-0.5 transition-colors ${
+                filterLevel === null
+                  ? "bg-white/10 text-slate-200 border-white/20"
+                  : "text-slate-500 border-white/[0.06] hover:text-slate-300 hover:border-white/20"
+              }`}
+            >
+              All
+            </button>
+            {FILTER_LEVELS.map((lvl) => (
+              <button
+                key={lvl}
+                onClick={() => setFilterLevel(filterLevel === lvl ? null : lvl)}
+                className={`rounded-full border px-2.5 py-0.5 transition-colors ${
+                  filterLevel === lvl ? FILTER_STYLE[lvl].active : FILTER_STYLE[lvl].idle
+                }`}
+              >
+                {lvl}
+              </button>
+            ))}
+          </div>
+          <span className="hidden h-4 w-px bg-white/10 sm:block" />
+          <div className="hidden items-center gap-1.5 rounded-full border border-purple-500/20 bg-purple-500/10 px-3 py-1 font-mono text-xs text-purple-400 sm:flex">
+            <Activity className="h-3 w-3" />
+            tail -f
+          </div>
         </div>
       </div>
 
@@ -192,7 +232,12 @@ export default function CrawlingLog() {
         {status === "loading" && <p className="px-4 py-3 text-sm text-slate-500">Đang tải log…</p>}
         {status === "empty"   && <p className="px-4 py-3 text-sm text-slate-500">Chưa có log nào.</p>}
         {status === "error"   && <p className="px-4 py-3 text-sm text-red-400">Không thể tải log từ API.</p>}
-        {lines.map((line, i) => <LogRow key={i} line={line} index={i} />)}
+        {displayed.length === 0 && (status === "connected" || status === "done") && (
+          <p className="px-4 py-3 text-sm text-slate-500">
+            {filterLevel ? `Không có dòng ${filterLevel} nào.` : "Không có log nào."}
+          </p>
+        )}
+        {displayed.map((line, i) => <LogRow key={i} line={line} index={i} />)}
       </div>
 
       {/* Footer */}
@@ -203,7 +248,7 @@ export default function CrawlingLog() {
         </div>
         <div className="hidden gap-4 sm:flex">
           {docId && <span className="text-slate-700" title="doc_id đang hiển thị">doc: {docId}</span>}
-          <span>{lines.length} lines</span>
+          <span>{filterLevel ? `${displayed.length} / ${lines.length} lines` : `${lines.length} lines`}</span>
           {running && <span className="text-purple-400">● live</span>}
         </div>
       </div>

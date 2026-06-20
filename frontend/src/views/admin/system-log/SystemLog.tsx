@@ -75,6 +75,16 @@ const LEVEL_COLOR: Record<Level, string> = {
   RAW:      "text-slate-500",
 };
 
+const FILTER_LEVELS = ["ERROR", "WARNING", "INFO", "DEBUG"] as const;
+type FilterLevel = typeof FILTER_LEVELS[number];
+
+const FILTER_STYLE: Record<FilterLevel, { active: string; idle: string }> = {
+  ERROR:   { active: "bg-red-500/20 text-red-300 border-red-500/40",    idle: "text-slate-500 border-white/[0.06] hover:border-red-500/30 hover:text-red-400" },
+  WARNING: { active: "bg-yellow-500/15 text-yellow-300 border-yellow-500/40", idle: "text-slate-500 border-white/[0.06] hover:border-yellow-500/30 hover:text-yellow-300" },
+  INFO:    { active: "bg-cyan-500/15 text-cyan-300 border-cyan-500/40",  idle: "text-slate-500 border-white/[0.06] hover:border-cyan-500/30 hover:text-cyan-400" },
+  DEBUG:   { active: "bg-slate-500/20 text-slate-300 border-slate-500/40", idle: "text-slate-500 border-white/[0.06] hover:border-slate-400/30 hover:text-slate-300" },
+};
+
 const MSG_COLOR: Record<Level, string> = {
   DEBUG:    "text-slate-500",
   INFO:     "text-slate-100",
@@ -131,6 +141,7 @@ function LogRow({ line, index }: { line: string; index: number }) {
 export default function SystemLog() {
   const [lines, setLines] = useState<string[]>([]);
   const [status, setStatus] = useState<Status>("loading");
+  const [filterLevel, setFilterLevel] = useState<FilterLevel | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const prevLenRef = useRef(0);
 
@@ -161,6 +172,17 @@ export default function SystemLog() {
     prevLenRef.current = lines.length;
   }, [lines]);
 
+  const displayed = filterLevel
+    ? lines.filter((l) => {
+        const lvl = parseLine(l).level;
+        if (filterLevel === "ERROR") return lvl === "ERROR" || lvl === "CRITICAL";
+        if (filterLevel === "WARNING") return lvl === "WARNING";
+        if (filterLevel === "INFO") return lvl === "INFO";
+        if (filterLevel === "DEBUG") return lvl === "DEBUG";
+        return true;
+      })
+    : lines;
+
   const statusDot =
     status === "connected" ? "bg-emerald-400 animate-pulse"
     : status === "loading"   ? "bg-yellow-300 animate-pulse"
@@ -187,9 +209,36 @@ export default function SystemLog() {
             <span className="text-slate-600"> — api-server stdout</span>
           </span>
         </div>
-        <div className="hidden items-center gap-1.5 rounded-full border border-cyan-500/20 bg-cyan-500/10 px-3 py-1 font-mono text-xs text-cyan-400 sm:flex">
-          <Activity className="h-3 w-3" />
-          tail -f
+        <div className="flex items-center gap-1.5">
+          {/* Level filter pills */}
+          <div className="flex items-center gap-1 font-mono text-[11px]">
+            <button
+              onClick={() => setFilterLevel(null)}
+              className={`rounded-full border px-2.5 py-0.5 transition-colors ${
+                filterLevel === null
+                  ? "bg-white/10 text-slate-200 border-white/20"
+                  : "text-slate-500 border-white/[0.06] hover:text-slate-300 hover:border-white/20"
+              }`}
+            >
+              All
+            </button>
+            {FILTER_LEVELS.map((lvl) => (
+              <button
+                key={lvl}
+                onClick={() => setFilterLevel(filterLevel === lvl ? null : lvl)}
+                className={`rounded-full border px-2.5 py-0.5 transition-colors ${
+                  filterLevel === lvl ? FILTER_STYLE[lvl].active : FILTER_STYLE[lvl].idle
+                }`}
+              >
+                {lvl}
+              </button>
+            ))}
+          </div>
+          <span className="hidden h-4 w-px bg-white/10 sm:block" />
+          <div className="hidden items-center gap-1.5 rounded-full border border-cyan-500/20 bg-cyan-500/10 px-3 py-1 font-mono text-xs text-cyan-400 sm:flex">
+            <Activity className="h-3 w-3" />
+            tail -f
+          </div>
         </div>
       </div>
 
@@ -209,7 +258,12 @@ export default function SystemLog() {
         {status === "loading" && <p className="px-4 py-3 text-sm text-slate-500">Đang tải log…</p>}
         {status === "empty"   && <p className="px-4 py-3 text-sm text-slate-500">Chưa có log nào.</p>}
         {status === "error"   && <p className="px-4 py-3 text-sm text-red-400">Không thể tải log từ API.</p>}
-        {lines.map((line, i) => <LogRow key={i} line={line} index={i} />)}
+        {displayed.length === 0 && status === "connected" && (
+          <p className="px-4 py-3 text-sm text-slate-500">
+            {filterLevel ? `Không có dòng ${filterLevel} nào.` : "Không có log nào."}
+          </p>
+        )}
+        {displayed.map((line, i) => <LogRow key={i} line={line} index={i} />)}
       </div>
 
       {/* Footer */}
@@ -218,7 +272,9 @@ export default function SystemLog() {
           <span className={`h-1.5 w-1.5 rounded-full ${statusDot}`} />
           <span>api-server · {status === "connected" ? "live" : status}</span>
         </div>
-        <span>{lines.length} lines</span>
+        <span>
+          {filterLevel ? `${displayed.length} / ${lines.length} lines` : `${lines.length} lines`}
+        </span>
       </div>
     </div>
   );
