@@ -16,7 +16,7 @@ from loguru import logger
 
 from src.config import LABEL_LIST, PROMPT_TEMPLATE
 from src.database.opensearch import OpenSearchKB
-from src.llm_call import split_claim
+from src.llm_call import rewrite_claim
 from src.retrieval.retrieval import QueryExpander, RetrievalResult, TemporalScorer
 
 _URL_KEYS: Tuple[str, ...] = ("article_url", "url", "link", "source_url")
@@ -823,9 +823,10 @@ class FusionClaimVerifier:
     # Claim splitting
     # ------------------------------------------------------------------
     def split_long_claim(self, claim: str) -> Optional[List[str]]:
-        if not _env_flag("SPLIT_CLAIMS", default=False):
+        if not _env_flag("REWRITE_CLAIM", default=False):
             return None
-        return split_claim(claim)
+        rewritten = rewrite_claim(claim)
+        return [rewritten]
 
     def _prepare_sub_claims(self, claim: str) -> List[str]:
         """

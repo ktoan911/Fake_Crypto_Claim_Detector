@@ -124,7 +124,7 @@ The topic should be general enough to cover all claims, but specific enough to b
 SYSTEM_PROMPT_RUMOR_GENERATION = "Bạn là hệ thống tạo tin đồn tài chính tiếng Việt."
 
 
-def build_prompt_extraction(claim: str) -> str:
+def build_prompt_rewrite(claim: str) -> str:
     claim = _sanitize(claim)
     tz = pytz.timezone("Asia/Ho_Chi_Minh")
     today = datetime.now(tz).strftime("%Y-%m-%d")
@@ -134,49 +134,65 @@ def build_prompt_extraction(claim: str) -> str:
     prev_day = (date_obj - timedelta(days=1)).strftime("%Y-%m-%d")
 
     prompt = f"""
-You are an information extraction system.
+You are a financial query rewriting system.
 
 TASK:
-1. Split the claim into smaller claims.
-   - Each claim should contain 1–2 related facts.
-   - Do NOT split too aggressively.
-   - Keep meaningful units.
+
+Rewrite the input query into a shorter, cleaner, and more retrieval-friendly query while preserving ALL original meaning.
+
+1. Remove:
+
+   * Redundant words
+   * Filler phrases
+   * Repeated information
+   * Unnecessary conversational expressions
 
 2. Normalize time expressions:
-   - "hôm nay" → "ngày {today}"
-   - "ngày mai" → "ngày {next_day}"
-   - "hôm qua" → "ngày {prev_day}"
-   - "chiều nay" → "chiều ngày {today}"
-   - "tối nay" → "tối ngày {today}"
-   - "gần đây" → giữ nguyên
 
-3. Make each claim SELF-CONTAINED:
-   - Replace vague references like:
-     "công ty", "doanh nghiệp", "kế hoạch này", "các con số này"
-   - Use full explicit names from the original text.
-   - Each claim must be understandable independently.
+   * "hôm nay" → "ngày {today}"
+   * "ngày mai" → "ngày {next_day}"
+   * "hôm qua" → "ngày {prev_day}"
+   * "chiều nay" → "chiều ngày {today}"
+   * "tối nay" → "tối ngày {today}"
+   * "gần đây" → giữ nguyên
+
+3. Preserve all important information:
+
+   * Company names
+   * Bank names
+   * Stock tickers
+   * Financial metrics
+   * Time references
+   * Events
+   * Numerical values
+   * Comparisons and constraints
+
+4. Resolve vague references when possible:
+
+   * Replace pronouns or ambiguous references with the explicit entity mentioned in the original query.
+   * Do not introduce new information.
 
 RULES:
-- Output MUST be in Vietnamese.
-- Each claim = 1 natural sentence.
-- Prefer fewer but meaningful claims.
-- Max 30 words per claim.
-- Do NOT invent information.
-- Do NOT explain.
+
+* Output MUST be in Vietnamese.
+* Output MUST contain exactly ONE rewritten query.
+* Preserve the original intent completely.
+* Do NOT summarize.
+* Do NOT omit any factual information.
+* Do NOT add information.
+* Prefer concise keyword-rich wording suitable for financial retrieval systems.
+* Maximum 25 words.
 
 OUTPUT FORMAT:
-Return ONLY a Python list of Vietnamese strings.
+Return ONLY the rewritten query as a single Vietnamese string.
 
 --- EXAMPLE ---
 
 Input:
-Hôm nay PNJ công bố kế hoạch và doanh nghiệp đặt mục tiêu doanh thu cao.
+Hôm nay tôi muốn tìm hiểu xem PNJ vừa công bố kế hoạch kinh doanh gì và doanh nghiệp này đặt mục tiêu doanh thu như thế nào.
 
 Output:
-[
-  "Ngày {today}, PNJ công bố kế hoạch kinh doanh.",
-  "PNJ đặt mục tiêu doanh thu cao."
-]
+"Trong ngày {today}, PNJ đã công bố kế hoạch kinh doanh cùng các mục tiêu doanh thu mà doanh nghiệp đặt ra trong giai đoạn tới. Thông tin được đưa ra nhằm cung cấp cho nhà đầu tư và thị trường cái nhìn về định hướng hoạt động, các chỉ tiêu kinh doanh dự kiến cũng như kỳ vọng tăng trưởng của công ty trong thời gian tới."
 
 --- END EXAMPLE ---
 
@@ -332,34 +348,24 @@ def safe_parse_list(text: str) -> List[str]:
     return []
 
 
-def _should_skip_split(text: str) -> bool:
-    """Tránh gọi LLM cho input ngắn / không có dấu hiệu nhiều fact."""
-    text = text.strip()
-    if len(text) < 30:
-        return True
-    # Bắt đầu bằng số thứ tự ("1. ", "2) ") + ngắn → 1 mục trong list, không phải multi-claim
-    if re.match(r"^\s*\d+[\.\)]\s", text) and len(text) < 120:
-        return True
-    # Không có dấu chấm câu kết và ngắn → có khả năng là cụm từ đơn lẻ
-    if len(text) < 80 and "\n" not in text:
-        return True
-    return False
-
+def _should_skip_rewrite(text: str) -> bool:
+    """Bỏ qua rewrite nếu claim đã đủ ngắn."""
+    return len(text.strip()) < 80
 
 # =========================
 # 3. Main function (no raise)
 # =========================
-def split_claim(claim: str) -> List[str]:
+def rewrite_claim(claim: str) -> str:
+    """Rút gọn và làm rõ claim dài thành 1 câu ngắn gọn. Trả về claim gốc nếu lỗi."""
     text = (claim or "").strip()
     if not text:
-        return []
+        return text
 
-    # Heuristic: input ngắn / không phải multi-claim → khỏi gọi LLM, dùng nguyên claim
-    if _should_skip_split(text):
-        return [text]
+    if _should_skip_rewrite(text):
+        return text
 
     try:
-        prompt = build_prompt_extraction(text)
+        prompt = build_prompt_rewrite(text)
 
         for attempt in range(3):
             response = _chat_completion_with_retry(
@@ -368,21 +374,18 @@ def split_claim(claim: str) -> List[str]:
                     {"role": "system", "content": SYSTEM_PROMPT_EXTRACTION},
                     {"role": "user", "content": prompt},
                 ],
+                max_tokens=150,
+                temperature=0.1,
             )
-            output_text = (response.choices[0].message.content or "").strip()
+            output = (response.choices[0].message.content or "").strip()
+            if output:
+                return output
 
-            result = safe_parse_list(output_text)
-            if result:
-                return result
+            logger.warning(f"rewrite_claim retry {attempt + 1}: empty response")
 
-            logger.warning(
-                f"Retry {attempt + 1}: format lỗi — raw response: "
-                f"{output_text[:200]!r}"
-            )
-
-        logger.error("LLM split failed after 3 attempts, fallback to original claim")
-        return [text]
+        logger.error("rewrite_claim failed after 3 attempts, fallback to original claim")
+        return text
 
     except Exception as e:
-        logger.error(f"split_claim exception: {e}, fallback to original claim")
-        return [text]
+        logger.error(f"rewrite_claim exception: {e}, fallback to original claim")
+        return text

@@ -1119,85 +1119,10 @@ async def main(args):
             chunks.append(current)
         return chunks
 
-    def late_chunk_embed(
-        tokenizer,
-        model,
-        full_text: str,
-        chunk_texts: list[str],
-        max_length: int = 2048,
-    ) -> list[list[float]]:
-        probe = tokenizer(
-            full_text,
-            return_tensors="pt",
-            truncation=False,
-            return_offsets_mapping=False,
-        )
-        n_tokens = probe["input_ids"].shape[1]
-
-        # Fix (1): fallback nếu vượt max_length
-        if n_tokens >= max_length:
-            logging.warning(
-                f"Text quá dài ({n_tokens} tokens >= {max_length}), fallback sang encode từng chunk."
-            )
-            fallback = []
-            for c in chunk_texts:
-                enc = tokenizer(
-                    c, return_tensors="pt", truncation=True, max_length=max_length
-                )
-                with torch.no_grad():
-                    out = model(**enc)
-                emb = out.last_hidden_state.mean(dim=1)[0]
-                fallback.append(emb.tolist())
-            return fallback
-
-        # Tokenize full document với offset_mapping
-        full_enc = tokenizer(
-            full_text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_length,
-            return_offsets_mapping=True,
-        )
-        offset_mapping = full_enc.pop("offset_mapping")[0]  # (T, 2)
-
-        with torch.no_grad():
-            output = model(**full_enc)
-        # token_embeddings: (1, T, H) → (T, H)
-        token_embeddings = output.last_hidden_state[0]
-        hidden_size = token_embeddings.shape[-1]
-
-        # Xác định vị trí char của từng chunk trong full_text
-        chunk_embeddings = []
-        search_start = 0
-        for chunk in chunk_texts:
-            char_start = full_text.find(chunk, search_start)
-            if char_start == -1:
-                chunk_embeddings.append([0.0] * hidden_size)
-                continue
-            char_end = char_start + len(chunk)
-            search_start = char_end
-
-            # Fix (2): dùng overlap condition thay vì strict containment
-            token_mask = [
-                (s < char_end and e > char_start) for s, e in offset_mapping.tolist()
-            ]
-            if not any(token_mask):
-                chunk_embeddings.append([0.0] * hidden_size)
-                continue
-
-            # Mean-pool các token trong span
-            indices = torch.tensor(
-                [i for i, m in enumerate(token_mask) if m], dtype=torch.long
-            )
-            span_emb = token_embeddings[indices].mean(dim=0)
-            chunk_embeddings.append(span_emb.tolist())
-
-        return chunk_embeddings
-
     # ---------------------------------------------------------------------------
     # Load model 1 lần để dùng chung cho các batch
     # ---------------------------------------------------------------------------
-    logging.info("Đang khởi tạo model embedding trên CPU (late chunking)...")
+    logging.info("Đang khởi tạo model embedding trên CPU...")
     tokenizer = None
     model = None
     try:
@@ -1230,19 +1155,24 @@ async def main(args):
                 _split_sentences(content) if len(content) > 1500 else [content]
             )
 
-            # Bước 2: Late chunking — tạo full_text để tokenize 1 lần
-            # Ghép title + content để ngữ cảnh title lan tỏa vào token embeddings
-            full_text = f"{title} {content}".strip() if title else content
-
-            # Bước 3: Tính late-chunk embeddings
+            # Bước 2: Tính embedding từng chunk riêng lẻ
             if tokenizer is not None and model is not None:
-                try:
-                    chunk_embeddings = late_chunk_embed(
-                        tokenizer, model, full_text, chunk_texts
-                    )
-                except Exception as e:
-                    logging.error(f"Lỗi late_chunk_embed: {e}")
-                    chunk_embeddings = [[]] * len(chunk_texts)
+                chunk_embeddings = []
+                for chunk in chunk_texts:
+                    try:
+                        enc = tokenizer(
+                            chunk,
+                            return_tensors="pt",
+                            truncation=True,
+                            max_length=2048,
+                        )
+                        with torch.no_grad():
+                            out = model(**enc)
+                        emb = out.last_hidden_state.mean(dim=1)[0].tolist()
+                        chunk_embeddings.append(emb)
+                    except Exception as e:
+                        logging.error(f"Lỗi encode chunk: {e}")
+                        chunk_embeddings.append([])
             else:
                 chunk_embeddings = [[]] * len(chunk_texts)
 
@@ -1276,7 +1206,7 @@ async def main(args):
 
         processed_count += len(processed_batch)
         logging.info(
-            f"Đã xử lý và tạo mã nhúng (late chunking) xong batch có {len(processed_batch)} đoạn."
+            f"Đã xử lý và tạo mã nhúng xong batch có {len(processed_batch)} đoạn."
         )
 
     if args.save_mode == "json":
