@@ -22,6 +22,7 @@ export default function DataAnalyst() {
         <div className="min-w-0 h-full">
           <DonutChart
             data={todayData?.per_source}
+            totalSaved={todayData?.total_saved}
             isLoading={isTodayLoading}
             isSuccess={isTodaySuccess}
           />

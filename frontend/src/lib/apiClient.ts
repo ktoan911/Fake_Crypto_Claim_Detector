@@ -79,6 +79,7 @@ export interface CrawlSourceItem {
 export interface CrawlerInfo {
     crawl_by_day: CrawlByDay[];
     per_source: CrawlSourceItem[];
+    total_saved?: number;
 }
 
 export async function fetchCrawlerInfo(days?: number): Promise<CrawlerInfo> {

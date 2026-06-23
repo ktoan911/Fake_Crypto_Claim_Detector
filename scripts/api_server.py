@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -9,7 +10,7 @@ import traceback
 
 # Phải set trước khi import torch để có hiệu lực.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
@@ -63,42 +64,114 @@ _inference_executor: ThreadPoolExecutor | None = None
 # ── crawl log via OpenSearch ─────────────────────────────────────────────────
 _CRAWL_LOGS_INDEX = "crawl_logs"
 
-# ── Server log (in-memory ring buffer) ───────────────────────────────────────
-_SERVER_LOG_MAX = 500
-_server_log_buf: deque[str] = deque(maxlen=_SERVER_LOG_MAX)
+# ── Server log via OpenSearch ─────────────────────────────────────────────────
+_SERVER_LOGS_INDEX = "server_logs"
+_server_log_queue: queue.Queue = queue.Queue(maxsize=2000)
+_server_log_thread: threading.Thread | None = None
 
 _inference_timeout_s = float(os.getenv("INFERENCE_TIMEOUT_S", "300"))
 _max_claim_chars = int(os.getenv("MAX_CLAIM_CHARS", "0"))
 
 
+def _os_log_writer_loop() -> None:
+    """Background thread: drain queue → index mỗi dòng vào OpenSearch server_logs."""
+    client = _crawl_client()
+    while True:
+        item = _server_log_queue.get()
+        if item is None:
+            break
+        try:
+            client.index(index=_SERVER_LOGS_INDEX, body=item)
+        except Exception:
+            pass
+        _server_log_queue.task_done()
 
-def _server_log_sink(message) -> None:
-    """Loguru sink: ghi thẳng vào ring buffer."""
+
+def _server_log_sink_os(message) -> None:
+    """Loguru sink: đẩy dòng log vào queue → OpenSearch."""
+    from datetime import datetime, timezone
     line = str(message).rstrip("\n")
-    if line.strip():
-        _server_log_buf.append(line)
+    if not line.strip():
+        return
+    try:
+        _server_log_queue.put_nowait({
+            "message": line,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except queue.Full:
+        pass
 
 
-def _setup_server_log() -> None:
-    """Đăng ký loguru sink + stdlib handler để capture uvicorn logs vào ring buffer."""
+def _setup_server_log_os() -> None:
+    """Đăng ký loguru + stdlib handlers để ghi log vào OpenSearch."""
+    global _server_log_thread
     import logging as _stdlib_logging
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     class _StdlibSink(_stdlib_logging.Handler):
         def emit(self, record: _stdlib_logging.LogRecord) -> None:
             ts = datetime.now().strftime("%H:%M:%S")
             line = f"{ts} - {record.levelname} - {record.getMessage()}"
-            _server_log_buf.append(line)
+            try:
+                _server_log_queue.put_nowait({
+                    "message": line,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            except queue.Full:
+                pass
 
-    _sink = _StdlibSink()
+    sink = _StdlibSink()
     for name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
-        _stdlib_logging.getLogger(name).addHandler(_sink)
+        _stdlib_logging.getLogger(name).addHandler(sink)
 
     logger.add(
-        _server_log_sink,
+        _server_log_sink_os,
         format="{time:HH:mm:ss} - {level} - {message}",
         level="INFO",
         enqueue=True,
+    )
+
+    _server_log_thread = threading.Thread(
+        target=_os_log_writer_loop, daemon=True, name="os-log-writer"
+    )
+    _server_log_thread.start()
+
+
+def _cleanup_server_logs(keep: int = 10) -> None:
+    """Startup: xóa toàn bộ log cũ, giữ lại `keep` doc mới nhất trong server_logs."""
+    client = _crawl_client()
+    index = _SERVER_LOGS_INDEX
+
+    if not client.indices.exists(index=index):
+        client.indices.create(
+            index=index,
+            body={
+                "mappings": {
+                    "properties": {
+                        "message": {"type": "text", "index": False},
+                        "timestamp": {"type": "date"},
+                    }
+                }
+            },
+        )
+        return
+
+    count = client.count(index=index, body={"query": {"match_all": {}}}).get("count", 0)
+    if count <= keep:
+        return
+
+    recent = client.search(
+        index=index,
+        body={
+            "size": keep,
+            "sort": [{"timestamp": {"order": "desc"}}],
+            "_source": False,
+        },
+    )
+    keep_ids = [h["_id"] for h in recent["hits"]["hits"]]
+    client.delete_by_query(
+        index=index,
+        body={"query": {"bool": {"must_not": [{"ids": {"values": keep_ids}}]}}},
     )
 
 
@@ -140,13 +213,15 @@ async def lifespan(app: FastAPI):
     logger.info("[startup] Stats OpenSearchKB connection ready ✓")
 
     try:
-        _setup_server_log()
+        _cleanup_server_logs(keep=10)
+        _setup_server_log_os()
         logger.info("[startup] Server log handler registered ✓")
     except Exception as e:
         logger.warning(f"[startup] Server log handler failed (non-fatal): {e}")
 
     yield
 
+    _server_log_queue.put(None)
     _inference_executor.shutdown(wait=False)
     logger.info("[shutdown] API server stopping.")
 
@@ -469,8 +544,8 @@ def _crawl_get_doc_sync(doc_id: str | None) -> dict | None:
     doc = {"doc_id": hits[0]["_id"], **hits[0]["_source"]}
     if "content" in doc:
         lines = doc["content"].splitlines()
-        if len(lines) > _SERVER_LOG_MAX:
-            doc["content"] = "\n".join(lines[-_SERVER_LOG_MAX:]) + "\n"
+        if len(lines) > 500:
+            doc["content"] = "\n".join(lines[-500:]) + "\n"
     return doc
 
 
@@ -496,7 +571,7 @@ def _crawl_info_sync(days: int) -> dict:
 
     date_filter = {"range": {"crawled_at": {"gte": f"now-{days - 1}d/d", "lte": "now/d"}}}
 
-    # Group by day, sum total_articles
+    # Group by day, sum per_source.count (articles actually saved to KB)
     day_resp = client.search(
         index=_CRAWL_INFO_INDEX,
         body={
@@ -510,13 +585,18 @@ def _crawl_info_sync(days: int) -> dict:
                         "format": "yyyy-MM-dd",
                         "min_doc_count": 1,
                     },
-                    "aggs": {"total": {"sum": {"field": "total_articles"}}},
+                    "aggs": {
+                        "nested_sources": {
+                            "nested": {"path": "per_source"},
+                            "aggs": {"total": {"sum": {"field": "per_source.count"}}},
+                        }
+                    },
                 }
             },
         },
     )
     crawl_by_day = [
-        {"day": b["key_as_string"], "total_crawl": int(b["total"]["value"])}
+        {"day": b["key_as_string"], "total_crawl": int(b["nested_sources"]["total"]["value"])}
         for b in day_resp.get("aggregations", {}).get("by_day", {}).get("buckets", [])
     ]
 
@@ -530,10 +610,11 @@ def _crawl_info_sync(days: int) -> dict:
                 "sources": {
                     "nested": {"path": "per_source"},
                     "aggs": {
+                        "grand_total": {"sum": {"field": "per_source.count"}},
                         "by_url": {
                             "terms": {"field": "per_source.source_url", "size": 50},
                             "aggs": {"total": {"sum": {"field": "per_source.count"}}},
-                        }
+                        },
                     },
                 }
             },
@@ -554,7 +635,13 @@ def _crawl_info_sync(days: int) -> dict:
         for name, total in sorted(merged.items(), key=lambda x: -x[1])
     ]
 
-    return {"crawl_by_day": crawl_by_day, "per_source": per_source}
+    total_saved = int(
+        src_resp.get("aggregations", {})
+        .get("sources", {})
+        .get("grand_total", {})
+        .get("value", 0)
+    )
+    return {"crawl_by_day": crawl_by_day, "per_source": per_source, "total_saved": total_saved}
 
 
 @app.get("/crawler/info")
@@ -641,6 +728,26 @@ async def stream_crawler_logs(request: Request, doc_id: str | None = None):
 
 @app.get("/server/logs")
 async def get_server_logs():
-    """Trả toàn bộ ring buffer server log dưới dạng content string."""
-    content = "\n".join(_server_log_buf)
-    return {"content": content, "running": True}
+    """Trả server log từ OpenSearch index server_logs."""
+    loop = asyncio.get_running_loop()
+
+    def _fetch() -> str:
+        client = _crawl_client()
+        if not client.indices.exists(index=_SERVER_LOGS_INDEX):
+            return ""
+        resp = client.search(
+            index=_SERVER_LOGS_INDEX,
+            body={
+                "size": 1000,
+                "sort": [{"timestamp": {"order": "asc"}}],
+                "_source": ["message"],
+            },
+        )
+        return "\n".join(h["_source"].get("message", "") for h in resp["hits"]["hits"] if h["_source"].get("message"))
+
+    try:
+        content = await loop.run_in_executor(None, _fetch)
+        return {"content": content, "running": True}
+    except Exception:
+        logger.error(f"[server/logs] {traceback.format_exc()}")
+        return JSONResponse(status_code=500, content={"content": "", "running": False})

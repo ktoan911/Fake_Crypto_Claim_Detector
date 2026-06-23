@@ -17,6 +17,7 @@ export type DonutChartItem = {
 
 type DonutChartProps = {
   data?: DonutChartItem[];
+  totalSaved?: number;
   isLoading?: boolean;
   isSuccess?: boolean;
 };
@@ -76,6 +77,7 @@ function toPointId(item: DonutChartItem, index: number): string {
 
 export default function DonutChart({
   data = fakeData,
+  totalSaved,
   isLoading = false,
   isSuccess = true,
 }: DonutChartProps) {
@@ -102,8 +104,8 @@ export default function DonutChart({
   }, [data, palette]);
 
   const total = useMemo(
-    () => chartData.reduce((sum, item) => sum + item.value, 0),
-    [chartData],
+    () => totalSaved ?? chartData.reduce((sum, item) => sum + item.value, 0),
+    [chartData, totalSaved],
   );
 
   const seriesData = useMemo(
