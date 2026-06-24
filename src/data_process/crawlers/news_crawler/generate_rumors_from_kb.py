@@ -4,7 +4,7 @@ import argparse
 import json
 import logging
 import os
-from random import random
+import random
 import re
 import sys
 import uuid
@@ -451,7 +451,7 @@ def main() -> None:
 
     articles = build_rumor_articles(
         news_items,
-        target_count=random.randint(30, 60),
+        target_count=random.randint(30, 70),
         max_retries=args.max_retries,
     )
     LOGGER.info("Generated %d rumor claims", len(articles))
