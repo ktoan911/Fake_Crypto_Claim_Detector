@@ -35,7 +35,7 @@ class FusionTrainingConfig:
     top_k: int = 10
     alpha: float = 0.7
     lambda_decay: float = 0.1
-    gamma: float = 0.5
+    gamma: float = 0.8
     initial_beta: float = (
         0.8  # Give retrieval branch 20% weight from the start to force it to learn.
     )
@@ -422,6 +422,8 @@ def train_fusion_from_dataframe(
         f"retriever_model={config.retriever_model}"
     )
 
+    import sys
+    print(">>> TRAINER: loading retriever model...", flush=True); sys.stdout.flush()
     # Initialize retriever with RRF hybrid
     retriever = KnowledgeAugmentedRetriever(
         embedding_model=config.retriever_model,
