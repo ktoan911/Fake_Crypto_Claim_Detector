@@ -35,11 +35,11 @@ class FusionTrainingConfig:
     top_k: int = 10
     alpha: float = 0.7
     lambda_decay: float = 0.1
-    gamma: float = 0.8
+    gamma: float = 0.5
     initial_beta: float = (
         0.8  # Give retrieval branch 20% weight from the start to force it to learn.
     )
-    lambda_reg: float = 0.0  # Disable β² penalty — it pulls β back toward 0.5 and dilutes a clean LLM.
+    lambda_reg: float = 0.0
     max_length: int = 2048
     evidence_mode: str = (
         "gold"  # "gold" or "retrieved"
@@ -72,21 +72,16 @@ class FusionTrainingConfig:
 def _build_retrieval_features(
     retriever: KnowledgeAugmentedRetriever, text: str, top_k: int, rrf_top_k: int = 20
 ) -> tuple:
-    """Returns (score_features, interaction_features, retrieved_evidence_text).
-
-    score_features:       [top_k, 5]
-    interaction_features: [2*emb_dim] claim-evidence interaction, or None
-                          = concat(q ⊙ mean_d, |q − mean_d|) where q is the
-                            L2-normalised query embedding and mean_d is the
-                            mean of the top-k retrieved document embeddings.
-                          Directly encodes whether the claim MATCHES or
-                          CONTRADICTS the retrieved evidence on each dimension.
+    """
+    Nhận vào 1 câu claim, đi tìm bằng chứng, và số hoá
     """
     results = retriever.retrieve(text, top_k=top_k, rrf_top_k=rrf_top_k)
     features = []
     doc_embs = []
     evidence_texts = []
 
+
+    # Duyệt qua các kết quả, lấy ra điểm số rời rạc (Base, RRF, Recency, Cyclicity, Cosine).
     for r in results:
         features.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score, r.cosine_similarity])
         evidence_texts.append(r.text)
@@ -97,7 +92,7 @@ def _build_retrieval_features(
     if pad > 0:
         features.extend([[0.0, 0.0, 0.0, 0.0, 0.0]] * pad)
 
-    # Compute claim-evidence interaction: q ⊙ mean_d and |q − mean_d|
+    # Tính toán sự tương tác giữa claim và evidence
     interaction = None
     q_emb = getattr(retriever, "_last_query_embedding", None)
     if q_emb is not None:
@@ -107,7 +102,7 @@ def _build_retrieval_features(
                 [q_emb * mean_d, np.abs(q_emb - mean_d)], dtype=np.float32
             )
         else:
-            # No retrieved docs — zero vector preserves tensor shape
+            # Nếu không tìm thấy doc nào, gán toàn bộ bằng 0.
             interaction = np.zeros(2 * len(q_emb), dtype=np.float32)
 
     return np.array(features, dtype=np.float32), interaction, evidence_texts
@@ -422,8 +417,6 @@ def train_fusion_from_dataframe(
         f"retriever_model={config.retriever_model}"
     )
 
-    import sys
-    print(">>> TRAINER: loading retriever model...", flush=True); sys.stdout.flush()
     # Initialize retriever with RRF hybrid
     retriever = KnowledgeAugmentedRetriever(
         embedding_model=config.retriever_model,

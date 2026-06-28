@@ -45,10 +45,10 @@ def main():
         help="Path to the labeled CSV file (text,evidence,label)",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=4, help="Batch size for training"
+        "--batch_size", type=int, default=8, help="Batch size for training"
     )
     parser.add_argument(
-        "--llm_batch_size", type=int, default=1, help="Batch size for LLM"
+        "--llm_batch_size", type=int, default=8, help="Batch size for LLM"
     )
     parser.add_argument(
         "--epochs", type=int, default=3, help="Number of training epochs"
@@ -84,21 +84,9 @@ def main():
         choices=["gold", "retrieved"],
         help="Evidence source: 'gold' = dùng cột evidence từ CSV, 'retrieved' = retriever tìm kiếm (default: gold)",
     )
-    parser.add_argument(
-        "--gamma",
-        type=float,
-        default=0.8,
-        help="Recency vs cyclicity mix for temporal scoring (default: 0.8)",
-    )
 
     args = parser.parse_args()
 
-    import sys
-    def phase(msg):
-        print(f"\n>>> PHASE: {msg}", flush=True)
-        sys.stdout.flush()
-
-    phase("START — parsing args OK")
     logger.info(f"Loading labeled data from {args.labeled_csv}...")
     file_ext = os.path.splitext(args.labeled_csv)[1].lower()
 
@@ -171,7 +159,6 @@ def main():
     logger.info(
         f"Knowledge base built: {len(kb_docs)} unique documents (deduplicated from {len(labeled_df)} labeled samples)"
     )
-    phase(f"DATA LOADED — {len(labeled_df)} samples, {len(kb_docs)} kb docs")
 
     fusion_config = FusionTrainingConfig(
         model_name=args.model_path,
@@ -181,10 +168,8 @@ def main():
         llm_batch_size=args.llm_batch_size,
         epochs=args.epochs,
         evidence_mode=args.evidence_mode,
-        gamma=args.gamma,
     )
 
-    phase("CALLING train_fusion_from_dataframe — about to load retriever + index docs")
     train_fusion_from_dataframe(
         knowledge_base=kb_docs,
         labeled_df=labeled_df,
