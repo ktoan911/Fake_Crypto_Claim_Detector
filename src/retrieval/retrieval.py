@@ -154,7 +154,7 @@ class TemporalScorer:
         self,
         alpha: float = 0.7,
         lambda_decay: float = 0.1,
-        gamma: float = 0.5,
+        gamma: float = 0.8,
         reference_date: datetime = None,  # Will be set dynamically per query if None
     ):
         """
@@ -625,7 +625,7 @@ class KnowledgeAugmentedRetriever:
         embedding_model: str = "AITeamVN/Vietnamese_Embedding",
         alpha: float = 0.7,
         lambda_decay: float = 0.1,
-        gamma: float = 0.5,
+        gamma: float = 0.8,
         use_query_expansion: bool = True,
         rrf_k: int = 60,
         index_path: str = None,

@@ -111,7 +111,7 @@ def main():
         batch_size=args.batch_size or int(os.getenv("LORA_BATCH_SIZE", "1")),
         learning_rate=args.lr or float(os.getenv("LORA_LR", "1e-4")),
         precision=args.precision or os.getenv("LORA_PRECISION", "auto"),
-        max_length=args.max_length or int(os.getenv("LORA_MAX_LENGTH", "256")),
+        max_length=args.max_length or int(os.getenv("LORA_MAX_LENGTH", "2048")),
         early_stopping_patience=args.early_stopping
         or int(os.getenv("LORA_EARLY_STOPPING", "3")),
     )
