@@ -240,7 +240,8 @@ def _build_retrieval_features_train_compatible(
 
     pad = top_k - len(features)
     if pad > 0:
-        features.extend([[0.0] * score_features] * pad)
+        base_dim = min(score_features, 5)
+        features.extend([[0.0] * base_dim] * pad)
 
     interaction = None
     q_emb = getattr(retriever, "_last_query_embedding", None)
