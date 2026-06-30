@@ -1,3 +1,8 @@
+// ── Cấu hình URL ─────────────────────────────────────────────────────────────
+const API_URL = "https://flashcard-eldercare-throng.ngrok-free.dev";
+const FRONTEND_URL = "https://trustfin.app";
+// ─────────────────────────────────────────────────────────────────────────────
+
 chrome.runtime.onInstalled.addListener(() => {
     chrome.contextMenus.create({
         id: "checkClaim",
@@ -32,10 +37,10 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     // → tránh bị Chrome terminate SW sau ~30s khi inference đang chạy
     chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: (claim) => {
+        func: (claim, apiUrl) => {
             window.__claimShowLoading && window.__claimShowLoading();
 
-            fetch("http://localhost:7860/verify", {
+            fetch(`${apiUrl}/verify`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ claim })
@@ -48,11 +53,11 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
                     window.__claimShowResult && window.__claimShowResult("Lỗi kết nối tới server");
                 });
         },
-        args: [text]
+        args: [text, API_URL]
     });
 });
 
 chrome.action.onClicked.addListener((tab) => {
     // Đổi link này thành tên miền bạn muốn nhảy tới
-    chrome.tabs.create({ url: "http://localhost:3000/dashboard" });
+    chrome.tabs.create({ url: `${FRONTEND_URL}/dashboard` });
 });

@@ -23,7 +23,7 @@
   ],
   "host_permissions": [
     "<all_urls>",
-    "http://localhost:7860/*"
+    "https://flashcard-eldercare-throng.ngrok-free.dev/*"
   ],
   "background": {
     "service_worker": "background.js"

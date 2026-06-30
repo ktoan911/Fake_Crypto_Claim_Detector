@@ -1,4 +1,4 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7860";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://flashcard-eldercare-throng.ngrok-free.dev";
 
 // ── Types matching api_server.py `/claims/stats` output ────────────────────
 
