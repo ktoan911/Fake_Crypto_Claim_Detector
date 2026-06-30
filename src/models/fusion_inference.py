@@ -131,7 +131,7 @@ def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str], str]:
     
     if len(dates) == 1:
         d1 = dates[0]
-        min_dt = d1 - timedelta(days=1)
+        min_dt = d1
         max_dt = d1.replace(hour=23, minute=59, second=59)
     else:
         d1 = dates[0]
