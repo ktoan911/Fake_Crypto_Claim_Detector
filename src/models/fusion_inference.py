@@ -430,25 +430,60 @@ class OpenSearchHybridRetriever:
 
         vector_cosine = {hit.id: hit.score for hit in vector_hits}
 
-        hit_by_id = {}
+        # Stage 1.5: Expand to all chunks of the same group (URL/title)
+        group_keys = set()
+        for hit in bm25_hits + vector_hits:
+            grp = self._doc_group_key(hit.source or {})
+            if grp and grp != "unknown":
+                group_keys.add(grp)
+
+        expanded_hits = []
+        if group_keys:
+            expanded_hits = self.kb.get_docs_by_group_keys(list(group_keys), k=500)
+
+        original_hit_by_id = {}
         for hit in bm25_hits:
-            hit_by_id[hit.id] = hit
+            original_hit_by_id[hit.id] = hit
         for hit in vector_hits:
-            if hit.id not in hit_by_id:
-                hit_by_id[hit.id] = hit
+            if hit.id not in original_hit_by_id:
+                original_hit_by_id[hit.id] = hit
 
         bm25_ranks = {hit.id: rank for rank, hit in enumerate(bm25_hits)}
         vector_ranks = {hit.id: rank for rank, hit in enumerate(vector_hits)}
-        missing_rank = max(search_pool_k, len(hit_by_id))
+        missing_rank = max(search_pool_k, len(original_hit_by_id))
+
+        group_best_bm25_rank = {}
+        group_best_vector_rank = {}
+        for hit in bm25_hits + vector_hits:
+            grp = self._doc_group_key(hit.source or {})
+            if grp and grp != "unknown":
+                b_r = bm25_ranks.get(hit.id, missing_rank)
+                v_r = vector_ranks.get(hit.id, missing_rank)
+                group_best_bm25_rank[grp] = min(group_best_bm25_rank.get(grp, missing_rank), b_r)
+                group_best_vector_rank[grp] = min(group_best_vector_rank.get(grp, missing_rank), v_r)
+
+        hit_by_id = {}
+        for hit in original_hit_by_id.values():
+            hit_by_id[hit.id] = hit
+        for hit in expanded_hits:
+            if hit.id not in hit_by_id:
+                hit_by_id[hit.id] = hit
 
         # Stage 2: Reciprocal Rank Fusion (same formula as training retriever).
         t_rrf0 = perf_counter()
         rrf_scores = {}
         bm25_weight = 1.35 if verbatim_query else 1.0
         vector_weight = 1.0
-        for doc_id in hit_by_id:
-            bm25_rank = bm25_ranks.get(doc_id, missing_rank)
-            vector_rank = vector_ranks.get(doc_id, missing_rank)
+        
+        for doc_id, hit in hit_by_id.items():
+            grp = self._doc_group_key(hit.source or {})
+            if grp and grp != "unknown":
+                bm25_rank = group_best_bm25_rank.get(grp, missing_rank)
+                vector_rank = group_best_vector_rank.get(grp, missing_rank)
+            else:
+                bm25_rank = bm25_ranks.get(doc_id, missing_rank)
+                vector_rank = vector_ranks.get(doc_id, missing_rank)
+                
             rrf_scores[doc_id] = (bm25_weight / (self.rrf_k + bm25_rank)) + (
                 vector_weight / (self.rrf_k + vector_rank)
             )

@@ -406,6 +406,38 @@ class OpenSearchKB:
             self._count_cache_ts = time.monotonic()
             return count
 
+    def get_docs_by_group_keys(self, group_keys: List[str], k: int = 1000) -> List[SearchHit]:
+        """Fetch all documents matching any of the group keys (URL or title)."""
+        if not group_keys:
+            return []
+            
+        should_clauses = [
+            {"terms": {"article_url.keyword": group_keys}},
+            {"terms": {"source_url.keyword": group_keys}},
+            {"terms": {"title.keyword": group_keys}}
+        ]
+        
+        body = {
+            "size": k,
+            "query": {
+                "bool": {
+                    "should": should_clauses,
+                    "minimum_should_match": 1
+                }
+            }
+        }
+        
+        resp = self.client.search(index=self.index, body=body)
+        hits = resp.get("hits", {}).get("hits", [])
+        return [
+            SearchHit(
+                id=str(h.get("_id")),
+                score=1.0,
+                source=h.get("_source", {}) or {},
+            )
+            for h in hits
+        ]
+
     def search_vector(
         self,
         query_vector: List[float],
