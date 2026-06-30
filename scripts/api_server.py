@@ -180,8 +180,8 @@ async def lifespan(app: FastAPI):
     """Load model và khởi tạo tài nguyên dùng chung một lần khi startup."""
     global _verifier, _stats_kb, _inference_executor
 
-    _inference_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inference")
-    logger.info("[startup] Inference executor (max_workers=1) ready ✓")
+    _inference_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="inference")
+    logger.info("[startup] Inference executor (max_workers=2, 15GB VRAM) ready ✓")
 
     logger.info("[startup] Pre-warming FusionClaimVerifier …")
     try:

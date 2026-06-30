@@ -162,15 +162,15 @@ class LLMScorer:
                         logger.warning("[llm_scorer] bitsandbytes not installed, falling back to float16. Run: pip install bitsandbytes")
                         load_in_4bit = False
 
-                if not load_in_4bit:
-                    # Flash Attention 2 giảm VRAM O(n) → O(n/block) và tăng tốc attention 2-4x.
-                    # Cần package flash-attn: pip install flash-attn --no-build-isolation
-                    try:
-                        import flash_attn  # noqa: F401
-                        kwargs["attn_implementation"] = "flash_attention_2"
-                        logger.info("[llm_scorer] Flash Attention 2 enabled.")
-                    except ImportError:
-                        logger.info("[llm_scorer] flash-attn not installed, using default attention.")
+                # Flash Attention 2 tương thích với cả float16 và 4-bit (transformers ≥ 4.37).
+                # Giảm VRAM O(n²) → O(n/block) và tăng tốc attention 2-4x.
+                # Cần package flash-attn: pip install flash-attn --no-build-isolation
+                try:
+                    import flash_attn  # noqa: F401
+                    kwargs["attn_implementation"] = "flash_attention_2"
+                    logger.info("[llm_scorer] Flash Attention 2 enabled (compatible with 4-bit quant).")
+                except ImportError:
+                    logger.info("[llm_scorer] flash-attn not installed, using default attention.")
             else:
                 # Be explicit to avoid accidental accelerate dispatch metadata on CPU.
                 kwargs["device_map"] = None
