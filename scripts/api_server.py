@@ -110,8 +110,11 @@ def _setup_server_log_os() -> None:
 
     class _StdlibSink(_stdlib_logging.Handler):
         def emit(self, record: _stdlib_logging.LogRecord) -> None:
+            msg = record.getMessage()
+            if "OPTIONS /crawler/logs " in msg or "OPTIONS /server/logs " in msg:
+                return
             ts = datetime.now().strftime("%H:%M:%S")
-            line = f"{ts} - {record.levelname} - {record.getMessage()}"
+            line = f"{ts} - {record.levelname} - {msg}"
             try:
                 _server_log_queue.put_nowait({
                     "message": line,

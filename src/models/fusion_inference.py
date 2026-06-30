@@ -7,7 +7,7 @@ import re
 import concurrent.futures
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -984,11 +984,21 @@ class FusionClaimVerifier:
 
                 # Inject today's date into claims that carry no explicit date.
                 _today_str = now_utc.strftime("%d/%m/%Y")
-                _date_pat = re.compile(r"\d{1,2}[/\-]\d{1,2}|hôm (nay|qua|kia)|tháng\s+\d", re.IGNORECASE)
-                batch = [
-                    (idx, text if _date_pat.search(text) else f"{text} (ngày {_today_str})")
-                    for idx, text in batch
-                ]
+                _yesterday_str = (now_utc - timedelta(days=1)).strftime("%d/%m/%Y")
+                _day_before_str = (now_utc - timedelta(days=2)).strftime("%d/%m/%Y")
+                _tomorrow_str = (now_utc + timedelta(days=1)).strftime("%d/%m/%Y")
+                _date_pat = re.compile(r"\d{1,2}[/\-]\d{1,2}|tháng\s+\d", re.IGNORECASE)
+                
+                new_batch = []
+                for idx, text in batch:
+                    text = re.sub(r'(?i)\bhôm nay\b', f'ngày {_today_str}', text)
+                    text = re.sub(r'(?i)\bhôm qua\b', f'ngày {_yesterday_str}', text)
+                    text = re.sub(r'(?i)\bhôm kia\b', f'ngày {_day_before_str}', text)
+                    text = re.sub(r'(?i)\bngày mai\b', f'ngày {_tomorrow_str}', text)
+                    if not _date_pat.search(text):
+                        text = f"{text} (ngày {_today_str})"
+                    new_batch.append((idx, text))
+                batch = new_batch
 
                 # Pre-batch encode tất cả queries trong một lần gọi SentenceTransformer
                 batch_texts_list = [text for _, text in batch]
@@ -1203,8 +1213,16 @@ class FusionClaimVerifier:
                 logger.info(f"[fusion_inference] original_claim={text!r}")
 
         today_str = now_utc.strftime("%d/%m/%Y")
+        yesterday_str = (now_utc - timedelta(days=1)).strftime("%d/%m/%Y")
+        day_before_str = (now_utc - timedelta(days=2)).strftime("%d/%m/%Y")
+        tomorrow_str = (now_utc + timedelta(days=1)).strftime("%d/%m/%Y")
+
+        model_text = re.sub(r'(?i)\bhôm nay\b', f'ngày {today_str}', model_text)
+        model_text = re.sub(r'(?i)\bhôm qua\b', f'ngày {yesterday_str}', model_text)
+        model_text = re.sub(r'(?i)\bhôm kia\b', f'ngày {day_before_str}', model_text)
+        model_text = re.sub(r'(?i)\bngày mai\b', f'ngày {tomorrow_str}', model_text)
+
         has_date = bool(re.search(r"\d{1,2}[/\-]\d{1,2}", model_text) or
-                        re.search(r"hôm (nay|qua|kia)", model_text, re.IGNORECASE) or
                         re.search(r"tháng\s+\d", model_text, re.IGNORECASE))
         if not has_date:
             model_text = f"{model_text} (ngày {today_str})"
