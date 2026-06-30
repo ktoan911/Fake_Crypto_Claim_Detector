@@ -992,6 +992,8 @@ class FusionClaimVerifier:
 
                 # Pre-batch encode tất cả queries trong một lần gọi SentenceTransformer
                 batch_texts_list = [text for _, text in batch]
+                for idx, text in batch:
+                    logger.info(f"[fusion_inference] final_claim_to_llm (batch) | idx={idx} | claim={text!r}")
                 t_benc0 = perf_counter()
                 batch_vectors = self.retriever.batch_encode(batch_texts_list)
                 t_benc1 = perf_counter()
@@ -1208,6 +1210,8 @@ class FusionClaimVerifier:
             model_text = f"{model_text} (ngày {today_str})"
             if self.debug:
                 logger.info(f"[fusion_inference] no date in claim, injected today: {today_str!r}")
+
+        logger.info(f"[fusion_inference] final_claim_to_llm={model_text!r}")
 
         t_retrieval0 = perf_counter()
         retrieval_features_np, doc_emb_np, retrieved_evidence, retrieval_results = (
