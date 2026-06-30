@@ -162,15 +162,30 @@ class LLMScorer:
                         logger.warning("[llm_scorer] bitsandbytes not installed, falling back to float16. Run: pip install bitsandbytes")
                         load_in_4bit = False
 
-                # Flash Attention 2 tương thích với cả float16 và 4-bit (transformers ≥ 4.37).
-                # Giảm VRAM O(n²) → O(n/block) và tăng tốc attention 2-4x.
+                # Flash Attention 2 tương thích với cả float16 và 4-bit (transformers ≥ 4.37),
+                # nhưng CHỈ hỗ trợ Ampere (sm_80+) trở lên. T4/V100 (sm_75/sm_70) sẽ crash.
                 # Cần package flash-attn: pip install flash-attn --no-build-isolation
+                _fa2_enabled = False
                 try:
                     import flash_attn  # noqa: F401
-                    kwargs["attn_implementation"] = "flash_attention_2"
-                    logger.info("[llm_scorer] Flash Attention 2 enabled (compatible with 4-bit quant).")
+                    _cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+                    if _cc[0] >= 8:  # Ampere = 8.0, Ada = 8.9, Hopper = 9.0
+                        kwargs["attn_implementation"] = "flash_attention_2"
+                        _fa2_enabled = True
+                        logger.info(
+                            f"[llm_scorer] Flash Attention 2 enabled "
+                            f"(GPU sm_{_cc[0]}{_cc[1]}, compatible with 4-bit quant)."
+                        )
+                    else:
+                        logger.info(
+                            f"[llm_scorer] Flash Attention 2 skipped — GPU sm_{_cc[0]}{_cc[1]} "
+                            f"(Ampere/sm_80+ required). Using sdpa attention."
+                        )
                 except ImportError:
                     logger.info("[llm_scorer] flash-attn not installed, using default attention.")
+                if not _fa2_enabled:
+                    # sdpa (scaled_dot_product_attention) là fallback tốt nhất cho pre-Ampere
+                    kwargs["attn_implementation"] = "sdpa"
             else:
                 # Be explicit to avoid accidental accelerate dispatch metadata on CPU.
                 kwargs["device_map"] = None
