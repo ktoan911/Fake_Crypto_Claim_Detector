@@ -686,22 +686,6 @@ class FusionClaimVerifier:
             except Exception as exc:
                 logger.warning(f"[fusion_inference] torch.compile failed (non-fatal): {exc}")
 
-        model_name = llm_model_path or self.saved_config.get("model_name")
-        if not model_name:
-            raise ValueError(
-                "Missing LLM path. Provide llm_model_path or save model_name in fusion checkpoint."
-            )
-
-        from src.llm_scorer import LLMScorer
-
-        self.llm = LLMScorer(
-            model_name=model_name,
-            device=self.device,
-            max_length=int(os.getenv("LLM_MAX_LENGTH", "1024")),
-            labels=self.label_list,
-            prompt_template=PROMPT_TEMPLATE,
-        )
-
         retriever_model = retriever_model_path or self.saved_config.get(
             "retriever_model", "bge-vi-base"
         )
@@ -727,6 +711,23 @@ class FusionClaimVerifier:
             rrf_k=rrf_k,
             device=self.device,
         )
+        
+        model_name = llm_model_path or self.saved_config.get("model_name")
+        if not model_name:
+            raise ValueError(
+                "Missing LLM path. Provide llm_model_path or save model_name in fusion checkpoint."
+            )
+
+        from src.llm_scorer import LLMScorer
+
+        self.llm = LLMScorer(
+            model_name=model_name,
+            device=self.device,
+            max_length=int(os.getenv("LLM_MAX_LENGTH", "1024")),
+            labels=self.label_list,
+            prompt_template=PROMPT_TEMPLATE,
+        )
+
         self._log_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
     # ------------------------------------------------------------------
