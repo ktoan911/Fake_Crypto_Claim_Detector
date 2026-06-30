@@ -1049,11 +1049,16 @@ class FusionClaimVerifier:
                 _date_pat = re.compile(r"\d{1,2}[/\-]\d{1,2}|tháng\s+\d", re.IGNORECASE)
                 
                 new_batch = []
+                batch_date_ranges = {}
                 for idx, text in batch:
                     text = re.sub(r'(?i)\bhôm nay\b', f'ngày {_today_str}', text)
                     text = re.sub(r'(?i)\bhôm qua\b', f'ngày {_yesterday_str}', text)
                     text = re.sub(r'(?i)\bhôm kia\b', f'ngày {_day_before_str}', text)
                     text = re.sub(r'(?i)\bngày mai\b', f'ngày {_tomorrow_str}', text)
+                    
+                    min_ts, max_ts = extract_date_range(text)
+                    batch_date_ranges[idx] = (min_ts, max_ts)
+                    
                     if not _date_pat.search(text):
                         text = f"{text} (ngày {_today_str})"
                     new_batch.append((idx, text))
@@ -1081,7 +1086,7 @@ class FusionClaimVerifier:
                 ) -> Tuple[int, str, Any, Any, List[str], List[str], List[RetrievalResult]]:
                     _idx, _text = item
                     _t0 = perf_counter()
-                    min_ts, max_ts = extract_date_range(_text)
+                    min_ts, max_ts = batch_date_ranges.get(_idx, (None, None))
                     _feat, _interaction, _evidence, _results = _build_retrieval_features_train_compatible(
                         self.retriever, _text, self.top_k,
                         precomputed_vector=vec_map.get(batch_pos),
@@ -1284,6 +1289,8 @@ class FusionClaimVerifier:
         model_text = re.sub(r'(?i)\bhôm kia\b', f'ngày {day_before_str}', model_text)
         model_text = re.sub(r'(?i)\bngày mai\b', f'ngày {tomorrow_str}', model_text)
 
+        min_ts, max_ts = extract_date_range(model_text)
+
         has_date = bool(re.search(r"\d{1,2}[/\-]\d{1,2}", model_text) or
                         re.search(r"tháng\s+\d", model_text, re.IGNORECASE))
         if not has_date:
@@ -1294,7 +1301,6 @@ class FusionClaimVerifier:
         logger.info(f"[fusion_inference] final_claim_to_llm={model_text!r}")
 
         t_retrieval0 = perf_counter()
-        min_ts, max_ts = extract_date_range(model_text)
         retrieval_features_np, doc_emb_np, retrieved_evidence, retrieval_results = (
             _build_retrieval_features_train_compatible(
                 self.retriever, model_text, self.top_k,

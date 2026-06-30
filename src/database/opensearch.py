@@ -460,9 +460,8 @@ class OpenSearchKB:
                 for h in hits
             ]
         except Exception as exc:
-            logger.warning(
-                f"[opensearch] kNN query failed (falling back to script_score): {exc}",
-                exc_info=True,
+            logger.debug(
+                f"[opensearch] kNN query failed (falling back to script_score): {exc}"
             )
 
         # Fallback: exact script_score (old index without HNSW mapping).
