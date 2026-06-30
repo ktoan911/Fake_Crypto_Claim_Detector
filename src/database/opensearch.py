@@ -359,7 +359,16 @@ class OpenSearchKB:
                 range_body["gte"] = min_timestamp
             if max_timestamp:
                 range_body["lte"] = max_timestamp
-            filter_clauses.append({"range": {"timestamp": range_body}})
+            
+            filter_clauses.append({
+                "bool": {
+                    "should": [
+                        {"range": {"timestamp": range_body}},
+                        {"range": {"published_at": range_body}}
+                    ],
+                    "minimum_should_match": 1
+                }
+            })
 
         body = {
             "size": k,
@@ -431,7 +440,16 @@ class OpenSearchKB:
                 range_body["gte"] = min_timestamp
             if max_timestamp:
                 range_body["lte"] = max_timestamp
-            filter_clauses.append({"range": {"timestamp": range_body}})
+                
+            filter_clauses.append({
+                "bool": {
+                    "should": [
+                        {"range": {"timestamp": range_body}},
+                        {"range": {"published_at": range_body}}
+                    ],
+                    "minimum_should_match": 1
+                }
+            })
 
         # HNSW knn query — O(log n), uses the index built at insert time.
         ef_search = int(os.getenv("KNN_EF_SEARCH", "200"))
