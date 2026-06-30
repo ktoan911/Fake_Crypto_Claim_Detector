@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Activity, Server } from "lucide-react";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7860";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://flashcard-eldercare-throng.ngrok-free.dev";
 
 type Status = "loading" | "connected" | "done" | "empty" | "error";
 type Level = "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL" | "RAW";
@@ -148,7 +148,10 @@ export default function SystemLog() {
   useEffect(() => {
     async function poll() {
       try {
-        const res = await fetch(`${API_URL}/server/logs`, { cache: "no-store" });
+        const res = await fetch(`${API_URL}/server/logs`, {
+          cache: "no-store",
+          headers: { "ngrok-skip-browser-warning": "true" },
+        });
         if (res.status === 404) { setStatus("empty"); return; }
         if (!res.ok) { setStatus((s) => s === "loading" ? "error" : s); return; }
         const data = await res.json();

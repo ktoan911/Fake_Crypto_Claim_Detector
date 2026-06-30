@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import Image from "next/image";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7860";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://flashcard-eldercare-throng.ngrok-free.dev";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type AuthState = "idle" | "loading" | "error" | "success";
@@ -610,7 +610,10 @@ export default function AdminLoginPage() {
     try {
       const res = await fetch(`${API_URL}/admin/login`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "ngrok-skip-browser-warning": "true",
+        },
         body: JSON.stringify({ username, password }),
       });
       const data = await res.json();

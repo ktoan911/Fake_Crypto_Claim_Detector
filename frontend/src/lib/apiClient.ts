@@ -1,5 +1,11 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://flashcard-eldercare-throng.ngrok-free.dev";
 
+// Common headers for all API requests (ngrok bypass + JSON)
+const API_HEADERS: HeadersInit = {
+    "ngrok-skip-browser-warning": "true",
+    "Content-Type": "application/json",
+};
+
 // ── Types matching api_server.py `/claims/stats` output ────────────────────
 
 export interface RecentClaim {
@@ -59,7 +65,7 @@ export async function fetchClaimsStats(date?: string): Promise<ClaimsStats> {
     const url = date
         ? `${API_URL}/claims/stats?date=${date}`
         : `${API_URL}/claims/stats`;
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetch(url, { cache: "no-store", headers: API_HEADERS });
     if (!res.ok) throw new Error(`fetchClaimsStats failed: ${res.status}`);
     return res.json();
 }
@@ -86,7 +92,7 @@ export async function fetchCrawlerInfo(days?: number): Promise<CrawlerInfo> {
     const url = days
         ? `${API_URL}/crawler/info?days=${days}`
         : `${API_URL}/crawler/info`;
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetch(url, { cache: "no-store", headers: API_HEADERS });
     if (!res.ok) throw new Error(`fetchCrawlerInfo failed: ${res.status}`);
     return res.json();
 }
@@ -94,7 +100,7 @@ export async function fetchCrawlerInfo(days?: number): Promise<CrawlerInfo> {
 export async function verifyClaim(claim: string) {
     const res = await fetch(`${API_URL}/verify`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: API_HEADERS,
         body: JSON.stringify({ claim }),
     });
     if (!res.ok) throw new Error(`verifyClaim failed: ${res.status}`);
