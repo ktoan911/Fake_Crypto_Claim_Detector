@@ -1056,10 +1056,10 @@ class FusionClaimVerifier:
                 batch_date_ranges = {}
                 batch_cleaned_texts = {}
                 for idx, text in batch:
-                    text = re.sub(r'(?i)\bhôm nay\b', f'ngày {_today_str}', text)
-                    text = re.sub(r'(?i)\bhôm qua\b', f'ngày {_yesterday_str}', text)
-                    text = re.sub(r'(?i)\bhôm kia\b', f'ngày {_day_before_str}', text)
-                    text = re.sub(r'(?i)\bngày mai\b', f'ngày {_tomorrow_str}', text)
+                    text = re.sub(r'(?i)(?:ngày\s+)?\bhôm nay\b', f'ngày {_today_str}', text)
+                    text = re.sub(r'(?i)(?:ngày\s+)?\bhôm qua\b', f'ngày {_yesterday_str}', text)
+                    text = re.sub(r'(?i)(?:ngày\s+)?\bhôm kia\b', f'ngày {_day_before_str}', text)
+                    text = re.sub(r'(?i)(?:ngày\s+)?\bngày mai\b', f'ngày {_tomorrow_str}', text)
                     
                     min_ts, max_ts, cleaned_text = extract_date_range(text)
                     batch_date_ranges[idx] = (min_ts, max_ts)
@@ -1291,10 +1291,10 @@ class FusionClaimVerifier:
         day_before_str = (now_utc - timedelta(days=2)).strftime("%d/%m/%Y")
         tomorrow_str = (now_utc + timedelta(days=1)).strftime("%d/%m/%Y")
 
-        model_text = re.sub(r'(?i)\bhôm nay\b', f'ngày {today_str}', model_text)
-        model_text = re.sub(r'(?i)\bhôm qua\b', f'ngày {yesterday_str}', model_text)
-        model_text = re.sub(r'(?i)\bhôm kia\b', f'ngày {day_before_str}', model_text)
-        model_text = re.sub(r'(?i)\bngày mai\b', f'ngày {tomorrow_str}', model_text)
+        model_text = re.sub(r'(?i)(?:ngày\s+)?\bhôm nay\b', f'ngày {today_str}', model_text)
+        model_text = re.sub(r'(?i)(?:ngày\s+)?\bhôm qua\b', f'ngày {yesterday_str}', model_text)
+        model_text = re.sub(r'(?i)(?:ngày\s+)?\bhôm kia\b', f'ngày {day_before_str}', model_text)
+        model_text = re.sub(r'(?i)(?:ngày\s+)?\bngày mai\b', f'ngày {tomorrow_str}', model_text)
 
         min_ts, max_ts, search_text = extract_date_range(model_text)
 
