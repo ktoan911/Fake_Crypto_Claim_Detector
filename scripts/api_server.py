@@ -228,13 +228,41 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Fake Claim Detector API", lifespan=lifespan)
 
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# Allowed origins: production domain + local dev + wildcard fallback.
+_CORS_ORIGINS = [
+    "https://trustfin.app",
+    "https://www.trustfin.app",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "*",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,  # cache preflight 24h — giảm số OPTIONS request
 )
+
+
+# Safety-net middleware: đảm bảo CORS header luôn có mặt, kể cả khi ngrok
+# intercept OPTIONS và trả HTML warning page thay vì đến FastAPI.
+@app.middleware("http")
+async def _cors_safety_net(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get("origin", "")
+    if origin:
+        response.headers.setdefault("Access-Control-Allow-Origin", origin)
+        response.headers.setdefault("Access-Control-Allow-Credentials", "false")
+        response.headers.setdefault(
+            "Access-Control-Allow-Methods", "GET, POST, OPTIONS"
+        )
+        response.headers.setdefault("Access-Control-Allow-Headers", "*")
+    return response
 
 
 class ClaimRequest(BaseModel):
