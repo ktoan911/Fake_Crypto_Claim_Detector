@@ -97,7 +97,7 @@ def _parse_timestamp(value: Any) -> datetime:
     return ts.astimezone(timezone.utc)
 
 
-def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str]]:
+def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str], str]:
     now_utc = datetime.now(timezone.utc)
     current_year = now_utc.year
     current_month = now_utc.month
@@ -125,7 +125,7 @@ def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str]]:
             pass
             
     if not dates:
-        return None, None
+        return None, None, text
         
     dates.sort()
     
@@ -139,7 +139,10 @@ def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str]]:
         min_dt = d1
         max_dt = d2.replace(hour=23, minute=59, second=59)
         
-    return min_dt.isoformat(), max_dt.isoformat()
+    cleaned_text = pat.sub("", text)
+    cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
+    
+    return min_dt.isoformat(), max_dt.isoformat(), cleaned_text
 
 
 def _select_doc_text(source: Dict[str, Any]) -> str:
@@ -430,60 +433,25 @@ class OpenSearchHybridRetriever:
 
         vector_cosine = {hit.id: hit.score for hit in vector_hits}
 
-        # Stage 1.5: Expand to all chunks of the same group (URL/title)
-        group_keys = set()
-        for hit in bm25_hits + vector_hits:
-            grp = self._doc_group_key(hit.source or {})
-            if grp and grp != "unknown":
-                group_keys.add(grp)
-
-        expanded_hits = []
-        if group_keys:
-            expanded_hits = self.kb.get_docs_by_group_keys(list(group_keys), k=500)
-
-        original_hit_by_id = {}
+        hit_by_id = {}
         for hit in bm25_hits:
-            original_hit_by_id[hit.id] = hit
+            hit_by_id[hit.id] = hit
         for hit in vector_hits:
-            if hit.id not in original_hit_by_id:
-                original_hit_by_id[hit.id] = hit
+            if hit.id not in hit_by_id:
+                hit_by_id[hit.id] = hit
 
         bm25_ranks = {hit.id: rank for rank, hit in enumerate(bm25_hits)}
         vector_ranks = {hit.id: rank for rank, hit in enumerate(vector_hits)}
-        missing_rank = max(search_pool_k, len(original_hit_by_id))
-
-        group_best_bm25_rank = {}
-        group_best_vector_rank = {}
-        for hit in bm25_hits + vector_hits:
-            grp = self._doc_group_key(hit.source or {})
-            if grp and grp != "unknown":
-                b_r = bm25_ranks.get(hit.id, missing_rank)
-                v_r = vector_ranks.get(hit.id, missing_rank)
-                group_best_bm25_rank[grp] = min(group_best_bm25_rank.get(grp, missing_rank), b_r)
-                group_best_vector_rank[grp] = min(group_best_vector_rank.get(grp, missing_rank), v_r)
-
-        hit_by_id = {}
-        for hit in original_hit_by_id.values():
-            hit_by_id[hit.id] = hit
-        for hit in expanded_hits:
-            if hit.id not in hit_by_id:
-                hit_by_id[hit.id] = hit
+        missing_rank = max(search_pool_k, len(hit_by_id))
 
         # Stage 2: Reciprocal Rank Fusion (same formula as training retriever).
         t_rrf0 = perf_counter()
         rrf_scores = {}
         bm25_weight = 1.35 if verbatim_query else 1.0
         vector_weight = 1.0
-        
-        for doc_id, hit in hit_by_id.items():
-            grp = self._doc_group_key(hit.source or {})
-            if grp and grp != "unknown":
-                bm25_rank = group_best_bm25_rank.get(grp, missing_rank)
-                vector_rank = group_best_vector_rank.get(grp, missing_rank)
-            else:
-                bm25_rank = bm25_ranks.get(doc_id, missing_rank)
-                vector_rank = vector_ranks.get(doc_id, missing_rank)
-                
+        for doc_id in hit_by_id:
+            bm25_rank = bm25_ranks.get(doc_id, missing_rank)
+            vector_rank = vector_ranks.get(doc_id, missing_rank)
             rrf_scores[doc_id] = (bm25_weight / (self.rrf_k + bm25_rank)) + (
                 vector_weight / (self.rrf_k + vector_rank)
             )
@@ -1085,14 +1053,16 @@ class FusionClaimVerifier:
                 
                 new_batch = []
                 batch_date_ranges = {}
+                batch_cleaned_texts = {}
                 for idx, text in batch:
-                    text = re.sub(r'(?i)\b(?:ngày\s+)?hôm nay\b', f'ngày {_today_str}', text)
-                    text = re.sub(r'(?i)\b(?:ngày\s+)?hôm qua\b', f'ngày {_yesterday_str}', text)
-                    text = re.sub(r'(?i)\b(?:ngày\s+)?hôm kia\b', f'ngày {_day_before_str}', text)
-                    text = re.sub(r'(?i)\b(?:ngày\s+)?ngày mai\b', f'ngày {_tomorrow_str}', text)
+                    text = re.sub(r'(?i)\bhôm nay\b', f'ngày {_today_str}', text)
+                    text = re.sub(r'(?i)\bhôm qua\b', f'ngày {_yesterday_str}', text)
+                    text = re.sub(r'(?i)\bhôm kia\b', f'ngày {_day_before_str}', text)
+                    text = re.sub(r'(?i)\bngày mai\b', f'ngày {_tomorrow_str}', text)
                     
-                    min_ts, max_ts = extract_date_range(text)
+                    min_ts, max_ts, cleaned_text = extract_date_range(text)
                     batch_date_ranges[idx] = (min_ts, max_ts)
+                    batch_cleaned_texts[idx] = cleaned_text
                     
                     if not _date_pat.search(text):
                         text = f"{text} (ngày {_today_str})"
@@ -1100,7 +1070,7 @@ class FusionClaimVerifier:
                 batch = new_batch
 
                 # Pre-batch encode tất cả queries trong một lần gọi SentenceTransformer
-                batch_texts_list = [text for _, text in batch]
+                batch_texts_list = [batch_cleaned_texts[idx] for idx, _ in batch]
                 for idx, text in batch:
                     logger.info(f"[fusion_inference] final_claim_to_llm (batch) | idx={idx} | claim={text!r}")
                 t_benc0 = perf_counter()
@@ -1122,8 +1092,9 @@ class FusionClaimVerifier:
                     _idx, _text = item
                     _t0 = perf_counter()
                     min_ts, max_ts = batch_date_ranges.get(_idx, (None, None))
+                    cleaned_text = batch_cleaned_texts.get(_idx, _text)
                     _feat, _interaction, _evidence, _results = _build_retrieval_features_train_compatible(
-                        self.retriever, _text, self.top_k,
+                        self.retriever, cleaned_text, self.top_k,
                         precomputed_vector=vec_map.get(batch_pos),
                         score_features=self.score_features,
                         min_timestamp=min_ts,
@@ -1319,12 +1290,12 @@ class FusionClaimVerifier:
         day_before_str = (now_utc - timedelta(days=2)).strftime("%d/%m/%Y")
         tomorrow_str = (now_utc + timedelta(days=1)).strftime("%d/%m/%Y")
 
-        model_text = re.sub(r'(?i)\b(?:ngày\s+)?hôm nay\b', f'ngày {today_str}', model_text)
-        model_text = re.sub(r'(?i)\b(?:ngày\s+)?hôm qua\b', f'ngày {yesterday_str}', model_text)
-        model_text = re.sub(r'(?i)\b(?:ngày\s+)?hôm kia\b', f'ngày {day_before_str}', model_text)
-        model_text = re.sub(r'(?i)\b(?:ngày\s+)?ngày mai\b', f'ngày {tomorrow_str}', model_text)
+        model_text = re.sub(r'(?i)\bhôm nay\b', f'ngày {today_str}', model_text)
+        model_text = re.sub(r'(?i)\bhôm qua\b', f'ngày {yesterday_str}', model_text)
+        model_text = re.sub(r'(?i)\bhôm kia\b', f'ngày {day_before_str}', model_text)
+        model_text = re.sub(r'(?i)\bngày mai\b', f'ngày {tomorrow_str}', model_text)
 
-        min_ts, max_ts = extract_date_range(model_text)
+        min_ts, max_ts, search_text = extract_date_range(model_text)
 
         has_date = bool(re.search(r"\d{1,2}[/\-]\d{1,2}", model_text) or
                         re.search(r"tháng\s+\d", model_text, re.IGNORECASE))
@@ -1338,7 +1309,7 @@ class FusionClaimVerifier:
         t_retrieval0 = perf_counter()
         retrieval_features_np, doc_emb_np, retrieved_evidence, retrieval_results = (
             _build_retrieval_features_train_compatible(
-                self.retriever, model_text, self.top_k,
+                self.retriever, search_text, self.top_k,
                 score_features=self.score_features,
                 min_timestamp=min_ts,
                 max_timestamp=max_ts,
