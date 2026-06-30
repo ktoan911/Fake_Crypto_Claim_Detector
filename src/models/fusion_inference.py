@@ -97,6 +97,51 @@ def _parse_timestamp(value: Any) -> datetime:
     return ts.astimezone(timezone.utc)
 
 
+def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str]]:
+    now_utc = datetime.now(timezone.utc)
+    current_year = now_utc.year
+    current_month = now_utc.month
+    current_day = now_utc.day
+
+    pat = re.compile(
+        r"(?:ngày\s+)?(\d{1,2})(?:\s*[-/]\s*|\s+tháng\s+)(\d{1,2})(?:(?:\s*[-/]\s*|\s+năm\s+)(\d{2,4}))?", 
+        re.IGNORECASE
+    )
+    
+    matches = pat.findall(text)
+    dates = []
+    for m in matches:
+        d_str, m_str, y_str = m
+        d = int(d_str) if d_str else current_day
+        m_val = int(m_str) if m_str else current_month
+        y = int(y_str) if y_str else current_year
+        if y < 100:
+            y += 2000
+        
+        try:
+            dt = datetime(y, m_val, d, tzinfo=timezone.utc)
+            dates.append(dt)
+        except ValueError:
+            pass
+            
+    if not dates:
+        return None, None
+        
+    dates.sort()
+    
+    if len(dates) == 1:
+        d1 = dates[0]
+        min_dt = d1 - timedelta(days=1)
+        max_dt = d1.replace(hour=23, minute=59, second=59)
+    else:
+        d1 = dates[0]
+        d2 = dates[-1]
+        min_dt = d1
+        max_dt = d2.replace(hour=23, minute=59, second=59)
+        
+    return min_dt.isoformat(), max_dt.isoformat()
+
+
 def _select_doc_text(source: Dict[str, Any]) -> str:
     """Pick evidence text from OpenSearch document source."""
     for key in ("text", "content", "description", "title"):
@@ -158,6 +203,8 @@ def _build_retrieval_features_train_compatible(
     rrf_top_k: int = 100,
     precomputed_vector: Optional[List[float]] = None,
     score_features: int = 5,
+    min_timestamp: Optional[str] = None,
+    max_timestamp: Optional[str] = None,
 ) -> "tuple[np.ndarray, Optional[np.ndarray], List[str], List[RetrievalResult]]":
     """
     Same feature construction used in training.
@@ -165,7 +212,12 @@ def _build_retrieval_features_train_compatible(
     interaction_features is [2*emb_dim] = concat(q⊙mean_d, |q-mean_d|) or None.
     """
     results = retriever.retrieve(
-        text, top_k=top_k, rrf_top_k=rrf_top_k, precomputed_vector=precomputed_vector
+        text, 
+        top_k=top_k, 
+        rrf_top_k=rrf_top_k, 
+        precomputed_vector=precomputed_vector,
+        min_timestamp=min_timestamp,
+        max_timestamp=max_timestamp,
     )
     features = []
     doc_embs = []
@@ -289,6 +341,8 @@ class OpenSearchHybridRetriever:
         use_semantic: bool = True,
         rrf_top_k: int = 20,
         precomputed_vector: Optional[List[float]] = None,
+        min_timestamp: Optional[str] = None,
+        max_timestamp: Optional[str] = None,
     ) -> List[RetrievalResult]:
         debug = _env_flag("FUSION_INFERENCE_DEBUG", default=False) or _env_flag(
             "FUSION_INFERENCE_LOG_ALL", default=False
@@ -336,6 +390,8 @@ class OpenSearchHybridRetriever:
             query=expanded_query,
             k=search_pool_k,
             fields=["title^3", "description^2", "content", "text"],
+            min_timestamp=min_timestamp,
+            max_timestamp=max_timestamp,
         )
         t_bm25_1 = perf_counter()
 
@@ -353,6 +409,8 @@ class OpenSearchHybridRetriever:
             vector_hits = self.kb.search_vector(
                 query_vector=query_vec,
                 k=search_pool_k,
+                min_timestamp=min_timestamp,
+                max_timestamp=max_timestamp,
             )
             t_vector_ms = 1000.0 * (perf_counter() - t_vec0)
 
@@ -1022,10 +1080,13 @@ class FusionClaimVerifier:
                 ) -> Tuple[int, str, Any, Any, List[str], List[str], List[RetrievalResult]]:
                     _idx, _text = item
                     _t0 = perf_counter()
+                    min_ts, max_ts = extract_date_range(_text)
                     _feat, _interaction, _evidence, _results = _build_retrieval_features_train_compatible(
                         self.retriever, _text, self.top_k,
                         precomputed_vector=vec_map.get(batch_pos),
                         score_features=self.score_features,
+                        min_timestamp=min_ts,
+                        max_timestamp=max_ts,
                     )
                     if self.debug:
                         logger.info(
@@ -1232,10 +1293,13 @@ class FusionClaimVerifier:
         logger.info(f"[fusion_inference] final_claim_to_llm={model_text!r}")
 
         t_retrieval0 = perf_counter()
+        min_ts, max_ts = extract_date_range(model_text)
         retrieval_features_np, doc_emb_np, retrieved_evidence, retrieval_results = (
             _build_retrieval_features_train_compatible(
                 self.retriever, model_text, self.top_k,
                 score_features=self.score_features,
+                min_timestamp=min_ts,
+                max_timestamp=max_ts,
             )
         )
         t_retrieval1 = perf_counter()
