@@ -542,8 +542,11 @@ def _crawl_client():
             http_auth=(os.getenv("OP_AUTH_USERNAME"), os.getenv("OP_AUTH_PASSWORD")),
             verify_certs=True,
             http_compress=True,
-            timeout=10,
+            timeout=60,
+            max_retries=3,
+            retry_on_timeout=True,
             connection_class=RequestsHttpConnection,
+            pool_maxsize=20,
         )
     return _crawl_os_client
 
