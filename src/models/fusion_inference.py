@@ -126,9 +126,15 @@ def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str], str]:
             
     if not dates:
         return None, None, text
-        
+
     dates.sort()
-    
+
+    # A future date can't be a reliable reference for "gần đây" retrieval —
+    # narrowing to a window that hasn't happened yet just returns nothing.
+    # Treat it as if no date was found: no filter, full original text kept.
+    if dates[-1].date() > now_utc.date():
+        return None, None, text
+
     if len(dates) == 1:
         d1 = dates[0]
         min_dt = d1
