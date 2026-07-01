@@ -26,7 +26,7 @@ def _extract_url(meta: Dict[str, Any]) -> str:
     return next((str(meta[k]).strip() for k in _URL_KEYS if meta.get(k)), "")
 
 
-def _resolve_fusion_model_path(path_or_repo: str, filename: str = "acf_fusion_model_v2.pt") -> str:
+def _resolve_fusion_model_path(path_or_repo: str, filename: str = "fusion_gold.pt") -> str:
     if os.path.isfile(path_or_repo):
         return path_or_repo
     try:
