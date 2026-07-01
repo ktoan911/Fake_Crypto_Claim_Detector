@@ -80,9 +80,16 @@ def main():
     parser.add_argument(
         "--evidence_mode",
         type=str,
-        default=os.getenv("FUSION_EVIDENCE_MODE", "gold"),
+        default=os.getenv("FUSION_EVIDENCE_MODE", "retrieved"),
         choices=["gold", "retrieved"],
-        help="Evidence source: 'gold' = dùng cột evidence từ CSV, 'retrieved' = retriever tìm kiếm (default: gold)",
+        help="Evidence source: 'gold' = dùng cột evidence từ CSV, 'retrieved' = retriever tìm kiếm "
+        "(default: retrieved, phải khớp với evidence thực tế lúc serving)",
+    )
+    parser.add_argument(
+        "--llm_evidence_top_k",
+        type=int,
+        default=int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "5")),
+        help="Số bằng chứng đưa vào LLM judge, phải khớp FUSION_LLM_EVIDENCE_TOP_K lúc serving",
     )
 
     args = parser.parse_args()

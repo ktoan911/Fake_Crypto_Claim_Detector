@@ -37,13 +37,18 @@ class FusionTrainingConfig:
     lambda_decay: float = 0.1
     gamma: float = 0.5
     initial_beta: float = (
-        0.8  # Give retrieval branch 20% weight from the start to force it to learn.
+        0.5  # Start with LLM and retrieval branches weighted equally.
     )
     lambda_reg: float = 0.0
     max_length: int = 2048
     evidence_mode: str = (
-        "gold"  # "gold" or "retrieved"
+        "retrieved"  # "gold" or "retrieved". Must match serving (api_server.py uses retrieved
+        # evidence), otherwise beta learns to over-trust the LLM branch on clean gold evidence
+        # and then fails at serve time when retrieval evidence is noisy/truncated.
     )
+    llm_evidence_top_k: int = int(
+        os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "5")
+    )  # Must match FUSION_LLM_EVIDENCE_TOP_K used at serving time.
     label_list: List[str] = field(default_factory=lambda: LABEL_LIST)
     retriever_model: str = "bge-vi-base"
     use_class_weights: bool = (
@@ -569,7 +574,7 @@ def train_fusion_from_dataframe(
         all_retrieval_base.append(feats)
         all_interactions.append(interaction)
         all_evidence_raw.append(evidence)
-        all_retrieved_evidences.append(evidence[:3])
+        all_retrieved_evidences.append(evidence[: config.llm_evidence_top_k])
         if (idx + 1) % 50 == 0:
             logger.info(f"  Retrieved {idx + 1}/{len(texts)} samples")
 
