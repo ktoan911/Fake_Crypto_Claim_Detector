@@ -657,6 +657,8 @@ class FusionClaimVerifier:
         # Số doc tối đa đưa vào NLI — đủ để lấy signal, không cần tất cả top_k.
         # Giảm từ top_k (10) xuống 5 cắt ~50% NLI time, accuracy giảm không đáng kể.
         self._nli_top_k = int(os.getenv("NLI_EVIDENCE_TOP_K", str(min(5, self.top_k))))
+        self.nli_override_enabled = _env_flag("NLI_OVERRIDE_ENABLED", default=True)
+        self.nli_override_threshold = float(os.getenv("NLI_OVERRIDE_THRESHOLD", "0.5"))
         self.retrieval_encoder = RetrievalFeatureEncoder(
             num_retrieved=self.top_k,
             score_features=self.score_features,
@@ -839,6 +841,30 @@ class FusionClaimVerifier:
                 nli_padded[:n_real] = nli_flat[start : start + n_real]
             out.append(nli_padded)
         return out
+
+    def _apply_nli_conflict_guard(
+        self, pred_id: int, probs: "torch.Tensor", nli_top_evidence: Optional[np.ndarray]
+    ) -> Tuple[int, float, bool]:
+        """Downgrade to 'Chưa chắc chắn' when the fusion verdict directly
+        contradicts what NLI says about the single highest-ranked evidence.
+
+        The LLM branch and the retrieval-branch MLP can independently land on
+        the same wrong verdict (both undertrained on "authority denies a
+        viral claim" patterns) even though NLI on the top evidence alone is
+        correct. Rather than trusting the learned fusion weight to resolve
+        that conflict, treat a strong NLI disagreement as reason to flag the
+        case for review instead of asserting a confident but likely-wrong
+        Đúng/Sai.
+        """
+        confidence = float(probs[pred_id].item())
+        if not self.nli_override_enabled or nli_top_evidence is None or pred_id == 2:
+            return pred_id, confidence, False
+        nli_argmax = int(np.argmax(nli_top_evidence))
+        nli_confidence = float(nli_top_evidence[nli_argmax])
+        conflict = (pred_id == 0 and nli_argmax == 2) or (pred_id == 1 and nli_argmax == 0)
+        if conflict and nli_confidence >= self.nli_override_threshold:
+            return 2, float(probs[2].item()), True
+        return pred_id, confidence, False
 
     # ------------------------------------------------------------------
     # Claims index
@@ -1146,6 +1172,7 @@ class FusionClaimVerifier:
 
                 # Merge NLI features into score features if checkpoint was trained with NLI
                 t_nli0 = perf_counter()
+                nli_list: Optional[List[np.ndarray]] = None
                 if self.nli_model_name:
                     nli_list = self._nli_for_batch(valid_claims, all_retrieval_results_list)
                     all_retrieval_features = [
@@ -1190,15 +1217,26 @@ class FusionClaimVerifier:
                 pred_ids = torch.argmax(probs_batch, dim=-1).cpu().tolist()
                 confidences = torch.max(probs_batch, dim=-1)[0].cpu().tolist()
 
-                for v_idx, text, llm_ev, links, pred_id, conf in zip(
+                for pos, (v_idx, text, llm_ev, links, pred_id, conf) in enumerate(zip(
                     valid_indices,
                     valid_claims,
                     all_llm_evidences,
                     all_source_links,
                     pred_ids,
                     confidences,
-                ):
+                )):
                     pred_id_int = int(pred_id)
+                    nli_top_evidence = nli_list[pos][0] if nli_list is not None else None
+                    pred_id_int, conf, nli_overridden = self._apply_nli_conflict_guard(
+                        pred_id_int, probs_batch[pos], nli_top_evidence
+                    )
+                    if nli_overridden:
+                        logger.info(
+                            "[fusion_inference] nli_conflict_guard_triggered (batch)"
+                            f" | idx={v_idx} | fusion_pred_id={int(pred_id)}"
+                            f" | nli_top_evidence={np.array2string(nli_top_evidence, precision=4)}"
+                            " | downgraded_to=C (Chưa chắc chắn)"
+                        )
                     pred_label = self.label_list[pred_id_int]
                     if pred_id_int == 0:
                         verdict = "Đúng"
@@ -1399,6 +1437,7 @@ class FusionClaimVerifier:
 
         # Append NLI features if checkpoint was trained with NLI
         t_nli0 = perf_counter()
+        nli_feats: Optional[np.ndarray] = None
         if self.nli_model_name:
             nli_feats = self._nli_for_claim(model_text, retrieval_results)
             if nli_feats is not None:
@@ -1463,6 +1502,18 @@ class FusionClaimVerifier:
             probs = fusion_output.final_probs[0]
             pred_id = int(torch.argmax(probs).item())
             confidence = float(probs[pred_id].item())
+
+            nli_top_evidence = nli_feats[0] if nli_feats is not None else None
+            pred_id, confidence, nli_overridden = self._apply_nli_conflict_guard(
+                pred_id, probs, nli_top_evidence
+            )
+            if nli_overridden:
+                logger.info(
+                    "[fusion_inference] nli_conflict_guard_triggered"
+                    f" | fusion_pred_id={int(torch.argmax(fusion_output.final_probs[0]).item())}"
+                    f" | nli_top_evidence={np.array2string(nli_top_evidence, precision=4)}"
+                    " | downgraded_to=C (Chưa chắc chắn)"
+                )
 
             if self.debug:
                 logger.info(
