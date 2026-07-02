@@ -888,7 +888,7 @@ class FusionClaimVerifier:
         self.llm = LLMScorer(
             model_name=model_name,
             device=self.device,
-            max_length=int(os.getenv("LLM_MAX_LENGTH", "8192")),
+            max_length=int(os.getenv("LLM_MAX_LENGTH", "6144")),
             labels=self.label_list,
             prompt_template=PROMPT_TEMPLATE,
         )
@@ -931,19 +931,6 @@ class FusionClaimVerifier:
         logger.info(
             f"[fusion_inference] warmup done | elapsed_ms={1000.0 * (perf_counter() - t0):.0f}"
         )
-
-    # ------------------------------------------------------------------
-    # GPU memory
-    # ------------------------------------------------------------------
-    def _clear_gpu_memory(self) -> None:
-        """Giải phóng VRAM còn sót lại từ lần predict trước (cache allocator
-        của PyTorch giữ lại các block đã free để tái sử dụng, gây phân mảnh
-        và OOM giả ở các câu tiếp theo dù tổng bộ nhớ đang dùng không tăng)."""
-        gc.collect()
-        if self.device != "cpu" and torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
 
     # ------------------------------------------------------------------
     # NLI helpers
@@ -1443,7 +1430,7 @@ class FusionClaimVerifier:
                 del retrieval_encoded
                 del fusion_output
                 del probs_batch
-                self._clear_gpu_memory()
+                gc.collect()
 
         batch_elapsed_ms = 1000.0 * (perf_counter() - t0)
         self._last_batch_timing = {
@@ -1459,7 +1446,6 @@ class FusionClaimVerifier:
         return [r for r in results if r is not None]
 
     def predict(self, claim: str) -> ClaimPrediction:
-        self._clear_gpu_memory()
         t0 = perf_counter()
         text = str(claim).strip()
         if not text:
@@ -1788,7 +1774,6 @@ class FusionClaimVerifier:
         return prediction
 
     def predict_batch(self, claims: List[str]) -> List[ClaimPrediction]:
-        self._clear_gpu_memory()
         t0 = perf_counter()
         if not claims:
             return []

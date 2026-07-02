@@ -10,6 +10,7 @@ import traceback
 
 # Phải set trước khi import torch để có hiệu lực.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import torch
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -442,6 +443,17 @@ async def verify_claim(request: ClaimRequest, http_request: Request):
                 "verdict": "Lỗi xử lý",
                 "status": "error",
                 "error": f"Inference quá {_inference_timeout_s}s — vui lòng thử lại.",
+            },
+        )
+    except torch.cuda.OutOfMemoryError:
+        logger.error(f"[verify] CUDA OOM key={cache_key[:8]}…")
+        torch.cuda.empty_cache()
+        return JSONResponse(
+            status_code=503,
+            content={
+                "verdict": "Lỗi xử lý",
+                "status": "error",
+                "error": "Máy chủ đang quá tải bộ nhớ GPU — vui lòng thử lại sau ít phút.",
             },
         )
     except Exception:

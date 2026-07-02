@@ -38,7 +38,7 @@ class FusionTrainingConfig:
     gamma: float = 0.5
     initial_beta: float = 0.7
     lambda_reg: float = 0.0
-    max_length: int = 8192
+    max_length: int = 6144
     evidence_mode: str = (
         "retrieved"  # "gold" or "retrieved". Must match serving (api_server.py uses retrieved
         # evidence), otherwise beta learns to over-trust the LLM branch on clean gold evidence

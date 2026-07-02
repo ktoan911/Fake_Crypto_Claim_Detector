@@ -59,7 +59,7 @@ class LoRATrainingConfig:
     batch_size: int = 1
     epochs: int = 3
     learning_rate: float = 5e-5
-    max_length: int = 8192
+    max_length: int = 6144
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
