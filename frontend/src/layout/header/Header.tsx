@@ -28,7 +28,18 @@ export default function Header() {
 
   const isItemSelected = (item: MenuItem) => {
     if (item.href.startsWith("/")) return pathname === item.href;
-    return activeHash === item.label;
+    return pathname === "/dashboard" && activeHash === item.label;
+  };
+
+  // Các mục là anchor (#content-report, #campaigns, #latest-claims) chỉ tồn tại
+  // trên trang dashboard, nên khi đang ở trang khác (vd: /verify) cần điều
+  // hướng về "/dashboard" trước rồi mới scroll tới đúng vị trí.
+  const resolveHref = (item: MenuItem) => {
+    if (item.comingSoon) return "#";
+    if (item.href.startsWith("#") && pathname !== "/dashboard") {
+      return `/dashboard${item.href}`;
+    }
+    return item.href;
   };
 
   return (
@@ -45,12 +56,12 @@ export default function Header() {
           </div>
           <div className="h-full hidden lg:flex items-center justify-center ">
             <div className="hidden lg:flex items-center gap-12 mt-1.5">
-              {MENU_ITEMS.filter((item) => pathname !== "/verify").map((item) => {
+              {MENU_ITEMS.map((item) => {
                 const isSelected = isItemSelected(item);
                 return (
                   <Link
                     key={item.href}
-                    href={item.comingSoon ? "#" : item.href}
+                    href={resolveHref(item)}
                     onClick={() => {
                       if (!item.comingSoon && item.href.startsWith("#"))
                         setActiveHash(item.label);
@@ -84,12 +95,12 @@ export default function Header() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-56">
-                {MENU_ITEMS.filter((item) => pathname !== "/verify").map((item: MenuItem) => {
+                {MENU_ITEMS.map((item: MenuItem) => {
                   const isSelected = isItemSelected(item);
                   return (
                     <Link
                       key={item.href}
-                      href={item.comingSoon ? "#" : item.href}
+                      href={resolveHref(item)}
                       onClick={() => {
                         if (!item.comingSoon && item.href.startsWith("#"))
                           setActiveHash(item.label);

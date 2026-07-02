@@ -33,8 +33,8 @@ type AdminMenuItem = {
 };
 
 const ADMIN_MENU_ITEMS: AdminMenuItem[] = [
-  { label: "Overview",      href: "/admin",                  icon: LayoutDashboard },
-  { label: "Analytics",     href: "/admin#campaigns",        icon: BarChart3       },
+  { label: "Tổng quan",      href: "/admin",                  icon: LayoutDashboard },
+  { label: "Phân Tích",     href: "/admin#campaigns",        icon: BarChart3       },
   { label: "Crawling Logs", href: "/admin#crawling-logs",   icon: FileText        },
   { label: "Server Logs",   href: "/admin#server-logs",     icon: Server          },
 ];
@@ -107,7 +107,7 @@ export default function HeaderAdmin({ children }: AdminShellProps) {
         {/* Section label */}
         <div className="px-5 pt-5 pb-2">
           <span className="text-xs font-medium tracking-widest text-gray-400 dark:text-slate-500">
-            NAVIGATION
+            Điều hướng
           </span>
         </div>
 
@@ -214,7 +214,7 @@ export default function HeaderAdmin({ children }: AdminShellProps) {
                 }}
               >
                 <LogOut className="h-4 w-4" />
-                Logout
+                Đăng xuất
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
