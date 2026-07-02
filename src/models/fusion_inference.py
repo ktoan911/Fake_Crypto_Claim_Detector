@@ -20,6 +20,10 @@ from src.database.opensearch import OpenSearchKB
 from src.llm_call import rewrite_claim
 from src.retrieval.retrieval import QueryExpander, RetrievalResult, TemporalScorer
 
+# Nhãn hiển thị theo đúng thứ tự index của model (0=Đúng, 1=Sai, 2=Chưa chắc chắn),
+# tách biệt với self.label_list (A/B/C) vốn chỉ dùng cho prompt LLM.
+VERDICT_ORDER = ["Đúng", "Sai", "Chưa chắc chắn"]
+
 _URL_KEYS: Tuple[str, ...] = ("article_url", "url", "link", "source_url")
 
 
@@ -929,6 +933,19 @@ class FusionClaimVerifier:
         )
 
     # ------------------------------------------------------------------
+    # GPU memory
+    # ------------------------------------------------------------------
+    def _clear_gpu_memory(self) -> None:
+        """Giải phóng VRAM còn sót lại từ lần predict trước (cache allocator
+        của PyTorch giữ lại các block đã free để tái sử dụng, gây phân mảnh
+        và OOM giả ở các câu tiếp theo dù tổng bộ nhớ đang dùng không tăng)."""
+        gc.collect()
+        if self.device != "cpu" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+    # ------------------------------------------------------------------
     # NLI helpers
     # ------------------------------------------------------------------
     def _ensure_nli_loaded(self) -> None:
@@ -1139,7 +1156,7 @@ class FusionClaimVerifier:
         if probs_sources:
             avg_label_probs = {
                 label: sum(probs.get(label, 0.0) for probs in probs_sources) / len(probs_sources)
-                for label in self.label_list
+                for label in VERDICT_ORDER
             }
 
         for p in sub_preds:
@@ -1408,7 +1425,7 @@ class FusionClaimVerifier:
                         verdict = "Chưa chắc chắn"
                     label_probs = {
                         label: float(probs_batch[pos][i].item())
-                        for i, label in enumerate(self.label_list)
+                        for i, label in enumerate(VERDICT_ORDER)
                     }
                     results[v_idx] = ClaimPrediction(
                         claim=text,
@@ -1426,7 +1443,7 @@ class FusionClaimVerifier:
                 del retrieval_encoded
                 del fusion_output
                 del probs_batch
-                gc.collect()
+                self._clear_gpu_memory()
 
         batch_elapsed_ms = 1000.0 * (perf_counter() - t0)
         self._last_batch_timing = {
@@ -1442,6 +1459,7 @@ class FusionClaimVerifier:
         return [r for r in results if r is not None]
 
     def predict(self, claim: str) -> ClaimPrediction:
+        self._clear_gpu_memory()
         t0 = perf_counter()
         text = str(claim).strip()
         if not text:
@@ -1751,7 +1769,7 @@ class FusionClaimVerifier:
             )
 
         label_probs = {
-            label: float(probs[i].item()) for i, label in enumerate(self.label_list)
+            label: float(probs[i].item()) for i, label in enumerate(VERDICT_ORDER)
         }
         prediction = ClaimPrediction(
             claim=text,
@@ -1770,6 +1788,7 @@ class FusionClaimVerifier:
         return prediction
 
     def predict_batch(self, claims: List[str]) -> List[ClaimPrediction]:
+        self._clear_gpu_memory()
         t0 = perf_counter()
         if not claims:
             return []
