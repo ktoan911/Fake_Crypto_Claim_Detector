@@ -16,6 +16,7 @@ interface VerifyApiResponse {
   evidence?: string[];
   source_links?: string[];
   confidence?: number;
+  label_probs?: Record<string, number>;
   error?: string;
 }
 
@@ -162,6 +163,70 @@ function ConfidenceBar({ confidence }: { confidence: number }) {
 }
 
 
+const LABEL_ORDER = ["Đúng", "Sai", "Chưa chắc chắn"];
+
+function LabelProbsSection({
+  labelProbs,
+  activeVerdict,
+}: {
+  labelProbs: Record<string, number>;
+  activeVerdict: string;
+}) {
+  const labels = LABEL_ORDER.filter((label) => label in labelProbs);
+
+  return (
+    <div
+      className="rounded-2xl shadow-md p-6 border mt-4"
+      style={{ backgroundColor: "var(--card-bg)", borderColor: "var(--border)" }}
+    >
+      <p className="font-semibold text-sm mb-4">Phân Bố Xác Suất Theo Nhãn</p>
+      <div className="space-y-4">
+        {labels.map((label) => {
+          const cfg = getVerdictConfig(label);
+          const pct = Math.round(labelProbs[label] * 100);
+          const isActive = label === activeVerdict;
+
+          return (
+            <div key={label}>
+              <div className="flex items-center justify-between mb-1.5">
+                <span
+                  className="text-sm"
+                  style={{
+                    color: isActive ? cfg.text : "var(--foreground)",
+                    fontWeight: isActive ? 600 : 400,
+                    opacity: isActive ? 1 : 0.7,
+                  }}
+                >
+                  {cfg.label}
+                </span>
+                <span
+                  className="text-sm font-semibold"
+                  style={{ color: isActive ? cfg.text : "var(--foreground)", opacity: isActive ? 1 : 0.7 }}
+                >
+                  {pct}%
+                </span>
+              </div>
+              <div
+                className="relative h-2 rounded-full overflow-hidden"
+                style={{ backgroundColor: "var(--secondary)" }}
+              >
+                <div
+                  className="absolute inset-y-0 left-0 rounded-full transition-all duration-700"
+                  style={{
+                    width: `${pct}%`,
+                    background: `linear-gradient(90deg, ${cfg.gradientFrom}, ${cfg.gradientTo})`,
+                    opacity: isActive ? 1 : 0.5,
+                  }}
+                />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function SourceLinksSection({ links }: { links: string[] }) {
   if (!links || links.length === 0) return null;
 
@@ -243,9 +308,17 @@ export default function VerificationResultSection({
         </div>
       </div>
 
-      {/* Confidence */}
-      {result.confidence !== undefined && result.status === "success" && (
-        <ConfidenceBar confidence={result.confidence} />
+      {/* Label probability breakdown (all 3 nhãn kèm phần trăm) */}
+      {result.status === "success" && result.label_probs ? (
+        <LabelProbsSection
+          labelProbs={result.label_probs}
+          activeVerdict={result.verdict}
+        />
+      ) : (
+        result.confidence !== undefined &&
+        result.status === "success" && (
+          <ConfidenceBar confidence={result.confidence} />
+        )
       )}
 
       {/* Sources */}

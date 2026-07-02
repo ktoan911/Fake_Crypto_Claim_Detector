@@ -392,6 +392,35 @@ class OpenSearchKB:
             for h in hits
         ]
 
+    def get_by_field_values(
+        self, field: str, values: List[str], size: int = 200
+    ) -> List[SearchHit]:
+        """Fetch every document whose `{field}.keyword` matches any of `values`.
+
+        Used to pull all chunks belonging to the same article (grouped by
+        article_url) in one round-trip, e.g. to reconstruct the full article
+        from its individually-indexed chunks.
+        """
+        unique_values = sorted({v for v in values if v})
+        if not unique_values:
+            return []
+        body = {
+            "size": size,
+            "query": {
+                "bool": {"filter": [{"terms": {f"{field}.keyword": unique_values}}]}
+            },
+        }
+        resp = self.client.search(index=self.index, body=body)
+        hits = resp.get("hits", {}).get("hits", [])
+        return [
+            SearchHit(
+                id=str(h.get("_id")),
+                score=float(h.get("_score", 0.0) or 0.0),
+                source=h.get("_source", {}) or {},
+            )
+            for h in hits
+        ]
+
     def count_docs(self) -> int:
         """Return document count, cached for 60 s to avoid a round-trip on every retrieve."""
         now = time.monotonic()

@@ -275,6 +275,19 @@ def looks_like_article_url(full_url: str, title: str) -> bool:
     return score >= 2
 
 
+def looks_like_listing_page(url: str) -> bool:
+    """Category/section pages (e.g. 'cafef.vn/vi-mo-dau-tu.chn') aggregate many
+    unrelated headline blurbs and have no single-article identity. Real article
+    URLs on these sites always embed a long numeric id/timestamp in the last
+    path segment (e.g. '...-20260630113411990.htm'); listing/section pages and
+    static info pages don't. Pages without that numeric fingerprint are
+    treated as listing pages and excluded from indexing.
+    """
+    path = urlparse(url).path
+    last_segment = path.rstrip("/").rsplit("/", 1)[-1]
+    return not re.search(r"\d{6,}", last_segment)
+
+
 def _normalize_iso_datetime(value: str | None) -> str | None:
     """Coerce loose date strings into ISO-8601 UTC. Return None if unparseable."""
     if not value:
@@ -1066,6 +1079,8 @@ async def main(args):
             ).strip()
             if not content:
                 continue
+            if looks_like_listing_page(item.get("article_url", "")):
+                continue
             chunk_id_raw = item.get("article_url", "") + "_0"
             # Nếu không parse được ngày đăng, dùng thời điểm cào làm fallback
             pub_at = item.get("published_at") or datetime.now(timezone.utc).isoformat()
@@ -1088,7 +1103,7 @@ async def main(args):
     # ---------------------------------------------------------------------------
     # Late Chunking helpers
     # ---------------------------------------------------------------------------
-    def _split_sentences(text: str, chunk_size: int = 1500) -> list[str]:
+    def _split_sentences(text: str, chunk_size: int = 4096) -> list[str]:
         """Tách văn bản thành các câu, gộp câu ngắn lại cho đến khi đủ chunk_size."""
         # Fix (6): Không tách sau viết tắt dạng "TP.", "TS.", "PGS.", "GS.", v.v.
         sentences = [
@@ -1149,10 +1164,12 @@ async def main(args):
 
             if not content:
                 continue
+            if looks_like_listing_page(item.get("article_url", "")):
+                continue
 
             # Bước 1: Xác định ranh giới chunk (câu / nhóm câu)
             chunk_texts = (
-                _split_sentences(content) if len(content) > 1500 else [content]
+                _split_sentences(content) if len(content) > 4096 else [content]
             )
 
             # Bước 2: Tính embedding từng chunk riêng lẻ
@@ -1190,6 +1207,10 @@ async def main(args):
                 )
                 chunk_id_raw = f"{new_item.get('article_url', '')}_{chunk_idx}"
                 new_item["id"] = hashlib.md5(chunk_id_raw.encode("utf-8")).hexdigest()
+                # chunk_idx/chunk_count cho phép ghép lại đúng thứ tự thành bài
+                # hoàn chỉnh lúc retrieval (xem OpenSearchHybridRetriever._dedupe_and_fetch_full_articles).
+                new_item["chunk_idx"] = chunk_idx
+                new_item["chunk_count"] = len(chunk_texts)
                 # Fix (5): chỉ gán embedding nếu dim khớp với expected_dim
                 if emb and len(emb) == expected_dim:
                     new_item["embedding"] = emb

@@ -198,7 +198,7 @@ async def lifespan(app: FastAPI):
                 "RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding"
             ),
             device=os.getenv("DEVICE", "cpu"),
-            llm_evidence_top_k=int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "5")),
+            llm_evidence_top_k=int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "10")),
             debug=True,
         )
         logger.info(f"[startup] FusionClaimVerifier ready ✓ | timeout={_inference_timeout_s}s")
@@ -428,6 +428,7 @@ async def verify_claim(request: ClaimRequest, http_request: Request):
             "evidence": prediction.evidence,
             "source_links": prediction.source_links,
             "confidence": prediction.confidence,
+            "label_probs": prediction.label_probs,
             "timing_ms": {**inference_timing, **api_timing},
         }
         _claim_cache.set(cache_key, result)

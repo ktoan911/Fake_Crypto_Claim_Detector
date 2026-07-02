@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 from loguru import logger
@@ -24,6 +25,21 @@ _URL_KEYS: Tuple[str, ...] = ("article_url", "url", "link", "source_url")
 
 def _extract_url(meta: Dict[str, Any]) -> str:
     return next((str(meta[k]).strip() for k in _URL_KEYS if meta.get(k)), "")
+
+
+def _looks_like_listing_page(url: str) -> bool:
+    """Category/section pages (e.g. 'cafef.vn/vi-mo-dau-tu.chn') aggregate many
+    unrelated headline blurbs and have no single-article identity. Real
+    article URLs on these sites always embed a long numeric id/timestamp in
+    the last path segment; listing/section pages and static info pages don't.
+    Mirrors looks_like_listing_page in the crawler — kept separate since the
+    crawler module isn't importable from serving without its scrape deps.
+    """
+    if not url:
+        return False
+    path = urlparse(url).path
+    last_segment = path.rstrip("/").rsplit("/", 1)[-1]
+    return not re.search(r"\d{6,}", last_segment)
 
 
 def _resolve_fusion_model_path(path_or_repo: str, filename: str = "fusion_gold.pt") -> str:
@@ -162,6 +178,48 @@ def _select_doc_text(source: Dict[str, Any]) -> str:
     return ""
 
 
+# Long articles are split into multiple chunk-documents at crawl time (see
+# crawler.py _split_sentences). A handful of indexed "documents" are actually
+# category/listing pages (many unrelated headline blurbs stitched together,
+# not a real article) — these can explode into far more chunks than any real
+# article would. Cap both the chunk count and merged length so we never feed
+# that kind of noise into the LLM as if it were one coherent article.
+_MAX_CHUNKS_TO_MERGE = 8
+_MAX_MERGED_ARTICLE_CHARS = 8000
+
+
+def _merge_article_chunks(title: str, chunk_hits: List[Any]) -> Optional[str]:
+    """Reconstruct the full article text from its ordered chunk-documents.
+
+    Returns None when reconstruction isn't safe (missing chunk_idx on legacy
+    data crawled before this field existed, or too many chunks to plausibly
+    be one article) — callers should keep the original single-chunk text.
+    """
+    if len(chunk_hits) <= 1:
+        return None
+    if len(chunk_hits) > _MAX_CHUNKS_TO_MERGE:
+        return None
+    if any(h.source.get("chunk_idx") is None for h in chunk_hits):
+        return None
+
+    ordered = sorted(chunk_hits, key=lambda h: h.source.get("chunk_idx"))
+    pieces = []
+    for h in ordered:
+        content = str(h.source.get("content") or "").strip()
+        if title and content.startswith(title):
+            content = content[len(title):].strip()
+        if content:
+            pieces.append(content)
+    if not pieces:
+        return None
+
+    merged = (f"{title} " if title else "") + " ".join(pieces)
+    merged = merged.strip()
+    if len(merged) > _MAX_MERGED_ARTICLE_CHARS:
+        merged = merged[:_MAX_MERGED_ARTICLE_CHARS].rstrip() + "…"
+    return merged or None
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -214,19 +272,27 @@ def _build_retrieval_features_train_compatible(
     score_features: int = 5,
     min_timestamp: Optional[str] = None,
     max_timestamp: Optional[str] = None,
+    evidence_top_k: Optional[int] = None,
 ) -> "tuple[np.ndarray, Optional[np.ndarray], List[str], List[RetrievalResult]]":
     """
     Same feature construction used in training.
     Returns (score_features_array, interaction_features, evidence_texts, results).
     interaction_features is [2*emb_dim] = concat(q⊙mean_d, |q-mean_d|) or None.
+
+    `top_k` sizes the numeric feature matrix (padded to exactly `top_k` rows
+    below — required, the retrieval-branch MLP was trained on that fixed
+    shape). `evidence_top_k`, if smaller, independently caps how many
+    deduped/full-article evidence texts survive — it never changes the
+    padded feature matrix shape.
     """
     results = retriever.retrieve(
-        text, 
-        top_k=top_k, 
-        rrf_top_k=rrf_top_k, 
+        text,
+        top_k=top_k,
+        rrf_top_k=rrf_top_k,
         precomputed_vector=precomputed_vector,
         min_timestamp=min_timestamp,
         max_timestamp=max_timestamp,
+        evidence_top_k=evidence_top_k,
     )
     features = []
     doc_embs = []
@@ -299,6 +365,63 @@ class OpenSearchHybridRetriever:
         # Ensure dimension check in OpenSearch wrapper matches the active encoder.
         self.kb.embedding_dim = self.embedding_dim
 
+    def _dedupe_and_fetch_full_articles(
+        self, ranked_items: List[RetrievalResult], top_k: int
+    ) -> List[RetrievalResult]:
+        """Drop duplicate chunks from the same article, then swap each kept
+        item's chunk text for the reconstructed full article when possible.
+
+        Dedup only looks within the original top_k window — a dropped
+        duplicate is NOT backfilled from lower-ranked candidates. Once a
+        chunk is expanded into its full article, pulling in more (lower
+        relevance) evidence on top risks both dragging in tangential
+        sentences and blowing past the LLM's context budget, since each
+        item is now a full article instead of a short chunk. Ending up with
+        fewer, cleaner evidence items is the intended tradeoff.
+
+        `ranked_items` should already be sorted best-first so the highest
+        scoring chunk of each article is the one that survives dedup.
+        """
+        deduped: List[RetrievalResult] = []
+        seen_urls: set = set()
+        for item in ranked_items[:top_k]:
+            url = _extract_url(item.metadata or {})
+            if url:
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+            deduped.append(item)
+
+        urls_to_fetch = sorted(
+            {_extract_url(item.metadata or {}) for item in deduped} - {""}
+        )
+        if not urls_to_fetch:
+            return deduped
+
+        try:
+            chunk_hits = self.kb.get_by_field_values("article_url", urls_to_fetch)
+        except Exception as exc:
+            logger.warning(f"[fusion_inference] full_article_fetch_failed: {exc}")
+            return deduped
+
+        hits_by_url: Dict[str, List[Any]] = {}
+        for hit in chunk_hits:
+            hit_url = str((hit.source or {}).get("article_url") or "").strip()
+            if hit_url:
+                hits_by_url.setdefault(hit_url, []).append(hit)
+
+        for item in deduped:
+            url = _extract_url(item.metadata or {})
+            group = hits_by_url.get(url) if url else None
+            if not group:
+                continue
+            title = str((item.metadata or {}).get("title") or "").strip()
+            merged = _merge_article_chunks(title, group)
+            if merged:
+                item.text = merged
+
+        return deduped
+
     def _get_search_pool_size(self, rrf_top_k: int) -> int:
         """
         Fetch a sufficiently large pool for RRF ranking without fetching the entire DB.
@@ -353,6 +476,7 @@ class OpenSearchHybridRetriever:
         precomputed_vector: Optional[List[float]] = None,
         min_timestamp: Optional[str] = None,
         max_timestamp: Optional[str] = None,
+        evidence_top_k: Optional[int] = None,
     ) -> List[RetrievalResult]:
         debug = _env_flag("FUSION_INFERENCE_DEBUG", default=False) or _env_flag(
             "FUSION_INFERENCE_LOG_ALL", default=False
@@ -446,6 +570,15 @@ class OpenSearchHybridRetriever:
             if hit.id not in hit_by_id:
                 hit_by_id[hit.id] = hit
 
+        if _env_flag("FUSION_LISTING_PAGE_FILTER_ENABLED", default=True):
+            hit_by_id = {
+                doc_id: hit
+                for doc_id, hit in hit_by_id.items()
+                if not _looks_like_listing_page(_extract_url(hit.source or {}))
+            }
+            if not hit_by_id:
+                return []
+
         bm25_ranks = {hit.id: rank for rank, hit in enumerate(bm25_hits)}
         vector_ranks = {hit.id: rank for rank, hit in enumerate(vector_hits)}
         missing_rank = max(search_pool_k, len(hit_by_id))
@@ -527,6 +660,23 @@ class OpenSearchHybridRetriever:
 
         final_items.sort(key=lambda x: x.score, reverse=True)
 
+        # top_k drives the fixed-size numeric retrieval-branch features (the
+        # model was trained expecting exactly self.top_k rows, zero-padded by
+        # _build_retrieval_features_train_compatible if fewer come back — see
+        # that function). evidence_top_k is the independent, smaller-or-equal
+        # cap on how many deduped/full-article evidence *texts* actually get
+        # kept — it must never widen the window past top_k.
+        dedup_window = top_k
+        if evidence_top_k is not None:
+            dedup_window = min(top_k, max(1, int(evidence_top_k)))
+
+        t_fullart0 = perf_counter()
+        if _env_flag("FUSION_FULL_ARTICLE_ENABLED", default=True):
+            final_items = self._dedupe_and_fetch_full_articles(final_items, dedup_window)
+        else:
+            final_items = final_items[:dedup_window]
+        t_fullart1 = perf_counter()
+
         if debug:
             t_total = 1000.0 * (perf_counter() - t_retrieve_start)
             logger.info(
@@ -537,10 +687,12 @@ class OpenSearchHybridRetriever:
                 f" | encode_ms={t_encode_ms:.1f}"
                 f" | vector_ms={t_vector_ms:.1f}"
                 f" | rrf_temporal_ms={1000.0*(t_rrf1-t_rrf0):.1f}"
+                f" | full_article_ms={1000.0*(t_fullart1-t_fullart0):.1f}"
+                f" | n_results={len(final_items)}"
                 f" | total_ms={t_total:.1f}"
             )
 
-        return final_items[:top_k]
+        return final_items
 
 
 @dataclass
@@ -553,6 +705,7 @@ class ClaimPrediction:
     evidence: List[str]
     source_links: List[str]
     timing_ms: Optional[Dict[str, float]] = None
+    label_probs: Optional[Dict[str, float]] = None
 
 
 class FusionClaimVerifier:
@@ -613,7 +766,7 @@ class FusionClaimVerifier:
 
         self.top_k = int(self.saved_config.get("top_k", 10))
         if llm_evidence_top_k is None:
-            llm_evidence_top_k = int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "5"))
+            llm_evidence_top_k = int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "10"))
         self.llm_evidence_top_k = max(1, int(llm_evidence_top_k))
         llm_batch_env = os.getenv("LLM_INFER_BATCH_SIZE") or os.getenv("FUSION_LLM_INFER_BATCH_SIZE", "1")
         try:
@@ -731,7 +884,7 @@ class FusionClaimVerifier:
         self.llm = LLMScorer(
             model_name=model_name,
             device=self.device,
-            max_length=int(os.getenv("LLM_MAX_LENGTH", "1024")),
+            max_length=int(os.getenv("LLM_MAX_LENGTH", "8192")),
             labels=self.label_list,
             prompt_template=PROMPT_TEMPLATE,
         )
@@ -981,6 +1134,13 @@ class FusionClaimVerifier:
         avg_conf = (
             sum(p.confidence for p in sub_preds) / len(sub_preds) if sub_preds else 0.0
         )
+        avg_label_probs: Optional[Dict[str, float]] = None
+        probs_sources = [p.label_probs for p in sub_preds if p.label_probs]
+        if probs_sources:
+            avg_label_probs = {
+                label: sum(probs.get(label, 0.0) for probs in probs_sources) / len(probs_sources)
+                for label in self.label_list
+            }
 
         for p in sub_preds:
             if p.verdict == "Sai":
@@ -1023,6 +1183,7 @@ class FusionClaimVerifier:
             confidence=avg_conf,
             evidence=all_evidence[:max_evidence],
             source_links=all_source_links,
+            label_probs=avg_label_probs,
         )
 
     def _log_predictions_to_claims_index(
@@ -1132,6 +1293,7 @@ class FusionClaimVerifier:
                         score_features=self.score_features,
                         min_timestamp=min_ts,
                         max_timestamp=max_ts,
+                        evidence_top_k=self.llm_evidence_top_k,
                     )
                     if self.debug:
                         logger.info(
@@ -1244,6 +1406,10 @@ class FusionClaimVerifier:
                         verdict = "Sai"
                     else:
                         verdict = "Chưa chắc chắn"
+                    label_probs = {
+                        label: float(probs_batch[pos][i].item())
+                        for i, label in enumerate(self.label_list)
+                    }
                     results[v_idx] = ClaimPrediction(
                         claim=text,
                         verdict=verdict,
@@ -1252,6 +1418,7 @@ class FusionClaimVerifier:
                         confidence=float(conf),
                         evidence=llm_ev,
                         source_links=links,
+                        label_probs=label_probs,
                     )
 
                 del retrieval_features
@@ -1358,6 +1525,7 @@ class FusionClaimVerifier:
                 score_features=self.score_features,
                 min_timestamp=min_ts,
                 max_timestamp=max_ts,
+                evidence_top_k=self.llm_evidence_top_k,
             )
         )
         t_retrieval1 = perf_counter()
@@ -1582,6 +1750,9 @@ class FusionClaimVerifier:
                 f" | total_ms={timing_ms['total_ms']}"
             )
 
+        label_probs = {
+            label: float(probs[i].item()) for i, label in enumerate(self.label_list)
+        }
         prediction = ClaimPrediction(
             claim=text,
             verdict=verdict,
@@ -1591,6 +1762,7 @@ class FusionClaimVerifier:
             evidence=llm_evidence,
             source_links=source_links,
             timing_ms=timing_ms,
+            label_probs=label_probs,
         )
 
         self._log_predictions_to_claims_index([prediction])
@@ -1645,6 +1817,7 @@ class FusionClaimVerifier:
                     confidence=p.confidence,
                     evidence=list(p.evidence),
                     source_links=list(p.source_links),
+                    label_probs=dict(p.label_probs) if p.label_probs else None,
                 )
             else:
                 results[original_idx] = self._aggregate_sub_claim_predictions(

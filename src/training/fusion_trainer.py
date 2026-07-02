@@ -36,18 +36,16 @@ class FusionTrainingConfig:
     alpha: float = 0.7
     lambda_decay: float = 0.1
     gamma: float = 0.5
-    initial_beta: float = (
-        0.5  # Start with LLM and retrieval branches weighted equally.
-    )
+    initial_beta: float = 0.7
     lambda_reg: float = 0.0
-    max_length: int = 2048
+    max_length: int = 8192
     evidence_mode: str = (
         "retrieved"  # "gold" or "retrieved". Must match serving (api_server.py uses retrieved
         # evidence), otherwise beta learns to over-trust the LLM branch on clean gold evidence
         # and then fails at serve time when retrieval evidence is noisy/truncated.
     )
     llm_evidence_top_k: int = int(
-        os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "5")
+        os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "10")
     )  # Must match FUSION_LLM_EVIDENCE_TOP_K used at serving time.
     label_list: List[str] = field(default_factory=lambda: LABEL_LIST)
     retriever_model: str = "bge-vi-base"
@@ -776,6 +774,14 @@ def train_fusion_from_dataframe(
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            if num_batches < 20:
+                beta_grad = fusion._beta_logit.grad
+                logger.debug(
+                    f"[beta_debug] epoch={epoch} step={num_batches}"
+                    f" beta_logit={fusion._beta_logit.item():.4f}"
+                    f" beta_logit_grad={float(beta_grad.item()) if beta_grad is not None else None}"
+                    f" beta={fusion.beta.item():.4f}"
+                )
             torch.nn.utils.clip_grad_norm_(
                 list(retrieval_encoder.parameters()) + list(fusion.parameters()),
                 max_norm=1.0,

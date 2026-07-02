@@ -56,7 +56,7 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default=os.getenv("LORA_MODEL_PATH", "ktoan911/Qwen3-4B-factcheck-finetune"),
+        default=os.getenv("LORA_MODEL_PATH", "ktoan911/Qwen3-4B-factcheck-finetune-v3"),
         help="Path to the LoRA-trained model (default: models/lora_llm)",
     )
     parser.add_argument(
@@ -88,7 +88,7 @@ def main():
     parser.add_argument(
         "--llm_evidence_top_k",
         type=int,
-        default=int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "5")),
+        default=int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "10")),
         help="Số bằng chứng đưa vào LLM judge, phải khớp FUSION_LLM_EVIDENCE_TOP_K lúc serving",
     )
 
