@@ -1013,7 +1013,7 @@ def train_lora_classification(
     training_args = TrainingArguments(
         output_dir=config.output_dir,
         per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=32,
+        per_device_eval_batch_size=config.batch_size,
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,
         lr_scheduler_type="cosine",
