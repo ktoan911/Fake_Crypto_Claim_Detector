@@ -1,7 +1,6 @@
 "use client";
 import { useState } from "react";
-import Link from "next/link";
-import { ArrowLeft, Shield } from "lucide-react";
+import { Shield } from "lucide-react";
 import ClaimInputSection from "./ClaimInputSection";
 import AnalysisStatusSection from "./AnalysisStatusSection";
 import VerificationResultSection from "./VerificationResultSection";
@@ -46,17 +45,6 @@ export default function VerifyView() {
 
   return (
     <div className="py-8 px-4">
-      {/* ── Back to dashboard ── */}
-      <div className="max-w-4xl mx-auto mb-4">
-        <Link
-          href="/dashboard"
-          className="inline-flex items-center gap-2 text-sm opacity-60 hover:opacity-100 transition-opacity"
-        >
-          <ArrowLeft className="w-4 h-4" />
-          Quay lại Dashboard
-        </Link>
-      </div>
-
       {/* ── Centered page header ── */}
       <div className="max-w-4xl mx-auto mb-8 text-center">
         <div className="flex items-center justify-center gap-3 mb-4">

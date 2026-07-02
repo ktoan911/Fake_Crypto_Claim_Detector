@@ -248,13 +248,18 @@ def build_prompt_generate_rumors_from_news(news_items, target_count=50):
         news_text.append(f"[{source_ref}] {title}\n{content}")
 
     return f"""
-Dựa vào các tin tức sau, hãy bịa ra đúng {target_count} tin đồn/claim tài chính tiếng Việt như kiểu chúng được bàn tán xôn xao trên các diễn .
+Dựa vào các tin tức sau, hãy viết đúng {target_count} tin đồn/claim tài chính tiếng Việt như kiểu chúng được bàn tán xôn xao trên các diễn đàn, mạng xã hội.
 
 Yêu cầu:
 - Trả về ONLY JSON array, không giải thích.
 - Mỗi item có format: {{"claim": "...", "source_ref": 1}}
 - Mỗi claim chỉ 1-2 câu ngắn.
-- Có thể đúng, sai, thiếu chắc chắn hoặc chỉ cùng chủ đề.
+- Văn phong phải giống tin đồn do người dùng bình thường tự viết tay khi chia sẻ/bàn tán: ngắn gọn, khẩu ngữ, đôi khi mơ hồ. KHÔNG viết chi tiết cụ thể kiểu văn phong báo chí (số liệu chính xác, tên đầy đủ chức danh, ngày giờ cụ thể, trích dẫn nguồn chính thức) — nghe phải tự nhiên như lời đồn truyền miệng, không phải như trích một đoạn báo.
+- Bắt buộc CÂN BẰNG độ chính xác giữa {target_count} claim, chia gần đều thành 3 nhóm:
+  1) Đúng sự thật: giữ đúng nội dung cốt lõi của tin gốc (có thể diễn đạt lại cho giống văn phong tin đồn nhưng không sai lệch bản chất).
+  2) Sai sự thật: bóp méo, phóng đại, đảo ngược hoặc thêm chi tiết sai lệch so với tin gốc.
+  3) Mơ hồ/chưa xác thực: nửa đúng nửa sai, thiếu căn cứ rõ ràng để khẳng định.
+- KHÔNG được để phần lớn claim rơi vào nhóm sai sự thật — số lượng tin đúng và tin sai phải tương đương nhau, đây là yêu cầu bắt buộc.
 - source_ref là số trong [] của tin nguồn liên quan nhất.
 - Các câu được sinh ra cần được gắn với ít nhất 1 tin nguồn, dựa trên nội dung tin đó, không hoàn toàn bịa ra ngoài không liên quan.
 - Các câu tin đồn không được chưa những cụm từ như "có tin đồn là", "người ta bàn tán rằng",... hay các cụm tương tự vì các cụm này thể hiện câu được sinh ra là được bịa ra chứ không phải tin đồn được cào trên các trang diễn đàn.
