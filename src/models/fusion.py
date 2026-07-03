@@ -110,6 +110,16 @@ if TORCH_AVAILABLE:
                 requires_grad=learn_beta,
             )
 
+            # Trainable per-branch temperature (log-parameterized so it stays > 0).
+            # Fixed across all samples — unlike per-sample std standardization, this
+            # can't invert the confidence/correctness relationship (dividing a
+            # confident sample's own large logit gap by its own std shrinks it,
+            # while dividing an uncertain sample's small gap by its own small std
+            # inflates it). A single learned scalar calibrates each branch's
+            # average scale without that per-sample side effect.
+            self._lm_log_temp = nn.Parameter(torch.zeros(()))
+            self._retrieval_log_temp = nn.Parameter(torch.zeros(()))
+
             # MLP for projecting retrieval scores
             # For binary classification, output 1 logit; else output num_classes logits
             mlp_output_dim = 1 if self.is_binary else num_classes
@@ -149,11 +159,28 @@ if TORCH_AVAILABLE:
             """Get the current gating parameter β. Guaranteed to be in [0, 1]."""
             return torch.sigmoid(self._beta_logit)
 
-        def _normalize_logits(self, logits: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-            """Per-sample standardization to avoid scale mismatch between fusion branches."""
+        @property
+        def lm_temperature(self) -> torch.Tensor:
+            """Learned LM-branch temperature. Guaranteed > 0 via exp()."""
+            return torch.exp(self._lm_log_temp)
+
+        @property
+        def retrieval_temperature(self) -> torch.Tensor:
+            """Learned retrieval-branch temperature. Guaranteed > 0 via exp()."""
+            return torch.exp(self._retrieval_log_temp)
+
+        def _normalize_logits(self, logits: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
+            """Center a branch's logits and rescale by its learned, fixed temperature.
+
+            Unlike per-sample std standardization, dividing by a single value
+            learned across the whole training set can't invert the
+            confidence/correctness relationship: it can't shrink a genuinely
+            confident sample's gap just because that one sample happens to have
+            a large spread, nor inflate an uncertain sample's gap just because
+            that one sample happens to have a small spread.
+            """
             centered = logits - logits.mean(dim=-1, keepdim=True)
-            scale = centered.std(dim=-1, keepdim=True, unbiased=False).clamp_min(eps)
-            return centered / scale
+            return centered / temperature
 
         def _normalized_entropy(self, probs: torch.Tensor) -> torch.Tensor:
             eps = 1e-8
@@ -211,9 +238,9 @@ if TORCH_AVAILABLE:
                 retrieval_logits_label_space = retrieval_logits_2
 
                 if self.normalize_branch_logits:
-                    lm_logits = self._normalize_logits(lm_logits)
+                    lm_logits = self._normalize_logits(lm_logits, self.lm_temperature)
                     retrieval_logits_label_space = self._normalize_logits(
-                        retrieval_logits_label_space
+                        retrieval_logits_label_space, self.retrieval_temperature
                     )
 
                 beta = self._compute_beta_for_batch(
@@ -236,9 +263,9 @@ if TORCH_AVAILABLE:
                 )
 
                 if self.normalize_branch_logits:
-                    lm_logits = self._normalize_logits(lm_logits)
+                    lm_logits = self._normalize_logits(lm_logits, self.lm_temperature)
                     retrieval_logits_label_space = self._normalize_logits(
-                        retrieval_logits_label_space
+                        retrieval_logits_label_space, self.retrieval_temperature
                     )
 
                 beta = self._compute_beta_for_batch(
