@@ -758,7 +758,9 @@ def train_fusion_from_dataframe(
                     [retrieval_logits_aux, -retrieval_logits_aux], dim=-1
                 )
             if fusion.normalize_branch_logits:
-                retrieval_logits_aux = fusion._normalize_logits(retrieval_logits_aux)
+                retrieval_logits_aux = fusion._normalize_logits(
+                    retrieval_logits_aux, fusion.retrieval_temperature
+                )
             retrieval_aux_loss = F.cross_entropy(
                 retrieval_logits_aux, b_labels, weight=class_weights
             )
@@ -836,7 +838,9 @@ def train_fusion_from_dataframe(
                         [retrieval_logits_eval, -retrieval_logits_eval], dim=-1
                     )
                 if fusion.normalize_branch_logits:
-                    retrieval_logits_eval = fusion._normalize_logits(retrieval_logits_eval)
+                    retrieval_logits_eval = fusion._normalize_logits(
+                        retrieval_logits_eval, fusion.retrieval_temperature
+                    )
                 retrieval_preds_eval = torch.argmax(retrieval_logits_eval, dim=-1).cpu()
                 all_retrieval_preds.append(retrieval_preds_eval)
         all_preds = torch.cat(all_preds)
