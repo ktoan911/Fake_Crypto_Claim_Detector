@@ -61,6 +61,10 @@ _verifier: FusionClaimVerifier | None = None
 _claim_cache: _TTLCache = _TTLCache(maxsize=500, ttl=3600.0)
 _stats_kb: OpenSearchKB | None = None
 _inference_executor: ThreadPoolExecutor | None = None
+# Chỉ 1 request /verify được chạy inference trên GPU tại một thời điểm — request
+# tiếp theo phải đợi request hiện tại chạy xong và dọn sạch VRAM rồi mới được vào,
+# để tránh nhiều request cùng lúc gây tràn RAM/VRAM (OOM).
+_verify_lock: asyncio.Lock = asyncio.Lock()
 
 # ── crawl log via OpenSearch ─────────────────────────────────────────────────
 _CRAWL_LOGS_INDEX = "crawl_logs"
@@ -184,8 +188,8 @@ async def lifespan(app: FastAPI):
     """Load model và khởi tạo tài nguyên dùng chung một lần khi startup."""
     global _verifier, _stats_kb, _inference_executor
 
-    _inference_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="inference")
-    logger.info("[startup] Inference executor (max_workers=2, 15GB VRAM) ready ✓")
+    _inference_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inference")
+    logger.info("[startup] Inference executor (max_workers=1, serialized để tránh OOM) ready ✓")
 
     logger.info("[startup] Pre-warming FusionClaimVerifier …")
     try:
@@ -399,69 +403,82 @@ async def verify_claim(request: ClaimRequest, http_request: Request):
             },
         }
 
-    try:
-        loop = asyncio.get_running_loop()
-        t_inference0 = time.perf_counter()
-        prediction = await asyncio.wait_for(
-            loop.run_in_executor(_inference_executor, _verifier.predict, claim_text),
-            timeout=_inference_timeout_s,
-        )
-        t_inference1 = time.perf_counter()
+    # Chỉ cho 1 request /verify chạy inference tại một thời điểm. Request đến sau
+    # phải đợi ở đây cho tới khi request đang chạy xong và dọn sạch VRAM (finally
+    # bên dưới) mới được vào, tránh nhiều request cùng lúc làm tràn RAM/VRAM.
+    t_lock0 = time.perf_counter()
+    async with _verify_lock:
+        t_lock1 = time.perf_counter()
+        try:
+            loop = asyncio.get_running_loop()
+            t_inference0 = time.perf_counter()
+            prediction = await asyncio.wait_for(
+                loop.run_in_executor(_inference_executor, _verifier.predict, claim_text),
+                timeout=_inference_timeout_s,
+            )
+            t_inference1 = time.perf_counter()
 
-        api_timing = {
-            "cache_check_ms": round(1000.0 * (t_cache1 - t_cache0), 1),
-            "executor_queue_ms": round(1000.0 * (t_inference0 - t_cache1), 1),
-            "inference_ms": round(1000.0 * (t_inference1 - t_inference0), 1),
-            "api_total_ms": round(1000.0 * (time.perf_counter() - t_api_start), 1),
-        }
-        logger.info(
-            f"[verify] timing"
-            f" | cache_ms={api_timing['cache_check_ms']}"
-            f" | queue_ms={api_timing['executor_queue_ms']}"
-            f" | inference_ms={api_timing['inference_ms']}"
-            f" | api_total_ms={api_timing['api_total_ms']}"
-        )
+            api_timing = {
+                "cache_check_ms": round(1000.0 * (t_cache1 - t_cache0), 1),
+                "lock_wait_ms": round(1000.0 * (t_lock1 - t_lock0), 1),
+                "executor_queue_ms": round(1000.0 * (t_inference0 - t_lock1), 1),
+                "inference_ms": round(1000.0 * (t_inference1 - t_inference0), 1),
+                "api_total_ms": round(1000.0 * (time.perf_counter() - t_api_start), 1),
+            }
+            logger.info(
+                f"[verify] timing"
+                f" | cache_ms={api_timing['cache_check_ms']}"
+                f" | lock_wait_ms={api_timing['lock_wait_ms']}"
+                f" | queue_ms={api_timing['executor_queue_ms']}"
+                f" | inference_ms={api_timing['inference_ms']}"
+                f" | api_total_ms={api_timing['api_total_ms']}"
+            )
 
-        inference_timing = prediction.timing_ms or {}
-        result = {
-            "verdict": prediction.verdict,
-            "status": "success",
-            "evidence": prediction.evidence,
-            "source_links": prediction.source_links,
-            "confidence": prediction.confidence,
-            "label_probs": prediction.label_probs,
-            "timing_ms": {**inference_timing, **api_timing},
-        }
-        _claim_cache.set(cache_key, result)
-        return result
+            inference_timing = prediction.timing_ms or {}
+            result = {
+                "verdict": prediction.verdict,
+                "status": "success",
+                "evidence": prediction.evidence,
+                "source_links": prediction.source_links,
+                "confidence": prediction.confidence,
+                "label_probs": prediction.label_probs,
+                "timing_ms": {**inference_timing, **api_timing},
+            }
+            _claim_cache.set(cache_key, result)
+            return result
 
-    except asyncio.TimeoutError:
-        logger.error(f"[verify] timeout sau {_inference_timeout_s}s key={cache_key[:8]}…")
-        return JSONResponse(
-            status_code=504,
-            content={
-                "verdict": "Lỗi xử lý",
-                "status": "error",
-                "error": f"Inference quá {_inference_timeout_s}s — vui lòng thử lại.",
-            },
-        )
-    except torch.cuda.OutOfMemoryError:
-        logger.error(f"[verify] CUDA OOM key={cache_key[:8]}…")
-        torch.cuda.empty_cache()
-        return JSONResponse(
-            status_code=503,
-            content={
-                "verdict": "Lỗi xử lý",
-                "status": "error",
-                "error": "Máy chủ đang quá tải bộ nhớ GPU — vui lòng thử lại sau ít phút.",
-            },
-        )
-    except Exception:
-        logger.error(f"[verify] error: {traceback.format_exc()}")
-        return JSONResponse(
-            status_code=500,
-            content={"verdict": "Lỗi xử lý", "status": "error", "error": "Lỗi máy chủ nội bộ."},
-        )
+        except asyncio.TimeoutError:
+            logger.error(f"[verify] timeout sau {_inference_timeout_s}s key={cache_key[:8]}…")
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "verdict": "Lỗi xử lý",
+                    "status": "error",
+                    "error": f"Inference quá {_inference_timeout_s}s — vui lòng thử lại.",
+                },
+            )
+        except torch.cuda.OutOfMemoryError:
+            logger.error(f"[verify] CUDA OOM key={cache_key[:8]}…")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "verdict": "Lỗi xử lý",
+                    "status": "error",
+                    "error": "Máy chủ đang quá tải bộ nhớ GPU — vui lòng thử lại sau ít phút.",
+                },
+            )
+        except Exception:
+            logger.error(f"[verify] error: {traceback.format_exc()}")
+            return JSONResponse(
+                status_code=500,
+                content={"verdict": "Lỗi xử lý", "status": "error", "error": "Lỗi máy chủ nội bộ."},
+            )
+        finally:
+            # Dọn sạch VRAM trước khi nhả lock, để request tiếp theo (nếu đang đợi)
+            # bắt đầu trên GPU sạch thay vì chồng lên bộ nhớ còn sót lại.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
 
 @app.get("/claims/stats")

@@ -56,7 +56,7 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default=os.getenv("LORA_MODEL_PATH", "ktoan911/Qwen3-4B-factcheck-finetune-v3"),
+        default=os.getenv("LORA_MODEL_PATH", "ktoan911/Qwen3-4B-factcheck-finetune-v6"),
         help="Path to the LoRA-trained model (default: models/lora_llm)",
     )
     parser.add_argument(
