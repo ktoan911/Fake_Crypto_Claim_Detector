@@ -5,9 +5,6 @@ import {
   XCircle,
   HelpCircle,
   ExternalLink,
-  TrendingUp,
-  TrendingDown,
-  Minus,
 } from "lucide-react";
 
 interface VerifyApiResponse {
@@ -94,75 +91,6 @@ function getVerdictConfig(verdict: string) {
   );
 }
 
-function ConfidenceBar({ confidence }: { confidence: number }) {
-  const pct = Math.round(confidence * 100);
-  const isHigh = pct >= 75;
-  const isMid = pct >= 50;
-
-  const color = isHigh
-    ? "linear-gradient(90deg, #06b6d4, #3b82f6)"
-    : isMid
-      ? "linear-gradient(90deg, #f39c12, #e67e22)"
-      : "linear-gradient(90deg, #e05252, #c0392b)";
-
-  const Icon = isHigh ? TrendingUp : isMid ? Minus : TrendingDown;
-  const label = isHigh
-    ? "Độ Tin Cậy Cao"
-    : isMid
-      ? "Độ Tin Cậy Trung Bình"
-      : "Độ Tin Cậy Thấp";
-  const textColor = isHigh ? "#06b6d4" : isMid ? "#f39c12" : "#e05252";
-
-  return (
-    <div
-      className="rounded-2xl shadow-md p-6 border mt-4"
-      style={{ backgroundColor: "var(--card-bg)", borderColor: "var(--border)" }}
-    >
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-3">
-          <div
-            className="p-2 rounded-xl"
-            style={{ background: color }}
-          >
-            <Icon className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <p className="font-semibold text-sm">Điểm Tin Cậy</p>
-            <p className="text-xs" style={{ color: textColor }}>
-              {label}
-            </p>
-          </div>
-        </div>
-        <span
-          className="text-3xl font-bold bg-clip-text text-transparent"
-          style={{ backgroundImage: "linear-gradient(135deg, #3b82f6, #8b5cf6, #06b6d4)" }}
-        >
-          {pct}%
-        </span>
-      </div>
-
-      <div
-        className="relative h-2.5 rounded-full overflow-hidden"
-        style={{ backgroundColor: "var(--secondary)" }}
-      >
-        <div
-          className="absolute inset-y-0 left-0 rounded-full transition-all duration-700"
-          style={{ width: `${pct}%`, background: color }}
-        />
-      </div>
-
-      <p className="text-xs opacity-50 mt-3">
-        {isHigh
-          ? "Bằng chứng mạnh mẽ hỗ trợ đánh giá này"
-          : isMid
-            ? "Có bằng chứng vừa phải cho đánh giá này"
-            : "Bằng chứng hạn chế — cần thêm thông tin xác minh"}
-      </p>
-    </div>
-  );
-}
-
-
 function SourceLinksSection({ links }: { links: string[] }) {
   if (!links || links.length === 0) return null;
 
@@ -243,10 +171,6 @@ export default function VerificationResultSection({
           </div>
         </div>
       </div>
-
-      {result.confidence !== undefined && result.status === "success" && (
-        <ConfidenceBar confidence={result.confidence} />
-      )}
 
       {/* Sources */}
       {result.source_links && result.source_links.length > 0 && (
