@@ -179,6 +179,12 @@ BLOCKED_CONTENT_HINTS = [
     "verify you are human",
 ]
 
+# Minimum article body length (title excluded) for a doc to be indexed. Below
+# this the extraction almost certainly failed and only the headline survived;
+# such stubs pollute retrieval. Kept in sync with FUSION_MIN_EVIDENCE_BODY_CHARS
+# on the serving side (src/models/fusion_inference.py).
+MIN_ARTICLE_BODY_CHARS = int(os.getenv("MIN_ARTICLE_BODY_CHARS", "160"))
+
 
 def normalize_domain(netloc: str) -> str:
     """Chuẩn hóa domain để so sánh ổn định giữa www/non-www."""
@@ -1159,12 +1165,28 @@ async def main(args):
                 r"\s+", " ", re.sub(r"[\n\t\r]+", " ", item.get("title", ""))
             ).strip()
             content = re.sub(
-                r"\s+", " ", re.sub(r"[\n\t\r]+", " ", item.get("content", ""))
+                r"\s+",
+                " ",
+                re.sub(r"[\n\t\r]+", " ", item.get("content", "").replace("﻿", " ")),
             ).strip()
 
             if not content:
                 continue
             if looks_like_listing_page(item.get("article_url", "")):
+                continue
+            # Crawl-failure guard: when the body never rendered, extraction
+            # falls back to the headline alone (± a BOM). Such docs have a
+            # near-empty embedding that matches almost any query and float to
+            # the top of retrieval as noise. Require a real body — measure the
+            # content minus the title so a repeated-headline dump can't pass.
+            body_only = content
+            if title and body_only.startswith(title):
+                body_only = body_only[len(title):].strip()
+            if len(body_only) < MIN_ARTICLE_BODY_CHARS:
+                logging.info(
+                    f"Bỏ bài thiếu nội dung (body {len(body_only)} ký tự < "
+                    f"{MIN_ARTICLE_BODY_CHARS}): {item.get('article_url', '')}"
+                )
                 continue
 
             # Bước 1: Xác định ranh giới chunk (câu / nhóm câu)

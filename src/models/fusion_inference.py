@@ -182,6 +182,32 @@ def _select_doc_text(source: Dict[str, Any]) -> str:
     return ""
 
 
+# Some indexed "articles" are crawl failures: the body never rendered, so all
+# that remains is the headline plus a stray BOM (e.g. the recurrent
+# "Một ngân hàng chuẩn bị chia cổ phiếu thưởng tỷ lệ 15% ﻿" doc). Their
+# near-empty embedding matches almost any query, so they float to the top of
+# retrieval as high-RRF noise and get fed to the LLM as if they were evidence.
+# Measure the *body* (content minus the title, stripped of BOM/whitespace) and
+# drop docs whose body is too short to be a real article.
+_MIN_EVIDENCE_BODY_CHARS = int(os.getenv("FUSION_MIN_EVIDENCE_BODY_CHARS", "160"))
+
+
+def _clean_body_text(source: Dict[str, Any]) -> str:
+    """Body text with the title prefix and BOM/whitespace noise removed."""
+    content = str(source.get("content") or source.get("text") or "")
+    content = content.replace("﻿", " ")
+    title = str(source.get("title") or "").strip()
+    body = content.strip()
+    if title and body.startswith(title):
+        body = body[len(title):]
+    return re.sub(r"\s+", " ", body).strip()
+
+
+def _has_usable_content(source: Dict[str, Any]) -> bool:
+    """True if the doc has enough body text to be trustworthy evidence."""
+    return len(_clean_body_text(source)) >= _MIN_EVIDENCE_BODY_CHARS
+
+
 # Long articles are split into multiple chunk-documents at crawl time (see
 # crawler.py _split_sentences). A handful of indexed "documents" are actually
 # category/listing pages (many unrelated headline blurbs stitched together,
@@ -583,6 +609,18 @@ class OpenSearchHybridRetriever:
             if not hit_by_id:
                 return []
 
+        if _env_flag("FUSION_MIN_CONTENT_FILTER_ENABLED", default=True):
+            # Drop crawl-failure docs (headline-only / BOM-only body) before
+            # they pollute RRF and the evidence fed to the LLM. Applies to
+            # already-indexed data too, so no re-index is needed to benefit.
+            hit_by_id = {
+                doc_id: hit
+                for doc_id, hit in hit_by_id.items()
+                if _has_usable_content(hit.source or {})
+            }
+            if not hit_by_id:
+                return []
+
         bm25_ranks = {hit.id: rank for rank, hit in enumerate(bm25_hits)}
         vector_ranks = {hit.id: rank for rank, hit in enumerate(vector_hits)}
         missing_rank = max(search_pool_k, len(hit_by_id))
@@ -816,6 +854,13 @@ class FusionClaimVerifier:
         self._nli_top_k = int(os.getenv("NLI_EVIDENCE_TOP_K", str(min(5, self.top_k))))
         self.nli_override_enabled = _env_flag("NLI_OVERRIDE_ENABLED", default=True)
         self.nli_override_threshold = float(os.getenv("NLI_OVERRIDE_THRESHOLD", "0.5"))
+        # Grounding guard: a confident Đúng/Sai must be backed by at least one
+        # piece of evidence that actually entails (A) or contradicts (B) the
+        # claim. If nothing does, the verdict is ungrounded → downgrade to C.
+        self.grounding_guard_enabled = _env_flag("GROUNDING_GUARD_ENABLED", default=True)
+        self.grounding_support_threshold = float(
+            os.getenv("GROUNDING_SUPPORT_THRESHOLD", "0.45")
+        )
         self.retrieval_encoder = RetrievalFeatureEncoder(
             num_retrieved=self.top_k,
             score_features=self.score_features,
@@ -1046,6 +1091,42 @@ class FusionClaimVerifier:
         agree = int((argmaxes[strong] == target_label).sum())
         min_votes = 2 if n_real_evidence >= 2 else 1
         if agree >= min_votes and agree > n_strong / 2:
+            return 2, float(probs[2].item()), True
+        return pred_id, confidence, False
+
+    def _apply_evidence_grounding_guard(
+        self,
+        pred_id: int,
+        probs: "torch.Tensor",
+        nli_feats: Optional[np.ndarray],
+        n_real_evidence: int,
+    ) -> Tuple[int, float, bool]:
+        """Downgrade a confident Đúng/Sai to 'Chưa chắc chắn' when NONE of the
+        retrieved evidence provides the NLI signal that verdict requires —
+        entailment for Đúng (col 0), contradiction for Sai (col 2).
+
+        Complements _apply_nli_conflict_guard: that one fires on *opposing*
+        evidence, this one fires on the *absence of supporting* evidence. It
+        catches the failure mode where retrieval returns only topically-related
+        (or entirely unrelated) documents that never actually speak to the
+        claim's subject, yet the LLM/fusion branch still asserts A or B — e.g.
+        a viral rumor about an entity that appears in no evidence at all. In
+        that situation the honest answer is "insufficient evidence", not a
+        fabricated verdict.
+        """
+        confidence = float(probs[pred_id].item())
+        if (
+            not self.grounding_guard_enabled
+            or nli_feats is None
+            or pred_id == 2
+            or n_real_evidence == 0
+        ):
+            return pred_id, confidence, False
+
+        support_col = 0 if pred_id == 0 else 2  # entailment for A, contradiction for B
+        real_nli = nli_feats[:n_real_evidence]
+        max_support = float(real_nli[:, support_col].max())
+        if max_support < self.grounding_support_threshold:
             return 2, float(probs[2].item()), True
         return pred_id, confidence, False
 
@@ -1432,6 +1513,17 @@ class FusionClaimVerifier:
                             f" | nli_feats={np.array2string(nli_feats_i[:nli_n_real_i], precision=4)}"
                             " | downgraded_to=C (Chưa chắc chắn)"
                         )
+                    pred_id_int, conf, grounding_overridden = self._apply_evidence_grounding_guard(
+                        pred_id_int, probs_batch[pos], nli_feats_i, nli_n_real_i
+                    )
+                    if grounding_overridden:
+                        logger.info(
+                            "[fusion_inference] grounding_guard_triggered (batch)"
+                            f" | idx={v_idx} | fusion_pred_id={int(pred_id)}"
+                            f" | n_real_evidence={nli_n_real_i}"
+                            f" | nli_feats={np.array2string(nli_feats_i[:nli_n_real_i], precision=4)}"
+                            " | downgraded_to=C (Chưa chắc chắn) | reason=no_supporting_evidence"
+                        )
                     pred_label = self.label_list[pred_id_int]
                     if pred_id_int == 0:
                         verdict = "Đúng"
@@ -1716,6 +1808,18 @@ class FusionClaimVerifier:
                     f" | n_real_evidence={nli_n_real}"
                     f" | nli_feats={np.array2string(nli_feats[:nli_n_real], precision=4)}"
                     " | downgraded_to=C (Chưa chắc chắn)"
+                )
+
+            pred_id, confidence, grounding_overridden = self._apply_evidence_grounding_guard(
+                pred_id, probs, nli_feats, nli_n_real
+            )
+            if grounding_overridden:
+                logger.info(
+                    "[fusion_inference] grounding_guard_triggered"
+                    f" | fusion_pred_id={int(torch.argmax(fusion_output.final_probs[0]).item())}"
+                    f" | n_real_evidence={nli_n_real}"
+                    f" | nli_feats={np.array2string(nli_feats[:nli_n_real], precision=4)}"
+                    " | downgraded_to=C (Chưa chắc chắn) | reason=no_supporting_evidence"
                 )
 
             if self.debug:
