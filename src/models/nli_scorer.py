@@ -45,10 +45,26 @@ class NLIScorer:
         self._neu_idx = 1
         self._con_idx = 2
 
+    def _resolve_device(self) -> str:
+        """Fall back to CPU when a CUDA device is requested but unavailable.
+
+        Prevents a hard RuntimeError (`Found no NVIDIA driver`) on GPU-less hosts
+        or when NLI_DEVICE is misconfigured — NLI is fast enough on CPU to degrade
+        gracefully rather than crash the whole pipeline.
+        """
+        if str(self.device).startswith("cuda") and not torch.cuda.is_available():
+            logger.warning(
+                f"NLI device {self.device!r} requested but CUDA is unavailable; "
+                "falling back to CPU."
+            )
+            return "cpu"
+        return self.device
+
     def load(self) -> "NLIScorer":
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch and transformers are required for NLIScorer.")
-        logger.info(f"Loading NLI model: {self.model_name}")
+        self.device = self._resolve_device()
+        logger.info(f"Loading NLI model: {self.model_name} | device={self.device}")
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
         self._model.to(self.device).eval()
