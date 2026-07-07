@@ -32,18 +32,11 @@ def _extract_url(meta: Dict[str, Any]) -> str:
 
 
 def _looks_like_listing_page(url: str) -> bool:
-    """Category/section pages (e.g. 'cafef.vn/vi-mo-dau-tu.chn') aggregate many
-    unrelated headline blurbs and have no single-article identity. Real
-    article URLs on these sites always embed a long numeric id/timestamp in
-    the last path segment; listing/section pages and static info pages don't.
-    Mirrors looks_like_listing_page in the crawler — kept separate since the
-    crawler module isn't importable from serving without its scrape deps.
-    """
     if not url:
         return False
     path = urlparse(url).path
     last_segment = path.rstrip("/").rsplit("/", 1)[-1]
-    return not re.search(r"\d{6,}", last_segment)
+    return not re.search(r"\d{6,}", last_segment) # Các bài báo thật thường có ID/Timestamp ở cuối URL
 
 
 def _resolve_fusion_model_path(path_or_repo: str, filename: str = "fusion_gold.pt") -> str:
@@ -149,9 +142,6 @@ def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str], str]:
 
     dates.sort()
 
-    # A future date can't be a reliable reference for "gần đây" retrieval —
-    # narrowing to a window that hasn't happened yet just returns nothing.
-    # Treat it as if no date was found: no filter, full original text kept.
     if dates[-1].date() > now_utc.date():
         return None, None, text
 
@@ -182,13 +172,6 @@ def _select_doc_text(source: Dict[str, Any]) -> str:
     return ""
 
 
-# Some indexed "articles" are crawl failures: the body never rendered, so all
-# that remains is the headline plus a stray BOM (e.g. the recurrent
-# "Một ngân hàng chuẩn bị chia cổ phiếu thưởng tỷ lệ 15% ﻿" doc). Their
-# near-empty embedding matches almost any query, so they float to the top of
-# retrieval as high-RRF noise and get fed to the LLM as if they were evidence.
-# Measure the *body* (content minus the title, stripped of BOM/whitespace) and
-# drop docs whose body is too short to be a real article.
 _MIN_EVIDENCE_BODY_CHARS = int(os.getenv("FUSION_MIN_EVIDENCE_BODY_CHARS", "160"))
 
 
@@ -219,12 +202,7 @@ _MAX_MERGED_ARTICLE_CHARS = 8000
 
 
 def _merge_article_chunks(title: str, chunk_hits: List[Any]) -> Optional[str]:
-    """Reconstruct the full article text from its ordered chunk-documents.
-
-    Returns None when reconstruction isn't safe (missing chunk_idx on legacy
-    data crawled before this field existed, or too many chunks to plausibly
-    be one article) — callers should keep the original single-chunk text.
-    """
+    """ghép evidence từ chunk"""
     if len(chunk_hits) <= 1:
         return None
     if len(chunk_hits) > _MAX_CHUNKS_TO_MERGE:
@@ -250,20 +228,10 @@ def _merge_article_chunks(title: str, chunk_hits: List[Any]) -> Optional[str]:
     return merged or None
 
 
-# A full article contains many competing numbers/tenors that swamp the one
-# sentence that actually speaks to the claim — that noise makes the NLI scorer
-# read "contradiction" and makes the LLM evidence longer than it needs to be.
-# We keep only the top-N sentences most similar to the claim (see
-# _select_relevant_sentences), so both branches see the confirming sentence
-# instead of the whole article.
-_EVIDENCE_MIN_SENTENCE_CHARS = 12
-# Cap how many sentences we embed per article — long articles rarely need more
-# and this bounds the extra encode cost.
-_EVIDENCE_MAX_SENTENCES_SCANNED = int(os.getenv("FUSION_EVIDENCE_MAX_SENTENCES", "80"))
-# Sentence punctuation followed by whitespace. Vietnamese decimals use a comma
-# (7,3%) and thousands a dot with no trailing space (100.000), so requiring the
-# whitespace keeps those numbers from being split mid-token.
-_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?…])\s+")
+
+_EVIDENCE_MIN_SENTENCE_CHARS = 12 #min input cho sentence
+_EVIDENCE_MAX_SENTENCES_SCANNED = int(os.getenv("FUSION_EVIDENCE_MAX_SENTENCES", "80")) #max input cho sentence 
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?…])\s+")# tách câu
 
 
 def _split_sentences(text: str) -> List[str]:

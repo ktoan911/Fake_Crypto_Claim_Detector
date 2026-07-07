@@ -105,6 +105,7 @@ URLS_TO_CRAWL = [
     "https://plo.vn/kinh-te/tai-chinh-ngan-hang/",
     "https://znews.vn/tai-chinh.html",
     "https://vtv.vn/tai-chinh-ngan-hang.html",  # Đã cập nhật
+    "https://tuoitre.vn/kinh-doanh.htm",
     "https://vov.vn/kinh-te/tai-chinh/",
     "https://www.vietcombank.com.vn/vi-VN/Trang-thong-tin-dien-tu/Tin-tuc-va-su-kien#ArticleSubCategories=T%C3%A0i%20ch%C3%ADnh%20ng%C3%A2n%20h%C3%A0ng",
     "https://www.vietcombank.com.vn/vi-VN/Trang-thong-tin-dien-tu/Tin-tuc-va-su-kien#ArticleSubCategories=Tin%20Vietcombank",
