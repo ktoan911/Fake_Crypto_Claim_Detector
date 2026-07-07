@@ -421,37 +421,51 @@ class OpenSearchHybridRetriever:
         self.kb.embedding_dim = self.embedding_dim
 
     def _select_relevant_sentences(
-        self, claim: str, text: str, top_n: int
+        self, claim: str, text: str, top_n: int, title: str = ""
     ) -> str:
-        """Return the `top_n` sentences of `text` most similar to `claim`,
-        re-joined in their original order.
+        """Keep the sentences of `text` most similar to `claim`, re-joined in
+        their original order, with the article `title` always prepended.
 
-        Reuses the retrieval encoder (already resident) to score each sentence
-        by cosine similarity to the claim. Keeping only the closest sentences
-        strips the competing numbers/tenors that otherwise make NLI read
+        The title is the article's own summary of what it reports, so it stays
+        in every evidence regardless of similarity and occupies one of the
+        `top_n` slots (top_n=3 with a title ⇒ title + 2 body sentences). The
+        remaining slots go to the body sentences closest to the claim, scored
+        with the already-resident retrieval encoder. Keeping only those strips
+        the competing numbers/tenors that otherwise make NLI read
         "contradiction" and bloat the LLM evidence. Falls back to the original
-        text on any failure or when the text is already short enough.
+        text on any failure.
         """
         if top_n <= 0 or not claim:
             return text
-        sentences = _split_sentences(text)
-        if len(sentences) <= top_n:
-            return " ".join(sentences) if sentences else text
-        scan = sentences[:_EVIDENCE_MAX_SENTENCES_SCANNED]
-        try:
-            embs = self.encoder.encode(
-                [claim] + scan,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                batch_size=32,
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(f"[fusion_inference] sentence_extract_failed: {exc}")
-            return text
-        sims = embs[1:] @ embs[0]
-        top_idx = np.argsort(-sims)[:top_n]
-        return " ".join(scan[i] for i in sorted(int(i) for i in top_idx))
+        title = _normalize_query_text(title)
+        body = _normalize_query_text(text)
+        # A merged article starts with its title — drop that leading copy so the
+        # title isn't duplicated and doesn't consume a body slot.
+        if title and body.startswith(title):
+            body = body[len(title):].strip()
+        sentences = _split_sentences(body)
+        pick_n = max(0, top_n - (1 if title else 0))
+        if len(sentences) <= pick_n:
+            chosen = sentences
+        else:
+            scan = sentences[:_EVIDENCE_MAX_SENTENCES_SCANNED]
+            try:
+                embs = self.encoder.encode(
+                    [claim] + scan,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    batch_size=32,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(f"[fusion_inference] sentence_extract_failed: {exc}")
+                chosen = scan[:pick_n]
+            else:
+                sims = embs[1:] @ embs[0]
+                top_idx = np.argsort(-sims)[:pick_n]
+                chosen = [scan[i] for i in sorted(int(i) for i in top_idx)]
+        parts = ([title] if title else []) + chosen
+        return " ".join(parts) if parts else text
 
     def _dedupe_and_fetch_full_articles(
         self, ranked_items: List[RetrievalResult], top_k: int, claim: str = ""
@@ -481,7 +495,10 @@ class OpenSearchHybridRetriever:
         def _focus(items: List[RetrievalResult]) -> List[RetrievalResult]:
             if extract_enabled and claim:
                 for it in items:
-                    it.text = self._select_relevant_sentences(claim, it.text, top_n)
+                    title = str((it.metadata or {}).get("title") or "").strip()
+                    it.text = self._select_relevant_sentences(
+                        claim, it.text, top_n, title=title
+                    )
             return items
 
         deduped: List[RetrievalResult] = []
