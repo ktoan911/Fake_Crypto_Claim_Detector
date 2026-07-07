@@ -126,6 +126,7 @@ class TextPreprocessor:
         return clean_tokens
 
 
+# Định dạng đầu ra của một tài liệu tìm được
 @dataclass
 class RetrievalResult:
     document_id: str
@@ -166,11 +167,11 @@ class TemporalScorer:
             gamma: Recency vs cyclicity mix (paper: 0.5)
             reference_date: Reference date for recency calculation
         """
-        self.alpha = alpha
-        self.lambda_decay = lambda_decay
-        self.lambda_base = lambda_decay
-        self.gamma = gamma
-        self._reference_date = reference_date  # Private, can be overridden
+        self.alpha = alpha # Trọng số giữa nội dung và thời gian
+        self.lambda_decay = lambda_decay # Mức độ trừ điểm khi tin tức quá cũ
+        self.lambda_base = lambda_decay 
+        self.gamma = gamma # Trọng số giữa (Độ mới) và (Tính chu kỳ)
+        self._reference_date = reference_date
 
         logger.info(
             f"TemporalScorer initialized: α={alpha}, λ={lambda_decay}, γ={gamma}"
@@ -209,8 +210,7 @@ class TemporalScorer:
         if ref.tzinfo is None:
             ref = ref.replace(tzinfo=timezone.utc)
 
-        # Paper Eq.1: e^(-λt) where t is time difference
-        # Use total_seconds for precise resolution (not quantized by .days)
+        # e^(-λt) với t là số ngày từ khi xuất bản
         time_diff_seconds = (ref - ts).total_seconds()
         time_diff_days = max(0, time_diff_seconds / 86400.0)  # Convert to days
         return float(np.exp(-self.lambda_decay * time_diff_days))

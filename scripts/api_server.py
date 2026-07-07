@@ -57,13 +57,11 @@ class _TTLCache:
 
 
 # ── Global state (khởi tạo trong lifespan) ──────────────────────────────────
-_verifier: FusionClaimVerifier | None = None
+_verifier: FusionClaimVerifier | None = None  #model AI
 _claim_cache: _TTLCache = _TTLCache(maxsize=500, ttl=3600.0)
 _stats_kb: OpenSearchKB | None = None
-_inference_executor: ThreadPoolExecutor | None = None
+_inference_executor: ThreadPoolExecutor | None = None 
 # Chỉ 1 request /verify được chạy inference trên GPU tại một thời điểm — request
-# tiếp theo phải đợi request hiện tại chạy xong và dọn sạch VRAM rồi mới được vào,
-# để tránh nhiều request cùng lúc gây tràn RAM/VRAM (OOM).
 _verify_lock: asyncio.Lock = asyncio.Lock()
 
 # ── crawl log via OpenSearch ─────────────────────────────────────────────────
@@ -404,8 +402,7 @@ async def verify_claim(request: ClaimRequest, http_request: Request):
         }
 
     # Chỉ cho 1 request /verify chạy inference tại một thời điểm. Request đến sau
-    # phải đợi ở đây cho tới khi request đang chạy xong và dọn sạch VRAM (finally
-    # bên dưới) mới được vào, tránh nhiều request cùng lúc làm tràn RAM/VRAM.
+    # phải đợi ở đây cho tới khi request đang chạy xong và dọn sạch VRAM 
     t_lock0 = time.perf_counter()
     async with _verify_lock:
         t_lock1 = time.perf_counter()

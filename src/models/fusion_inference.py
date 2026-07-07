@@ -250,6 +250,31 @@ def _merge_article_chunks(title: str, chunk_hits: List[Any]) -> Optional[str]:
     return merged or None
 
 
+# A full article contains many competing numbers/tenors that swamp the one
+# sentence that actually speaks to the claim — that noise makes the NLI scorer
+# read "contradiction" and makes the LLM evidence longer than it needs to be.
+# We keep only the top-N sentences most similar to the claim (see
+# _select_relevant_sentences), so both branches see the confirming sentence
+# instead of the whole article.
+_EVIDENCE_MIN_SENTENCE_CHARS = 12
+# Cap how many sentences we embed per article — long articles rarely need more
+# and this bounds the extra encode cost.
+_EVIDENCE_MAX_SENTENCES_SCANNED = int(os.getenv("FUSION_EVIDENCE_MAX_SENTENCES", "80"))
+# Sentence punctuation followed by whitespace. Vietnamese decimals use a comma
+# (7,3%) and thousands a dot with no trailing space (100.000), so requiring the
+# whitespace keeps those numbers from being split mid-token.
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split evidence text into sentence-ish spans for relevance extraction."""
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return []
+    parts = _SENTENCE_BOUNDARY_RE.split(normalized)
+    return [p.strip() for p in parts if len(p.strip()) >= _EVIDENCE_MIN_SENTENCE_CHARS]
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -395,23 +420,70 @@ class OpenSearchHybridRetriever:
         # Ensure dimension check in OpenSearch wrapper matches the active encoder.
         self.kb.embedding_dim = self.embedding_dim
 
+    def _select_relevant_sentences(
+        self, claim: str, text: str, top_n: int
+    ) -> str:
+        """Return the `top_n` sentences of `text` most similar to `claim`,
+        re-joined in their original order.
+
+        Reuses the retrieval encoder (already resident) to score each sentence
+        by cosine similarity to the claim. Keeping only the closest sentences
+        strips the competing numbers/tenors that otherwise make NLI read
+        "contradiction" and bloat the LLM evidence. Falls back to the original
+        text on any failure or when the text is already short enough.
+        """
+        if top_n <= 0 or not claim:
+            return text
+        sentences = _split_sentences(text)
+        if len(sentences) <= top_n:
+            return " ".join(sentences) if sentences else text
+        scan = sentences[:_EVIDENCE_MAX_SENTENCES_SCANNED]
+        try:
+            embs = self.encoder.encode(
+                [claim] + scan,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                batch_size=32,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"[fusion_inference] sentence_extract_failed: {exc}")
+            return text
+        sims = embs[1:] @ embs[0]
+        top_idx = np.argsort(-sims)[:top_n]
+        return " ".join(scan[i] for i in sorted(int(i) for i in top_idx))
+
     def _dedupe_and_fetch_full_articles(
-        self, ranked_items: List[RetrievalResult], top_k: int
+        self, ranked_items: List[RetrievalResult], top_k: int, claim: str = ""
     ) -> List[RetrievalResult]:
-        """Drop duplicate chunks from the same article, then swap each kept
-        item's chunk text for the reconstructed full article when possible.
+        """Drop duplicate chunks from the same article, reconstruct each kept
+        item's full article, then keep only the sentences most relevant to the
+        claim as its evidence text.
 
         Dedup only looks within the original top_k window — a dropped
-        duplicate is NOT backfilled from lower-ranked candidates. Once a
-        chunk is expanded into its full article, pulling in more (lower
-        relevance) evidence on top risks both dragging in tangential
-        sentences and blowing past the LLM's context budget, since each
-        item is now a full article instead of a short chunk. Ending up with
-        fewer, cleaner evidence items is the intended tradeoff.
+        duplicate is NOT backfilled from lower-ranked candidates. The full
+        article is reconstructed first so relevant-sentence extraction can see
+        every chunk of the article (the confirming sentence may live in a chunk
+        that wasn't the one retrieved), then `_select_relevant_sentences`
+        trims it back down to the few sentences that actually speak to the
+        claim — giving both the LLM and the NLI scorer focused evidence instead
+        of a whole article full of competing figures. Set
+        FUSION_EVIDENCE_SENTENCE_EXTRACT_ENABLED=0 to keep the full article.
 
         `ranked_items` should already be sorted best-first so the highest
         scoring chunk of each article is the one that survives dedup.
         """
+        extract_enabled = _env_flag(
+            "FUSION_EVIDENCE_SENTENCE_EXTRACT_ENABLED", default=True
+        )
+        top_n = int(os.getenv("FUSION_EVIDENCE_SENTENCE_TOP_N", "3"))
+
+        def _focus(items: List[RetrievalResult]) -> List[RetrievalResult]:
+            if extract_enabled and claim:
+                for it in items:
+                    it.text = self._select_relevant_sentences(claim, it.text, top_n)
+            return items
+
         deduped: List[RetrievalResult] = []
         seen_urls: set = set()
         for item in ranked_items[:top_k]:
@@ -426,13 +498,13 @@ class OpenSearchHybridRetriever:
             {_extract_url(item.metadata or {}) for item in deduped} - {""}
         )
         if not urls_to_fetch:
-            return deduped
+            return _focus(deduped)
 
         try:
             chunk_hits = self.kb.get_by_field_values("article_url", urls_to_fetch)
         except Exception as exc:
             logger.warning(f"[fusion_inference] full_article_fetch_failed: {exc}")
-            return deduped
+            return _focus(deduped)
 
         hits_by_url: Dict[str, List[Any]] = {}
         for hit in chunk_hits:
@@ -450,7 +522,7 @@ class OpenSearchHybridRetriever:
             if merged:
                 item.text = merged
 
-        return deduped
+        return _focus(deduped)
 
     def _get_search_pool_size(self, rrf_top_k: int) -> int:
         """
@@ -714,7 +786,9 @@ class OpenSearchHybridRetriever:
 
         t_fullart0 = perf_counter()
         if _env_flag("FUSION_FULL_ARTICLE_ENABLED", default=True):
-            final_items = self._dedupe_and_fetch_full_articles(final_items, dedup_window)
+            final_items = self._dedupe_and_fetch_full_articles(
+                final_items, dedup_window, claim=normalized_query
+            )
         else:
             final_items = final_items[:dedup_window]
         t_fullart1 = perf_counter()
