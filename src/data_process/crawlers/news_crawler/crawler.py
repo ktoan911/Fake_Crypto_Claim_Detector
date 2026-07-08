@@ -63,7 +63,6 @@ URLS_TO_CRAWL = [
     "https://bnews.vn/tai-chinh-ngan-hang/3/trang-1.html",
     "https://bnews.vn/thi-truong/4/trang-1.html",
     "https://tapchicongthuong.vn/",
-
     "https://vnba.org.vn/vi/hashtag/tin-tuc-7824",
     "https://www.customs.gov.vn/index.jsp?pageId=4&cid=25",
     "https://www.vietinbank.vn/vn/tin-tuc/",
@@ -84,6 +83,7 @@ URLS_TO_CRAWL = [
     "https://cafef.vn/xa-hoi.chn",
     "https://cafef.vn/doanh-nghiep.chn",
     "https://cafef.vn/vi-mo-dau-tu.chn",
+    "https://dantri.com.vn/kinh-doanh.htm",
     "https://cafef.vn/thi-truong.chn",
     "https://cafef.vn/smart-money.chn",
     "https://cafef.vn/tai-chinh-ngan-hang.chn",
@@ -109,15 +109,12 @@ URLS_TO_CRAWL = [
     "https://vov.vn/kinh-te/tai-chinh/",
     "https://www.vietcombank.com.vn/vi-VN/Trang-thong-tin-dien-tu/Tin-tuc-va-su-kien#ArticleSubCategories=T%C3%A0i%20ch%C3%ADnh%20ng%C3%A2n%20h%C3%A0ng",
     "https://www.vietcombank.com.vn/vi-VN/Trang-thong-tin-dien-tu/Tin-tuc-va-su-kien#ArticleSubCategories=Tin%20Vietcombank",
-
     # --- Cảnh báo ---
     "https://tinnhiemmang.vn/tin-tuc",
     "https://vnexpress.net/chu-de/lua-dao-4730",
     "https://nhandan.vn/tu-khoa/Luadao-tag78345.html",
     "https://tuoitre.vn/lua-dao.html",
-
-
-    #chứng khoản
+    # chứng khoản
     "https://cafef.vn/thi-truong-chung-khoan.chn",
     "https://fiingroup.vn/vi/tin-tuc.html",
     "https://ssc.gov.vn/webcenter/portal/ubck/pages_r/m/tintc-skin/dnhngmcututhumuasmcng",
@@ -126,7 +123,7 @@ URLS_TO_CRAWL = [
     "https://www.hsx.vn/vi/tin-tuc",
     "https://www.hnx.vn/vi-vn/",
     "https://vsd.vn/vi/tin-tuc",
-    "https://bocongan.gov.vn/chuyen-muc/tin-an-ninh-trat-tu-1753170263"
+    "https://bocongan.gov.vn/chuyen-muc/tin-an-ninh-trat-tu-1753170263",
 ]
 
 
@@ -784,7 +781,9 @@ def _push_crawl_info(
     op_user = os.getenv("OP_AUTH_USERNAME")
     op_pass = os.getenv("OP_AUTH_PASSWORD")
     if not op_host or not op_port or not op_user or not op_pass:
-        logging.warning("[crawl_info] Thiếu biến môi trường OpenSearch, bỏ qua ghi log phiên cào.")
+        logging.warning(
+            "[crawl_info] Thiếu biến môi trường OpenSearch, bỏ qua ghi log phiên cào."
+        )
         return
     try:
         from opensearchpy import OpenSearch, RequestsHttpConnection
@@ -826,8 +825,7 @@ def _push_crawl_info(
                 },
             )
         per_source_list = [
-            {"source_url": url, "count": cnt}
-            for url, cnt in source_counts.items()
+            {"source_url": url, "count": cnt} for url, cnt in source_counts.items()
         ]
         doc_id = hashlib.md5(crawled_at.encode()).hexdigest()
         client.index(

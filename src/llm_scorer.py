@@ -130,10 +130,6 @@ class LLMScorer:
                     )
 
         def _load_causal_lm(model_path: str):
-
-            # IMPORTANT: Must use torch_dtype= (NOT dtype=) — from_pretrained silently ignores
-            # unknown kwargs, so passing dtype= causes the model to load in fp32 (2x RAM!) with no error.
-            # CPU: bfloat16 halves RAM (8GB for 4B model). float32 = 16GB = instant OOM on 16GB machines.
             dtype = torch.float16 if use_cuda else torch.bfloat16
 
             load_in_4bit = use_cuda and os.getenv("LLM_LOAD_IN_4BIT", "0") == "1"
@@ -162,9 +158,6 @@ class LLMScorer:
                         logger.warning("[llm_scorer] bitsandbytes not installed, falling back to float16. Run: pip install bitsandbytes")
                         load_in_4bit = False
 
-                # Flash Attention 2 tương thích với cả float16 và 4-bit (transformers ≥ 4.37),
-                # nhưng CHỈ hỗ trợ Ampere (sm_80+) trở lên. T4/V100 (sm_75/sm_70) sẽ crash.
-                # Cần package flash-attn: pip install flash-attn --no-build-isolation
                 _fa2_enabled = False
                 try:
                     import flash_attn  # noqa: F401
@@ -247,10 +240,6 @@ class LLMScorer:
                     mod.register_forward_pre_hook(_pre_hook)
                     mod.register_forward_hook(_post_hook)
                     n_hooked += 1
-            logger.info(
-                f"CPU fp32-compute hooks registered on {n_hooked} Linear modules. "
-                "Weights stay bf16 in mmap; fp32 upcast happens per-layer during inference."
-            )
 
         import gc
 
@@ -289,15 +278,6 @@ class LLMScorer:
     def score_logits(
         self, texts: List[str], evidences: Optional[List[Any]] = None
     ) -> torch.Tensor:
-        """
-        Returns LOGITS (not probabilities) for labels in shape [batch, num_labels].
-        This is the paper-accurate p_LM(y|q) for Eq.2.
-
-        Implements SMART TRUNCATION:
-        - Preserves Claim and Template structure
-        - Formats evidence as numbered list: "1. ...\n2. ..."
-        - Truncates evidence from bottom to fill max_length
-        """
         if evidences is None:
             evidences = [[]] * len(texts)
 
@@ -311,11 +291,6 @@ class LLMScorer:
         template_parts = self.prompt_template.split("{evidence}")
         template_start_raw = template_parts[0]
         template_end_raw = template_parts[1]
-
-        # CRITICAL: Match training's max_length exactly (no reserved tokens)
-        # Training: input = [BOS, prompt, label, EOS] fits in max_length
-        # Inference: input = [BOS, prompt] should use same available space
-        # Prediction position: last non-pad token predicts next token (the label)
 
         for text, evidence_item in zip(texts, evidences):
             # 1. Prepare fixed parts

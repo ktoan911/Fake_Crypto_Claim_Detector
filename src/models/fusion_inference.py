@@ -28,10 +28,12 @@ _URL_KEYS: Tuple[str, ...] = ("article_url", "url", "link", "source_url")
 
 
 def _extract_url(meta: Dict[str, Any]) -> str:
+    """Lấy URL đầu tiên tìm được trong metadata theo thứ tự ưu tiên _URL_KEYS."""
     return next((str(meta[k]).strip() for k in _URL_KEYS if meta.get(k)), "")
 
 
 def _looks_like_listing_page(url: str) -> bool:
+    """Đoán xem URL có phải trang danh mục/chuyên mục (không phải bài báo thật) hay không."""
     if not url:
         return False
     path = urlparse(url).path
@@ -40,6 +42,8 @@ def _looks_like_listing_page(url: str) -> bool:
 
 
 def _resolve_fusion_model_path(path_or_repo: str, filename: str = "fusion_gold.pt") -> str:
+    """Trả về đường dẫn tới file model fusion: dùng file local nếu có sẵn,
+    ngược lại tải về từ HuggingFace Hub theo repo_id."""
     if os.path.isfile(path_or_repo):
         return path_or_repo
     try:
@@ -83,7 +87,7 @@ except ImportError:
 
 
 def _parse_timestamp(value: Any) -> datetime:
-    """Best-effort timestamp parser with UTC normalization."""
+    """Cố gắng parse timestamp từ nhiều định dạng và chuẩn hoá về UTC."""
     now = datetime.now(timezone.utc)
     if value is None:
         return now
@@ -111,6 +115,11 @@ def _parse_timestamp(value: Any) -> datetime:
 
 
 def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str], str]:
+    """Trích khoảng thời gian (min, max) từ các mốc ngày/tháng/năm trong text.
+
+    Bỏ qua nếu ngày nằm trong tương lai. Trả về (min_iso, max_iso, text_đã_bỏ_ngày);
+    nếu không tìm thấy ngày hợp lệ thì trả về (None, None, text_gốc).
+    """
     now_utc = datetime.now(timezone.utc)
     current_year = now_utc.year
     current_month = now_utc.month
@@ -162,7 +171,7 @@ def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str], str]:
 
 
 def _select_doc_text(source: Dict[str, Any]) -> str:
-    """Pick evidence text from OpenSearch document source."""
+    """Chọn đoạn text làm evidence từ document OpenSearch (ưu tiên text/content/description/title)."""
     for key in ("text", "content", "description", "title"):
         value = source.get(key)
         if value is not None:
@@ -176,7 +185,7 @@ _MIN_EVIDENCE_BODY_CHARS = int(os.getenv("FUSION_MIN_EVIDENCE_BODY_CHARS", "160"
 
 
 def _clean_body_text(source: Dict[str, Any]) -> str:
-    """Body text with the title prefix and BOM/whitespace noise removed."""
+    """Trả về phần thân bài đã bỏ tiêu đề ở đầu và loại nhiễu BOM/khoảng trắng."""
     content = str(source.get("content") or source.get("text") or "")
     content = content.replace("﻿", " ")
     title = str(source.get("title") or "").strip()
@@ -187,16 +196,15 @@ def _clean_body_text(source: Dict[str, Any]) -> str:
 
 
 def _has_usable_content(source: Dict[str, Any]) -> bool:
-    """True if the doc has enough body text to be trustworthy evidence."""
+    """True nếu document có đủ độ dài thân bài để coi là evidence đáng tin."""
     return len(_clean_body_text(source)) >= _MIN_EVIDENCE_BODY_CHARS
 
 
-# Long articles are split into multiple chunk-documents at crawl time (see
-# crawler.py _split_sentences). A handful of indexed "documents" are actually
-# category/listing pages (many unrelated headline blurbs stitched together,
-# not a real article) — these can explode into far more chunks than any real
-# article would. Cap both the chunk count and merged length so we never feed
-# that kind of noise into the LLM as if it were one coherent article.
+# Bài dài được chia thành nhiều chunk-document lúc crawl (xem crawler.py
+# _split_sentences). Một số "document" trong index thực ra là trang danh
+# mục/chuyên mục (ghép nhiều tiêu đề rời rạc, không phải một bài thật) — loại
+# này có thể sinh ra nhiều chunk hơn bất kỳ bài thật nào. Giới hạn cả số chunk
+# lẫn độ dài sau khi ghép để không đưa loại nhiễu đó vào LLM như một bài liền mạch.
 _MAX_CHUNKS_TO_MERGE = 8
 _MAX_MERGED_ARTICLE_CHARS = 8000
 
@@ -235,7 +243,7 @@ _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?…])\s+")# tách câu
 
 
 def _split_sentences(text: str) -> List[str]:
-    """Split evidence text into sentence-ish spans for relevance extraction."""
+    """Tách text evidence thành các câu (gần đúng) để phục vụ trích câu liên quan."""
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     if not normalized:
         return []
@@ -244,6 +252,7 @@ def _split_sentences(text: str) -> List[str]:
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
+    """Đọc biến môi trường dạng cờ bật/tắt (1/true/yes/y/on = True)."""
     value = os.getenv(name)
     if value is None:
         return default
@@ -251,6 +260,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _truncate(text: str, max_chars: int) -> str:
+    """Cắt bớt chuỗi về tối đa max_chars ký tự, thêm dấu … ở cuối (max_chars<=0 = không cắt)."""
     s = str(text)
     if max_chars <= 0 or len(s) <= max_chars:
         return s
@@ -258,25 +268,29 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _normalize_query_text(text: str) -> str:
+    """Chuẩn hoá text truy vấn: gộp khoảng trắng thừa và cắt đầu/cuối."""
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
 def _tokenize_for_overlap(text: str) -> List[str]:
+    """Tách chuỗi thành các token chữ-số viết thường để tính độ trùng lặp."""
     return re.findall(r"[a-z0-9]+", str(text or "").lower())
 
 
 def _is_verbatim_query(query: str) -> bool:
+    """Nhận biết truy vấn là kiểu dán nguyên cả bài (rất dài) thay vì một claim ngắn."""
     normalized = _normalize_query_text(query)
     token_count = len(_tokenize_for_overlap(normalized))
     if not normalized:
         return False
-    # Only treat as verbatim whole-article dump if it's exceptionally long
+    # Chỉ coi là dán nguyên cả bài khi nó đặc biệt dài
     if len(normalized) >= 1200:
         return True
     return token_count >= 200
 
 
 def _token_overlap_ratio(query_text: str, doc_text: str) -> float:
+    """Tỉ lệ token của truy vấn cũng xuất hiện trong document (0..1)."""
     q_tokens = set(_tokenize_for_overlap(query_text))
     d_tokens = set(_tokenize_for_overlap(doc_text))
     if not q_tokens or not d_tokens:
@@ -298,15 +312,15 @@ def _build_retrieval_features_train_compatible(
     evidence_top_k: Optional[int] = None,
 ) -> "tuple[np.ndarray, Optional[np.ndarray], List[str], List[RetrievalResult]]":
     """
-    Same feature construction used in training.
-    Returns (score_features_array, interaction_features, evidence_texts, results).
-    interaction_features is [2*emb_dim] = concat(q⊙mean_d, |q-mean_d|) or None.
+    Dựng feature giống hệt lúc training.
+    Trả về (mảng_score_features, interaction_features, evidence_texts, results).
+    interaction_features có shape [2*emb_dim] = concat(q⊙mean_d, |q-mean_d|) hoặc None.
 
-    `top_k` sizes the numeric feature matrix (padded to exactly `top_k` rows
-    below — required, the retrieval-branch MLP was trained on that fixed
-    shape). `evidence_top_k`, if smaller, independently caps how many
-    deduped/full-article evidence texts survive — it never changes the
-    padded feature matrix shape.
+    `top_k` quy định kích thước ma trận feature dạng số (được pad thành đúng
+    `top_k` hàng ở dưới — bắt buộc, vì MLP nhánh retrieval được train với shape
+    cố định này). `evidence_top_k`, nếu nhỏ hơn, giới hạn độc lập số evidence
+    text (đã dedup/ghép full-article) được giữ lại — nó không bao giờ làm thay
+    đổi shape ma trận feature đã pad.
     """
     results = retriever.retrieve(
         text,
@@ -354,8 +368,8 @@ def _build_retrieval_features_train_compatible(
 
 class OpenSearchHybridRetriever:
     """
-    Retrieval wrapper that keeps the train-time scoring pipeline, but uses
-    OpenSearch for BM25 and vector retrieval.
+    Lớp bọc retrieval giữ nguyên pipeline tính điểm như lúc training, nhưng
+    dùng OpenSearch để làm BM25 và tìm kiếm vector.
     """
 
     def __init__(
@@ -369,6 +383,8 @@ class OpenSearchHybridRetriever:
         rrf_k: int = 60,
         device: Optional[str] = None,
     ):
+        """Khởi tạo retriever: nạp encoder SentenceTransformer, bộ chấm điểm
+        theo thời gian (TemporalScorer) và (tuỳ chọn) bộ mở rộng truy vấn."""
         if not SENTENCE_TRANSFORMERS_AVAILABLE:
             raise ImportError(
                 "sentence-transformers is required for OpenSearch vector retrieval."
@@ -385,30 +401,29 @@ class OpenSearchHybridRetriever:
         self.encoder = SentenceTransformer(embedding_model, device=_st_device)
         self.embedding_dim = int(self.encoder.get_sentence_embedding_dimension())
 
-        # Ensure dimension check in OpenSearch wrapper matches the active encoder.
+        # Đảm bảo phần kiểm tra số chiều trong wrapper OpenSearch khớp với encoder đang dùng.
         self.kb.embedding_dim = self.embedding_dim
 
     def _select_relevant_sentences(
         self, claim: str, text: str, top_n: int, title: str = ""
     ) -> str:
-        """Keep the sentences of `text` most similar to `claim`, re-joined in
-        their original order, with the article `title` always prepended.
+        """Giữ lại những câu trong `text` giống `claim` nhất, ghép lại theo đúng
+        thứ tự gốc, và luôn đặt tiêu đề bài `title` lên đầu.
 
-        The title is the article's own summary of what it reports, so it stays
-        in every evidence regardless of similarity and occupies one of the
-        `top_n` slots (top_n=3 with a title ⇒ title + 2 body sentences). The
-        remaining slots go to the body sentences closest to the claim, scored
-        with the already-resident retrieval encoder. Keeping only those strips
-        the competing numbers/tenors that otherwise make NLI read
-        "contradiction" and bloat the LLM evidence. Falls back to the original
-        text on any failure.
+        Tiêu đề là bản tóm tắt của chính bài báo về nội dung nó đưa tin, nên
+        luôn được giữ trong mọi evidence bất kể độ tương đồng và chiếm một trong
+        `top_n` suất (top_n=3 kèm tiêu đề ⇒ tiêu đề + 2 câu thân bài). Các suất
+        còn lại dành cho những câu thân bài gần claim nhất, chấm điểm bằng chính
+        encoder retrieval đang có sẵn. Chỉ giữ những câu này giúp loại bỏ các con
+        số/giọng điệu gây nhiễu khiến NLI đọc thành "mâu thuẫn" và làm phình
+        evidence đưa cho LLM. Trả về text gốc nếu có lỗi xảy ra.
         """
         if top_n <= 0 or not claim:
             return text
         title = _normalize_query_text(title)
         body = _normalize_query_text(text)
-        # A merged article starts with its title — drop that leading copy so the
-        # title isn't duplicated and doesn't consume a body slot.
+        # Bài đã ghép bắt đầu bằng tiêu đề — bỏ bản sao ở đầu này để tiêu đề
+        # không bị lặp lại và không chiếm mất một suất câu thân bài.
         if title and body.startswith(title):
             body = body[len(title):].strip()
         sentences = _split_sentences(body)
@@ -438,22 +453,21 @@ class OpenSearchHybridRetriever:
     def _dedupe_and_fetch_full_articles(
         self, ranked_items: List[RetrievalResult], top_k: int, claim: str = ""
     ) -> List[RetrievalResult]:
-        """Drop duplicate chunks from the same article, reconstruct each kept
-        item's full article, then keep only the sentences most relevant to the
-        claim as its evidence text.
+        """Bỏ các chunk trùng nhau của cùng một bài, dựng lại full-article cho
+        mỗi item được giữ, rồi chỉ giữ những câu liên quan nhất tới claim làm
+        evidence text.
 
-        Dedup only looks within the original top_k window — a dropped
-        duplicate is NOT backfilled from lower-ranked candidates. The full
-        article is reconstructed first so relevant-sentence extraction can see
-        every chunk of the article (the confirming sentence may live in a chunk
-        that wasn't the one retrieved), then `_select_relevant_sentences`
-        trims it back down to the few sentences that actually speak to the
-        claim — giving both the LLM and the NLI scorer focused evidence instead
-        of a whole article full of competing figures. Set
-        FUSION_EVIDENCE_SENTENCE_EXTRACT_ENABLED=0 to keep the full article.
+        Việc dedup chỉ xét trong cửa sổ top_k ban đầu — một chunk trùng bị loại
+        sẽ KHÔNG được bù bằng ứng viên xếp hạng thấp hơn. Full-article được dựng
+        lại trước để bước trích câu liên quan có thể nhìn thấy mọi chunk của bài
+        (câu xác nhận có thể nằm ở chunk không phải chunk được retrieve), sau đó
+        `_select_relevant_sentences` cắt gọn lại còn vài câu thực sự nói tới
+        claim — đưa evidence cô đọng cho cả LLM lẫn bộ chấm NLI thay vì cả bài
+        đầy những con số cạnh tranh nhau. Đặt
+        FUSION_EVIDENCE_SENTENCE_EXTRACT_ENABLED=0 để giữ nguyên full-article.
 
-        `ranked_items` should already be sorted best-first so the highest
-        scoring chunk of each article is the one that survives dedup.
+        `ranked_items` cần được sắp xếp tốt-nhất-trước để chunk điểm cao nhất
+        của mỗi bài là chunk sống sót sau dedup.
         """
         extract_enabled = _env_flag(
             "FUSION_EVIDENCE_SENTENCE_EXTRACT_ENABLED", default=True
@@ -511,8 +525,8 @@ class OpenSearchHybridRetriever:
 
     def _get_search_pool_size(self, rrf_top_k: int) -> int:
         """
-        Fetch a sufficiently large pool for RRF ranking without fetching the entire DB.
-        During inference, fetching 10k full documents takes >100 seconds over HTTP.
+        Lấy một pool đủ lớn để xếp hạng RRF mà không cần tải toàn bộ DB.
+        Lúc inference, tải 10k document đầy đủ mất hơn 100 giây qua HTTP.
         """
         hard_cap = int(os.getenv("RETRIEVAL_POOL_SIZE_CAP", "100"))
         pool = min(max(rrf_top_k * 2, 50), hard_cap)
@@ -527,15 +541,18 @@ class OpenSearchHybridRetriever:
         return pool
 
     def _doc_group_key(self, source: Dict[str, Any]) -> str:
+        """Khoá nhóm của document (theo type/source) dùng cho chấm điểm thời gian."""
         return str(source.get("type") or source.get("source") or "default")
 
     def _doc_timestamp(self, source: Dict[str, Any]) -> datetime:
+        """Lấy timestamp của document từ các trường thời gian có thể có; mặc định là hiện tại."""
         for key in ("timestamp", "published_at", "created_at", "fetched_at"):
             if key in source:
                 return _parse_timestamp(source.get(key))
         return datetime.now(timezone.utc)
 
     def _encode_query(self, query: str) -> List[float]:
+        """Encode một truy vấn thành vector embedding (chưa chuẩn hoá)."""
         vector = self.encoder.encode(
             [query], convert_to_numpy=True, normalize_embeddings=False
         )[0]
@@ -565,12 +582,20 @@ class OpenSearchHybridRetriever:
         max_timestamp: Optional[str] = None,
         evidence_top_k: Optional[int] = None,
     ) -> List[RetrievalResult]:
+        """Chạy pipeline retrieval lai (BM25 + vector) rồi hợp nhất bằng RRF và
+        chấm điểm theo thời gian, trả về danh sách RetrievalResult đã sắp xếp.
+
+        Hỗ trợ lọc theo khoảng thời gian, mở rộng truy vấn, và xử lý riêng cho
+        truy vấn dán nguyên cả bài (verbatim). `top_k` quy định số hàng feature,
+        `evidence_top_k` giới hạn số evidence text được giữ lại.
+        """
         debug = _env_flag("FUSION_INFERENCE_DEBUG", default=False) or _env_flag(
             "FUSION_INFERENCE_LOG_ALL", default=False
         )
-        # Do NOT set self.temporal_scorer.reference_date here — the property
-        # already returns datetime.now(timezone.utc) when _reference_date is None,
-        # and mutating a shared attribute is a race condition under concurrent requests.
+        # KHÔNG gán self.temporal_scorer.reference_date ở đây — property đó đã tự
+        # trả về datetime.now(timezone.utc) khi _reference_date là None, và việc
+        # thay đổi thuộc tính dùng chung sẽ gây race condition khi có nhiều
+        # request đồng thời.
 
         t_retrieve_start = perf_counter()
 
@@ -682,7 +707,7 @@ class OpenSearchHybridRetriever:
         vector_ranks = {hit.id: rank for rank, hit in enumerate(vector_hits)}
         missing_rank = max(search_pool_k, len(hit_by_id))
 
-        # Stage 2: Reciprocal Rank Fusion (same formula as training retriever).
+        # Bước 2: Reciprocal Rank Fusion (cùng công thức với retriever lúc training).
         t_rrf0 = perf_counter()
         rrf_scores = {}
         bm25_weight = 1.35 if verbatim_query else 1.0
@@ -703,7 +728,7 @@ class OpenSearchHybridRetriever:
         max_rrf = max(max_rrf, 1e-8)
         rrf_scores_norm = {doc_id: score / max_rrf for doc_id, score in rrf_candidates}
 
-        # Build group histories for temporal scoring.
+        # Dựng lịch sử thời gian theo từng nhóm để phục vụ chấm điểm thời gian.
         docs_by_group: Dict[str, List[datetime]] = {}
         for hit in hit_by_id.values():
             source = hit.source or {}
@@ -759,12 +784,12 @@ class OpenSearchHybridRetriever:
 
         final_items.sort(key=lambda x: x.score, reverse=True)
 
-        # top_k drives the fixed-size numeric retrieval-branch features (the
-        # model was trained expecting exactly self.top_k rows, zero-padded by
-        # _build_retrieval_features_train_compatible if fewer come back — see
-        # that function). evidence_top_k is the independent, smaller-or-equal
-        # cap on how many deduped/full-article evidence *texts* actually get
-        # kept — it must never widen the window past top_k.
+        # top_k quy định feature dạng số kích thước cố định của nhánh retrieval
+        # (model được train với đúng self.top_k hàng, được zero-pad bởi
+        # _build_retrieval_features_train_compatible nếu trả về ít hơn — xem hàm
+        # đó). evidence_top_k là giới hạn độc lập, nhỏ-hơn-hoặc-bằng, cho số
+        # evidence *text* (đã dedup/full-article) thực sự được giữ — nó không bao
+        # giờ được mở cửa sổ rộng quá top_k.
         dedup_window = top_k
         if evidence_top_k is not None:
             dedup_window = min(top_k, max(1, int(evidence_top_k)))
@@ -798,9 +823,10 @@ class OpenSearchHybridRetriever:
 
 @dataclass
 class ClaimPrediction:
+    """Kết quả dự đoán cho một claim: verdict, nhãn, độ tin cậy, evidence và nguồn."""
     claim: str
     verdict: str  # "Đúng" | "Sai"
-    label: str  # Model label token, e.g. "Đúng" | "Sai"
+    label: str  # Token nhãn của model, ví dụ "Đúng" | "Sai"
     label_id: int
     confidence: float
     evidence: List[str]
@@ -811,8 +837,8 @@ class ClaimPrediction:
 
 class FusionClaimVerifier:
     """
-    Single-claim inference helper:
-      claim -> retrieved evidence -> LLM logits -> fusion -> Đúng/Sai verdict.
+    Bộ trợ giúp inference cho từng claim:
+      claim -> lấy evidence -> logits LLM -> fusion -> verdict Đúng/Sai.
     """
 
     def __init__(
@@ -830,6 +856,8 @@ class FusionClaimVerifier:
         debug: Optional[bool] = None,
         log_evidence_chars: int = 240,
     ):
+        """Nạp checkpoint fusion, các nhánh model (retrieval encoder + fusion),
+        retriever OpenSearch, LLM scorer và cấu hình các guard NLI/grounding."""
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch is required for fusion inference.")
         if ConfidenceAwareFusion is None or RetrievalFeatureEncoder is None:
@@ -913,9 +941,9 @@ class FusionClaimVerifier:
         self._nli_top_k = int(os.getenv("NLI_EVIDENCE_TOP_K", str(min(5, self.top_k))))
         self.nli_override_enabled = _env_flag("NLI_OVERRIDE_ENABLED", default=True)
         self.nli_override_threshold = float(os.getenv("NLI_OVERRIDE_THRESHOLD", "0.5"))
-        # Grounding guard: a confident Đúng/Sai must be backed by at least one
-        # piece of evidence that actually entails (A) or contradicts (B) the
-        # claim. If nothing does, the verdict is ungrounded → downgrade to C.
+        # Grounding guard: một verdict Đúng/Sai tự tin phải được chống lưng bởi ít
+        # nhất một evidence thực sự kéo theo (A) hoặc mâu thuẫn (B) với claim. Nếu
+        # không có evidence nào như vậy thì verdict là vô căn cứ → hạ về C.
         self.grounding_guard_enabled = _env_flag("GROUNDING_GUARD_ENABLED", default=True)
         self.grounding_support_threshold = float(
             os.getenv("GROUNDING_SUPPORT_THRESHOLD", "0.45")
@@ -946,7 +974,7 @@ class FusionClaimVerifier:
         self.fusion.eval()
 
         # torch.compile tăng tốc ~20% cho fusion/retrieval_encoder (model nhỏ,
-        # compile nhanh). Chỉ bật trên GPU vì CPU compile overhead không đáng.
+        # compile nhanh). Chỉ bật trên GPU vì overhead compile trên CPU không đáng.
         if self.device != "cpu" and hasattr(torch, "compile"):
             try:
                 self.retrieval_encoder = torch.compile(self.retrieval_encoder)
@@ -1003,12 +1031,7 @@ class FusionClaimVerifier:
     # Warmup
     # ------------------------------------------------------------------
     def warmup(self) -> None:
-        """Trigger torch.compile lazy Triton compilation during startup.
-
-        torch.compile defers kernel compilation to the first real forward pass,
-        which stalls the initial user request for 3-10 minutes on GPU. Running a
-        dummy forward here during server startup moves that cost out of the
-        critical path.
+        """Kích hoạt việc biên dịch Triton (lazy) của torch.compile ngay lúc khởi động.
         """
         if self.device == "cpu":
             return
@@ -1040,17 +1063,18 @@ class FusionClaimVerifier:
     # NLI helpers
     # ------------------------------------------------------------------
     def _ensure_nli_loaded(self) -> None:
+        """Nạp NLIScorer một lần duy nhất (lazy, thread-safe) khi cần dùng lần đầu."""
         if self._nli_scorer is not None or not self.nli_model_name:
             return
         with self._nli_lock:
             if self._nli_scorer is not None:
                 return
             from src.models.nli_scorer import NLIScorer
-            # NLI_MAX_LENGTH: attention complexity is O(n²) — 256 vs 512 = 4x less compute.
-            # Evidence relevant to fact-checking is almost always in the first ~200 tokens.
+            # NLI_MAX_LENGTH: độ phức tạp attention là O(n²) — 256 vs 512 = ít tính toán hơn 4 lần.
+            # Evidence liên quan tới fact-checking hầu như luôn nằm trong ~200 token đầu.
             nli_max_length = int(os.getenv("NLI_MAX_LENGTH", "256"))
-            # NLI_DEVICE defaults to CPU to avoid competing with LLM for VRAM.
-            # On a 6 GB GPU, LLM alone needs ~3 GB + activations; adding DeBERTa causes OOM.
+            # NLI_DEVICE mặc định là CPU để không tranh VRAM với LLM.
+            # Trên GPU 6 GB, riêng LLM đã cần ~3 GB + activations; thêm DeBERTa sẽ gây OOM.
             nli_device = os.getenv("NLI_DEVICE", "cpu")
             self._nli_scorer = NLIScorer(
                 model_name=self.nli_model_name,
@@ -1061,7 +1085,7 @@ class FusionClaimVerifier:
     def _nli_for_claim(
         self, claim: str, results: List[RetrievalResult]
     ) -> Optional[Tuple[np.ndarray, int]]:
-        """Returns ([top_k, 3] NLI features, n_real_evidence) or None if NLI not available."""
+        """Trả về (NLI features [top_k, 3], số_evidence_thật) hoặc None nếu NLI không khả dụng."""
         if not self.nli_model_name:
             return None
         self._ensure_nli_loaded()
@@ -1077,7 +1101,7 @@ class FusionClaimVerifier:
     def _nli_for_batch(
         self, claims: List[str], results_list: List[List[RetrievalResult]]
     ) -> List[Optional[Tuple[np.ndarray, int]]]:
-        """Returns list of ([top_k, 3] NLI features, n_real_evidence), one per claim."""
+        """Trả về danh sách (NLI features [top_k, 3], số_evidence_thật), mỗi phần tử cho một claim."""
         if not self.nli_model_name:
             return [None] * len(claims)
         self._ensure_nli_loaded()
@@ -1113,21 +1137,8 @@ class FusionClaimVerifier:
         nli_feats: Optional[np.ndarray],
         n_real_evidence: int,
     ) -> Tuple[int, float, bool]:
-        """Downgrade to 'Chưa chắc chắn' when the fusion verdict is contradicted
-        by a majority of independently-scored evidence.
-
-        The LLM branch and the retrieval-branch MLP can independently land on
-        the same wrong verdict (both undertrained on "authority denies a
-        viral claim" patterns) even though NLI on the evidence is correct.
-        Rather than trusting the learned fusion weight to resolve that
-        conflict, treat a strong NLI disagreement as reason to flag the case
-        for review instead of asserting a confident but likely-wrong Đúng/Sai.
-
-        Uses all scored evidence (not just the top-ranked one) and requires
-        both a minimum vote count and a majority among the *confident* NLI
-        calls, so a single noisy/off-topic document can't flip the verdict —
-        the failure mode this guard is meant to fix already needs 2+
-        independent pieces of evidence to be worth trusting over the model.
+        """Hạ verdict về 'Chưa chắc chắn' khi verdict của fusion bị đa số evidence
+        (được chấm điểm độc lập) mâu thuẫn.
         """
         confidence = float(probs[pred_id].item())
         if (
@@ -1138,7 +1149,7 @@ class FusionClaimVerifier:
         ):
             return pred_id, confidence, False
 
-        target_label = 2 if pred_id == 0 else 0  # need contradiction vs Đúng, entailment vs Sai
+        target_label = 2 if pred_id == 0 else 0  # cần mâu thuẫn với Đúng, kéo theo với Sai
         real_nli = nli_feats[:n_real_evidence]
         argmaxes = np.argmax(real_nli, axis=-1)
         top_confidences = real_nli[np.arange(len(real_nli)), argmaxes]
@@ -1160,18 +1171,9 @@ class FusionClaimVerifier:
         nli_feats: Optional[np.ndarray],
         n_real_evidence: int,
     ) -> Tuple[int, float, bool]:
-        """Downgrade a confident Đúng/Sai to 'Chưa chắc chắn' when NONE of the
-        retrieved evidence provides the NLI signal that verdict requires —
-        entailment for Đúng (col 0), contradiction for Sai (col 2).
-
-        Complements _apply_nli_conflict_guard: that one fires on *opposing*
-        evidence, this one fires on the *absence of supporting* evidence. It
-        catches the failure mode where retrieval returns only topically-related
-        (or entirely unrelated) documents that never actually speak to the
-        claim's subject, yet the LLM/fusion branch still asserts A or B — e.g.
-        a viral rumor about an entity that appears in no evidence at all. In
-        that situation the honest answer is "insufficient evidence", not a
-        fabricated verdict.
+        """Hạ một verdict Đúng/Sai tự tin về 'Chưa chắc chắn' khi KHÔNG evidence
+        nào trong số được lấy về cung cấp tín hiệu NLI mà verdict đó cần —
+        kéo theo (entailment) cho Đúng (cột 0), mâu thuẫn (contradiction) cho Sai (cột 2).
         """
         confidence = float(probs[pred_id].item())
         if (
@@ -1182,7 +1184,7 @@ class FusionClaimVerifier:
         ):
             return pred_id, confidence, False
 
-        support_col = 0 if pred_id == 0 else 2  # entailment for A, contradiction for B
+        support_col = 0 if pred_id == 0 else 2  # kéo theo cho A, mâu thuẫn cho B
         real_nli = nli_feats[:n_real_evidence]
         max_support = float(real_nli[:, support_col].max())
         if max_support < self.grounding_support_threshold:
@@ -1194,7 +1196,7 @@ class FusionClaimVerifier:
     # ------------------------------------------------------------------
     @property
     def _claims_kb(self) -> "OpenSearchKB":
-        """Lazy OpenSearchKB pointing to the 'claims' index."""
+        """OpenSearchKB (khởi tạo lazy) trỏ tới index 'claims'."""
         if not hasattr(self, "_claims_kb_instance"):
             claims_index = os.getenv("OP_CLAIMS_INDEX", "claims")
             self._claims_kb_instance = OpenSearchKB(
@@ -1241,6 +1243,7 @@ class FusionClaimVerifier:
     # Claim splitting
     # ------------------------------------------------------------------
     def split_long_claim(self, claim: str) -> Optional[List[str]]:
+        """Viết lại/tách claim dài khi bật REWRITE_CLAIM; trả về None nếu tắt."""
         if not _env_flag("REWRITE_CLAIM", default=False):
             return None
         rewritten = rewrite_claim(claim)
@@ -1296,6 +1299,12 @@ class FusionClaimVerifier:
     def _aggregate_sub_claim_predictions(
         self, claim: str, sub_preds: List[ClaimPrediction], sub_claim_count: int
     ) -> ClaimPrediction:
+        """Gộp dự đoán của các sub-claim thành một verdict cho claim gốc.
+
+        Quy tắc: chỉ cần một sub-claim 'Sai' thì tổng thể là 'Sai'; nếu không có
+        'Sai' nhưng có 'Chưa chắc chắn' thì là 'Chưa chắc chắn'; còn lại là 'Đúng'.
+        Độ tin cậy lấy trung bình, evidence và source link được gộp lại.
+        """
         has_sai = False
         has_chua_chac_chan = False
         all_evidence: List[str] = []
@@ -1359,6 +1368,7 @@ class FusionClaimVerifier:
     def _log_predictions_to_claims_index(
         self, predictions: List[ClaimPrediction]
     ) -> None:
+        """Ghi (bất đồng bộ) danh sách dự đoán vào index 'claims' của OpenSearch."""
         if not predictions:
             return
 
@@ -1375,6 +1385,11 @@ class FusionClaimVerifier:
         )
 
     def _predict_batch_without_split(self, claims: List[str]) -> List[ClaimPrediction]:
+        """Dự đoán theo lô cho danh sách claim (không tách sub-claim).
+
+        Chuẩn hoá ngày trong claim, retrieve evidence, chạy NLI + LLM + fusion
+        theo batch rồi áp các guard NLI/grounding để ra verdict cuối cho từng claim.
+        """
         t0 = perf_counter()
         if not claims:
             return []
@@ -1408,7 +1423,7 @@ class FusionClaimVerifier:
                 all_llm_evidences = []
                 all_source_links = []
 
-                # Inject today's date into claims that carry no explicit date.
+                # Chèn ngày hôm nay vào các claim không có ngày cụ thể.
                 _today_str = now_utc.strftime("%d/%m/%Y")
                 _yesterday_str = (now_utc - timedelta(days=1)).strftime("%d/%m/%Y")
                 _day_before_str = (now_utc - timedelta(days=2)).strftime("%d/%m/%Y")
@@ -1433,7 +1448,7 @@ class FusionClaimVerifier:
                     new_batch.append((idx, text))
                 batch = new_batch
 
-                # Pre-batch encode tất cả queries trong một lần gọi SentenceTransformer
+                # Encode trước tất cả query trong một lần gọi SentenceTransformer
                 batch_texts_list = [batch_cleaned_texts[idx] for idx, _ in batch]
                 for idx, text in batch:
                     logger.info(f"[fusion_inference] final_claim_to_llm (batch) | idx={idx} | claim={text!r}")
@@ -1453,6 +1468,7 @@ class FusionClaimVerifier:
                     item: Tuple[int, str],
                     batch_pos: int,
                 ) -> Tuple[int, str, Any, Any, List[str], List[str], List[RetrievalResult]]:
+                    """Retrieve evidence cho một claim và dựng feature + danh sách source link."""
                     _idx, _text = item
                     _t0 = perf_counter()
                     min_ts, max_ts = batch_date_ranges.get(_idx, (None, None))
@@ -1502,7 +1518,7 @@ class FusionClaimVerifier:
                     all_source_links.append(links)
                     all_retrieval_results_list.append(r_results)
 
-                # Merge NLI features into score features if checkpoint was trained with NLI
+                # Gộp NLI features vào score features nếu checkpoint được train kèm NLI
                 t_nli0 = perf_counter()
                 nli_list: Optional[List[Tuple[np.ndarray, int]]] = None
                 if self.nli_model_name:
@@ -1626,6 +1642,12 @@ class FusionClaimVerifier:
         return [r for r in results if r is not None]
 
     def predict(self, claim: str) -> ClaimPrediction:
+        """Dự đoán verdict cho một claim đơn.
+
+        Nếu claim được tách thành nhiều sub-claim thì dự đoán từng cái rồi gộp
+        lại; ngược lại chạy trực tiếp pipeline retrieve → NLI → LLM → fusion và
+        áp guard, trả về ClaimPrediction kèm thông tin timing.
+        """
         t0 = perf_counter()
         text = str(claim).strip()
         if not text:
@@ -1787,7 +1809,7 @@ class FusionClaimVerifier:
                         ev_text = _truncate(ev_text, self.log_evidence_chars)
                     logger.info(f"[fusion_inference] evidence[{idx}]={ev_text!r}")
 
-        # Append NLI features if checkpoint was trained with NLI
+        # Nối thêm NLI features nếu checkpoint được train kèm NLI
         t_nli0 = perf_counter()
         nli_feats: Optional[np.ndarray] = None
         nli_n_real = 0
@@ -1968,6 +1990,12 @@ class FusionClaimVerifier:
         return prediction
 
     def predict_batch(self, claims: List[str]) -> List[ClaimPrediction]:
+        """Dự đoán verdict cho nhiều claim cùng lúc.
+
+        Tách từng claim thành sub-claim, dự đoán toàn bộ sub-claim trong một lô
+        phẳng để tận dụng batch, rồi gom kết quả về đúng claim gốc (gộp nếu claim
+        có nhiều sub-claim).
+        """
         t0 = perf_counter()
         if not claims:
             return []

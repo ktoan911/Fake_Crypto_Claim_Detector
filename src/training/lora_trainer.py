@@ -161,7 +161,7 @@ def _resolve_training_precision(precision: str):
 
     return torch.float32, False, False, "fp32"
 
-
+# Lora only in
 def _is_linear_like_module(module) -> bool:
     if isinstance(module, torch.nn.Linear):
         return True
@@ -204,7 +204,7 @@ def _resolve_lora_target_modules(model) -> List[str]:
     if detected:
         return detected
 
-    excluded_suffixes = {"lm_head", "embed_out", "classifier", "score", "qa_outputs"}
+    excluded_suffixes = {"lm_head", "embed_out", "classifier", "score", "qa_outputs"} # auto kick
     excluded_name_fragments = ("embed_tokens", "word_embeddings", "wte")
 
     linear_suffixes = set()
@@ -286,7 +286,7 @@ def _normalize_label(label_value) -> str:
     )
     return NEI_LABEL
 
-
+#% nhãn
 def _log_label_distribution(labels: List[str], title: str) -> None:
     if not labels:
         logger.warning(f"{title}: empty label list.")
