@@ -181,7 +181,7 @@ BLOCKED_CONTENT_HINTS = [
 # this the extraction almost certainly failed and only the headline survived;
 # such stubs pollute retrieval. Kept in sync with FUSION_MIN_EVIDENCE_BODY_CHARS
 # on the serving side (src/models/fusion_inference.py).
-MIN_ARTICLE_BODY_CHARS = int(os.getenv("MIN_ARTICLE_BODY_CHARS", "160"))
+MIN_ARTICLE_BODY_CHARS = int(os.getenv("MIN_ARTICLE_BODY_CHARS", "60"))
 
 
 def normalize_domain(netloc: str) -> str:
@@ -848,7 +848,7 @@ def _push_crawl_info(
 
 async def main(args):
     results = []
-    concurrency_limit = 10  # tăng từ 5 → 10 để crawl danh sách nhanh hơn
+    concurrency_limit = 10 
     semaphore = asyncio.Semaphore(concurrency_limit)
 
     # Tính cutoff_time sớm để truyền vào các hàm fetch (early-exit)
@@ -870,7 +870,7 @@ async def main(args):
             ],
         )
 
-        # Ngụy trang Context mạnh hơn
+        # Ngụy trang Context
         context = await browser.new_context(
             ignore_https_errors=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
