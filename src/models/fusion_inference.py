@@ -251,6 +251,77 @@ def _split_sentences(text: str) -> List[str]:
     return [p.strip() for p in parts if len(p.strip()) >= _EVIDENCE_MIN_SENTENCE_CHARS]
 
 
+# Khối menu/điều hướng của trang báo (danh sách nhiều tiêu đề rời ghép lại,
+# gần như không có dấu chấm câu) thường lọt vào full-article dưới dạng MỘT
+# "câu" dài bất thường. Nhận diện bằng: rất dài VÀ mật độ dấu phẩy thấp — câu
+# tin thật dù dài vẫn có dấu phẩy ngắt mệnh đề, còn menu là chuỗi tiêu đề nối
+# nhau gần như không ngắt. (Đo thực tế: menu ~124 từ / density 0.02, câu tin
+# 24–36 từ / density 0.07–0.13.)
+_BOILERPLATE_MIN_WORDS = int(os.getenv("FUSION_BOILERPLATE_MIN_WORDS", "50"))
+_BOILERPLATE_MAX_COMMA_DENSITY = float(
+    os.getenv("FUSION_BOILERPLATE_MAX_COMMA_DENSITY", "0.05")
+)
+# Câu evidence trích một ngày lệch quá xa ngày của claim (± ngần này ngày) bị
+# coi là nội dung cũ/ngược hướng và loại khỏi evidence.
+_EVIDENCE_DATE_TOLERANCE_DAYS = int(os.getenv("FUSION_EVIDENCE_DATE_TOLERANCE_DAYS", "2"))
+_DATE_IN_TEXT_RE = re.compile(
+    r"(?:ngày\s+)?(\d{1,2})(?:\s*[-/]\s*|\s+tháng\s+)(\d{1,2})(?:(?:\s*[-/]\s*|\s+năm\s+)(\d{2,4}))?",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_boilerplate(sentence: str) -> bool:
+    """True nếu 'câu' thực chất là khối menu/điều hướng ghép nhiều tiêu đề:
+    dài bất thường VÀ mật độ dấu phẩy thấp."""
+    n = len(sentence.split())
+    if n < _BOILERPLATE_MIN_WORDS:
+        return False
+    return sentence.count(",") / n < _BOILERPLATE_MAX_COMMA_DENSITY
+
+
+def _dates_in_text(text: str) -> List[datetime]:
+    """Trích danh sách mốc ngày (UTC) xuất hiện trong text. Ngày không có năm
+    mặc định lấy năm hiện tại; mốc không hợp lệ bị bỏ qua."""
+    now = datetime.now(timezone.utc)
+    out: List[datetime] = []
+    for d_str, m_str, y_str in _DATE_IN_TEXT_RE.findall(text or ""):
+        try:
+            y = int(y_str) if y_str else now.year
+            if y < 100:
+                y += 2000
+            out.append(datetime(y, int(m_str), int(d_str), tzinfo=timezone.utc))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _claim_date_window(
+    min_ts: Optional[str], max_ts: Optional[str]
+) -> "Optional[Tuple[datetime, datetime]]":
+    """Dựng cửa sổ [lo, hi] quanh ngày của claim (± _EVIDENCE_DATE_TOLERANCE_DAYS)
+    để lọc câu evidence lệch ngày. Trả về None nếu claim không kèm ngày."""
+    if not min_ts and not max_ts:
+        return None
+    tol = timedelta(days=_EVIDENCE_DATE_TOLERANCE_DAYS)
+    lo = _parse_timestamp(min_ts) if min_ts else _parse_timestamp(max_ts)
+    hi = _parse_timestamp(max_ts) if max_ts else _parse_timestamp(min_ts)
+    return lo - tol, hi + tol
+
+
+def _sentence_in_window(
+    sentence: str, window: "Optional[Tuple[datetime, datetime]]"
+) -> bool:
+    """Giữ câu nếu không có cửa sổ, câu không trích ngày nào, hoặc có ít nhất
+    một ngày nằm trong cửa sổ. Loại câu chỉ trích ngày ngoài cửa sổ."""
+    if window is None:
+        return True
+    dates = _dates_in_text(sentence)
+    if not dates:
+        return True
+    lo, hi = window
+    return any(lo <= d <= hi for d in dates)
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     """Đọc biến môi trường dạng cờ bật/tắt (1/true/yes/y/on = True)."""
     value = os.getenv(name)
@@ -399,7 +470,12 @@ class OpenSearchHybridRetriever:
         self.kb.embedding_dim = self.embedding_dim
 
     def _select_relevant_sentences(
-        self, claim: str, text: str, top_n: int, title: str = ""
+        self,
+        claim: str,
+        text: str,
+        top_n: int,
+        title: str = "",
+        date_window: "Optional[Tuple[datetime, datetime]]" = None,
     ) -> str:
         """Giữ lại những câu trong `text` giống `claim` nhất, ghép lại theo đúng
         thứ tự gốc, và luôn đặt tiêu đề bài `title` lên đầu.
@@ -421,6 +497,18 @@ class OpenSearchHybridRetriever:
         if title and body.startswith(title):
             body = body[len(title):].strip()
         sentences = _split_sentences(body)
+        # Loại khối menu/điều hướng và câu trích ngày lệch xa ngày claim (nội
+        # dung cũ/ngược hướng) trước khi chấm điểm liên quan.
+        drop_boilerplate = _env_flag(
+            "FUSION_EVIDENCE_BOILERPLATE_FILTER_ENABLED", default=True
+        )
+        drop_stale_dates = _env_flag(
+            "FUSION_EVIDENCE_DATE_FILTER_ENABLED", default=True
+        )
+        if drop_boilerplate:
+            sentences = [s for s in sentences if not _looks_like_boilerplate(s)]
+        if drop_stale_dates:
+            sentences = [s for s in sentences if _sentence_in_window(s, date_window)]
         pick_n = max(0, top_n - (1 if title else 0))
         if len(sentences) <= pick_n:
             chosen = sentences
@@ -445,7 +533,11 @@ class OpenSearchHybridRetriever:
         return " ".join(parts) if parts else text
 
     def _dedupe_and_fetch_full_articles(
-        self, ranked_items: List[RetrievalResult], top_k: int, claim: str = ""
+        self,
+        ranked_items: List[RetrievalResult],
+        top_k: int,
+        claim: str = "",
+        date_window: "Optional[Tuple[datetime, datetime]]" = None,
     ) -> List[RetrievalResult]:
         """Bỏ các chunk trùng nhau của cùng một bài, dựng lại full-article cho
         mỗi item được giữ, rồi chỉ giữ những câu liên quan nhất tới claim làm
@@ -473,7 +565,7 @@ class OpenSearchHybridRetriever:
                 for it in items:
                     title = str((it.metadata or {}).get("title") or "").strip()
                     it.text = self._select_relevant_sentences(
-                        claim, it.text, top_n, title=title
+                        claim, it.text, top_n, title=title, date_window=date_window
                     )
             return items
 
@@ -791,7 +883,10 @@ class OpenSearchHybridRetriever:
         t_fullart0 = perf_counter()
         if _env_flag("FUSION_FULL_ARTICLE_ENABLED", default=True):
             final_items = self._dedupe_and_fetch_full_articles(
-                final_items, dedup_window, claim=normalized_query
+                final_items,
+                dedup_window,
+                claim=normalized_query,
+                date_window=_claim_date_window(min_timestamp, max_timestamp),
             )
         else:
             final_items = final_items[:dedup_window]
