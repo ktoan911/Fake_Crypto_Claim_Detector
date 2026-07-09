@@ -342,13 +342,7 @@ def _build_retrieval_features_train_compatible(
         features.append(row)
         if r.embedding is not None:
             doc_embs.append(r.embedding)
-        ts = (
-            r.timestamp.astimezone(timezone.utc)
-            if isinstance(r.timestamp, datetime)
-            else _parse_timestamp(r.timestamp)
-        )
-        time_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
-        evidence_texts.append(f"[Thời gian của thông tin: {time_str}] {r.text}")
+        evidence_texts.append(r.text)
 
     pad = top_k - len(features)
     if pad > 0:

@@ -1,20 +1,11 @@
 from __future__ import annotations
 
 import os
-import re
 from typing import Any, List, Optional
 
 from loguru import logger
 
 from src.config import LABEL_LIST, PROMPT_TEMPLATE
-
-# Evidence text đưa vào LLM không kèm timestamp: bỏ tiền tố
-# "[Thời gian của thông tin: ...] " do retriever gắn (vẫn giữ ở evidence hiển thị).
-_TIMESTAMP_PREFIX_RE = re.compile(r"^\s*\[Thời gian của thông tin:[^\]]*\]\s*")
-
-
-def _strip_timestamp_prefix(text: str) -> str:
-    return _TIMESTAMP_PREFIX_RE.sub("", str(text))
 
 try:
     import torch
@@ -335,12 +326,11 @@ class LLMScorer:
 
                 current_evidence_ids = []
                 for i, item in enumerate(evidence_list):
-                    item_text = _strip_timestamp_prefix(item).strip()
-                    if not item_text:
+                    if not str(item).strip():
                         continue
 
                     # Format: "1. Evidence text\n"
-                    formatted_item = f"{i + 1}. {item_text}\n"
+                    formatted_item = f"{i + 1}. {str(item).strip()}\n"
                     item_ids = self.tokenizer(formatted_item, add_special_tokens=False)[
                         "input_ids"
                     ]
