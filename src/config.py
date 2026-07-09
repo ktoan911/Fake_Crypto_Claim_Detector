@@ -8,9 +8,6 @@ current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 PROMPT_TEMPLATE = """You are a Vietnamese fact-checker. Verify the claim using ONLY the provided evidence.
 
-Evidence may include timestamps like:
-[Thời gian của thông tin: ...]
-
 Output ONLY one letter:
 A = Supported
 B = Contradicted
@@ -20,7 +17,7 @@ Rules:
 
 1. Use only the evidence. Do not use outside knowledge. Do not explain.
 2. For time-sensitive facts such as finance, business, stock, price, salary, pension, tax, interest rate, exchange rate, inflation, or policy, compare only the same time period.
-3. For time, use the period stated inside the evidence first. Use the evidence timestamp only if no fact period is stated. If time is unclear or different, choose C, not B.
+3. For time, use the period stated inside the evidence. If time is unclear or different, choose C, not B.
 4. Check same subject, metric, scope, and basis. Do not treat related entities as the same unless evidence clearly connects them, such as parent company vs subsidiary, company vs group, revenue vs profit, plan vs actual, quarter vs year.
 5. Choose A if the evidence supports the claim. Specific evidence can support a general claim, EXCEPT when the claim uses an absolute quantifier ("tất cả/mọi/toàn bộ") — see rule 9, evidence covering only some cases is not enough for A.
 6. Choose B only if the evidence clearly contradicts the claim for the same subject, scope, and time.
