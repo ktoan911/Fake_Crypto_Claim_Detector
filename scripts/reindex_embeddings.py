@@ -11,7 +11,7 @@ Vì sao:
 
 Luồng:
   1) tạo index mới (engine lucene) — mặc định {source}_v2;
-  2) scroll toàn bộ doc nguồn -> encode lại content -> parallel_bulk vào index mới;
+  2) scroll toàn bộ doc nguồn -> encode lại content -> streaming_bulk (retry/backoff) vào index mới;
   3) kiểm tra số lượng khớp;
   4) (trừ khi --no-swap) xoá index nguồn, tạo alias {source} -> index mới.
 
@@ -30,7 +30,7 @@ import sys
 import time
 
 from dotenv import load_dotenv
-from opensearchpy.helpers import parallel_bulk
+from opensearchpy.helpers import streaming_bulk
 from sentence_transformers import SentenceTransformer
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -65,8 +65,12 @@ def parse_args() -> argparse.Namespace:
                    help="Batch encode GPU. H200 kéo được 256-1024.")
     p.add_argument("--block-size", type=int, default=6000,
                    help="Số doc gom mỗi vòng scan->encode->upload.")
-    p.add_argument("--upload-threads", type=int, default=8)
-    p.add_argument("--chunk-size", type=int, default=1000, help="Doc mỗi request bulk.")
+    p.add_argument("--chunk-size", type=int, default=200,
+                   help="Doc mỗi request bulk (nhỏ hơn = nhẹ tải cluster hơn).")
+    p.add_argument("--max-retries", type=int, default=6,
+                   help="Số lần tự retry mỗi doc khi cluster từ chối (429).")
+    p.add_argument("--initial-backoff", type=float, default=2.0,
+                   help="Giây chờ trước retry đầu (tăng gấp đôi mỗi lần).")
     p.add_argument("--limit", type=int, default=0, help="Chỉ xử lý N doc đầu (0=tất cả).")
     p.add_argument("--fp16", dest="fp16", action="store_true", default=None,
                    help="Ép fp16 (mặc định bật khi cuda).")
@@ -102,7 +106,8 @@ def main() -> int:
     use_fp16 = args.fp16 if args.fp16 is not None else (args.device == "cuda")
     print(f"[reindex] REBUILD source={src_name} -> new={new_index} | model={args.model} "
           f"| device={args.device} | fp16={use_fp16} | encode_batch={args.encode_batch} "
-          f"| block={args.block_size} | threads={args.upload_threads} | chunk={args.chunk_size} "
+          f"| block={args.block_size} | chunk={args.chunk_size} "
+          f"| retries={args.max_retries} backoff={args.initial_backoff}s "
           f"| limit={args.limit or 'ALL'} | no_swap={args.no_swap} | dry_run={args.dry_run}")
 
     src = OpenSearchKB(index_name=src_name)
@@ -132,6 +137,10 @@ def main() -> int:
     t0 = time.perf_counter()
     block_docs: list[dict] = []
     block_texts: list[str] = []
+    err_reasons: dict[str, int] = {}   # loại lỗi -> số lần
+    err_samples: list[dict] = []       # vài info lỗi đầy đủ đầu tiên
+    fail_path = os.path.join(os.path.dirname(__file__), "reindex_failed_ids.txt")
+    fail_fh = None if args.dry_run else open(fail_path, "w")
 
     def process_block() -> None:
         nonlocal block_docs, block_texts, written, errors
@@ -148,14 +157,31 @@ def main() -> int:
                 "_op_type": "index", "_index": new_index,
                 "_id": d["_id"], "_source": d["_source"],
             } for d in block_docs)
-            for ok, _info in parallel_bulk(
-                dst.client, actions, thread_count=args.upload_threads,
-                chunk_size=args.chunk_size, raise_on_error=False, raise_on_exception=False,
+            for ok, info in streaming_bulk(
+                dst.client, actions,
+                chunk_size=args.chunk_size,
+                max_retries=args.max_retries,
+                initial_backoff=args.initial_backoff,
+                raise_on_error=False, raise_on_exception=False,
             ):
                 if ok:
                     written += 1
+                    continue
+                errors += 1
+                # info = {"index": {"_id":..., "status":..., "error": {"type","reason"...}}}
+                action = info.get("index") or info.get("create") or next(iter(info.values()), {})
+                _id = action.get("_id")
+                err = action.get("error")
+                if isinstance(err, dict):
+                    reason = f"{err.get('type', '?')}: {str(err.get('reason', ''))[:120]}"
                 else:
-                    errors += 1
+                    reason = str(err)[:120] or f"status={action.get('status')}"
+                err_reasons[reason] = err_reasons.get(reason, 0) + 1
+                if len(err_samples) < 3:
+                    err_samples.append(info)
+                    print(f"[reindex]   MẪU LỖI: {reason}")
+                if fail_fh and _id:
+                    fail_fh.write(f"{_id}\n")
         block_docs = []
         block_texts = []
 
@@ -187,10 +213,17 @@ def main() -> int:
         src.client.clear_scroll(scroll_id=scroll_id)
     except Exception:
         pass
+    if fail_fh:
+        fail_fh.close()
 
     elapsed = time.perf_counter() - t0
     print(f"[reindex] ENCODE/GHI XONG | quét={processed} | ghi={written} | lỗi={errors} "
           f"| bỏ(rỗng)={skipped} | {elapsed:.1f}s | {processed / max(1e-6, elapsed):.0f} doc/s")
+    if err_reasons:
+        print("[reindex] PHÂN LOẠI LỖI (loại -> số lần):")
+        for reason, cnt in sorted(err_reasons.items(), key=lambda x: -x[1]):
+            print(f"[reindex]   {cnt:>7}  {reason}")
+        print(f"[reindex] Danh sách _id hỏng đã ghi: {fail_path}")
 
     if args.dry_run:
         print("[reindex] dry-run: không tạo index/không swap.")
