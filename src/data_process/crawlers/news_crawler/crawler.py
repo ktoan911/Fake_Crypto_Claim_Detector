@@ -1141,7 +1141,11 @@ async def main(args):
     # ---------------------------------------------------------------------------
     # Load model 1 lần để dùng chung cho các batch
     # ---------------------------------------------------------------------------
-    logging.info("Đang khởi tạo model embedding trên CPU...")
+    # Mặc định chạy thuần CPU (giữ nguyên hành vi cũ, chạy được ở máy không GPU).
+    # Đặt DEVICE=cuda để dùng GPU; khi đó ép bf16 cho nhanh mà KHÔNG tràn số như
+    # fp16 (fp16 với bài dài sinh NaN/Inf -> OpenSearch từ chối knn_vector).
+    embed_device = os.getenv("DEVICE", "cpu")
+    logging.info(f"Đang khởi tạo model embedding trên {embed_device}...")
     embedder = None
     try:
         model_name = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding")
@@ -1151,8 +1155,17 @@ async def main(args):
         # nạp AutoModel thô rồi mean-pool tay (out.last_hidden_state.mean) và
         # bỏ normalize → vector document lệch pha với vector query, làm cosine
         # gần như vô nghĩa. Xem so sánh thực nghiệm trong lịch sử điều tra.
-        embedder = SentenceTransformer(model_name, device="cpu")
-        logging.info(f"Đã tải model embedding (SentenceTransformer): {model_name}")
+        embedder = SentenceTransformer(model_name, device=embed_device)
+        if embed_device.startswith("cuda"):
+            try:
+                import torch
+
+                embedder = embedder.to(torch.bfloat16)
+            except Exception as e:  # noqa: BLE001
+                logging.warning(f"Không ép được bf16, dùng mặc định: {e}")
+        logging.info(
+            f"Đã tải model embedding (SentenceTransformer) trên {embed_device}: {model_name}"
+        )
     except Exception as e:
         logging.error(f"Không thể tải model embedding: {e}")
 

@@ -29,6 +29,7 @@ import os
 import sys
 import time
 
+import numpy as np
 from dotenv import load_dotenv
 from opensearchpy.helpers import streaming_bulk
 from sentence_transformers import SentenceTransformer
@@ -73,8 +74,9 @@ def parse_args() -> argparse.Namespace:
                    help="Giây chờ trước retry đầu (tăng gấp đôi mỗi lần).")
     p.add_argument("--limit", type=int, default=0, help="Chỉ xử lý N doc đầu (0=tất cả).")
     p.add_argument("--fp16", dest="fp16", action="store_true", default=None,
-                   help="Ép fp16 (mặc định bật khi cuda).")
-    p.add_argument("--fp32", dest="fp16", action="store_false", help="Tắt fp16.")
+                   help="Ép fp16 (CÓ THỂ tràn -> NaN. Mặc định cuda dùng bf16 an toàn).")
+    p.add_argument("--fp32", dest="fp16", action="store_false",
+                   help="Ép fp32 (mặc định cuda là bf16).")
     p.add_argument("--no-swap", action="store_true",
                    help="Chỉ build index mới, KHÔNG xoá cũ/alias — để tự kiểm tra.")
     p.add_argument("--dry-run", action="store_true",
@@ -103,9 +105,23 @@ def main() -> int:
         print("[reindex] --new-index phải KHÁC source.", file=sys.stderr)
         return 2
 
-    use_fp16 = args.fp16 if args.fp16 is not None else (args.device == "cuda")
+    # Chọn dtype encode. MẶC ĐỊNH trên cuda là bf16: nhanh như fp16 nhưng cùng
+    # dải số mũ với fp32 -> KHÔNG tràn thành NaN/Inf (fp16 tràn với bài dài ->
+    # OpenSearch từ chối knn_vector: mapper_parsing_exception). --fp16 ép fp16
+    # (có thể tràn), --fp32 ép fp32. Trên cpu luôn fp32.
+    import torch
+
+    if args.device != "cuda":
+        precision = "fp32"
+    elif args.fp16 is True:
+        precision = "fp16"
+    elif args.fp16 is False:
+        precision = "fp32"
+    else:
+        precision = "bf16"
+
     print(f"[reindex] REBUILD source={src_name} -> new={new_index} | model={args.model} "
-          f"| device={args.device} | fp16={use_fp16} | encode_batch={args.encode_batch} "
+          f"| device={args.device} | precision={precision} | encode_batch={args.encode_batch} "
           f"| block={args.block_size} | chunk={args.chunk_size} "
           f"| retries={args.max_retries} backoff={args.initial_backoff}s "
           f"| limit={args.limit or 'ALL'} | no_swap={args.no_swap} | dry_run={args.dry_run}")
@@ -118,7 +134,9 @@ def main() -> int:
     print(f"[reindex] tổng doc nguồn: {total}")
 
     embedder = SentenceTransformer(args.model, device=args.device)
-    if use_fp16 and args.device == "cuda":
+    if precision == "bf16":
+        embedder = embedder.to(torch.bfloat16)
+    elif precision == "fp16":
         embedder = embedder.half()
     dim = int(embedder.get_sentence_embedding_dimension())
     print(f"[reindex] embedding_dim = {dim}")
@@ -139,6 +157,7 @@ def main() -> int:
     block_texts: list[str] = []
     err_reasons: dict[str, int] = {}   # loại lỗi -> số lần
     err_samples: list[dict] = []       # vài info lỗi đầy đủ đầu tiên
+    nonfinite_ids: list[str] = []      # doc có embedding NaN/Inf, bị loại
     fail_path = os.path.join(os.path.dirname(__file__), "reindex_failed_ids.txt")
     fail_fh = None if args.dry_run else open(fail_path, "w")
 
@@ -150,13 +169,22 @@ def main() -> int:
             block_texts, normalize_embeddings=True, batch_size=args.encode_batch,
             show_progress_bar=False, convert_to_numpy=True,
         )
+        # Chốt chặn: vector chứa NaN/Inf sẽ bị OpenSearch từ chối
+        # (mapper_parsing_exception). Loại nó ra thay vì để hỏng cả request.
+        good_docs = []
         for d, v in zip(block_docs, vecs):
+            if not np.isfinite(v).all():
+                nonfinite_ids.append(d["_id"])
+                if fail_fh:
+                    fail_fh.write(f"{d['_id']}\tnonfinite_embedding\n")
+                continue
             d["_source"]["embedding"] = v.tolist()
-        if not args.dry_run:
+            good_docs.append(d)
+        if not args.dry_run and good_docs:
             actions = ({
                 "_op_type": "index", "_index": new_index,
                 "_id": d["_id"], "_source": d["_source"],
-            } for d in block_docs)
+            } for d in good_docs)
             for ok, info in streaming_bulk(
                 dst.client, actions,
                 chunk_size=args.chunk_size,
@@ -218,7 +246,8 @@ def main() -> int:
 
     elapsed = time.perf_counter() - t0
     print(f"[reindex] ENCODE/GHI XONG | quét={processed} | ghi={written} | lỗi={errors} "
-          f"| bỏ(rỗng)={skipped} | {elapsed:.1f}s | {processed / max(1e-6, elapsed):.0f} doc/s")
+          f"| bỏ(rỗng)={skipped} | bỏ(NaN/Inf)={len(nonfinite_ids)} "
+          f"| {elapsed:.1f}s | {processed / max(1e-6, elapsed):.0f} doc/s")
     if err_reasons:
         print("[reindex] PHÂN LOẠI LỖI (loại -> số lần):")
         for reason, cnt in sorted(err_reasons.items(), key=lambda x: -x[1]):
@@ -231,7 +260,7 @@ def main() -> int:
 
     dst.client.indices.refresh(index=new_index)
     new_count = dst.count_docs()
-    expected = processed - skipped
+    expected = processed - skipped - len(nonfinite_ids)
     print(f"[reindex] doc index mới: {new_count} (kỳ vọng ~{expected})")
 
     if args.no_swap:
