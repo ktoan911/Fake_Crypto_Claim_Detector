@@ -130,43 +130,60 @@ def extract_date_range(text: str) -> Tuple[Optional[str], Optional[str], str]:
         re.IGNORECASE
     )
     
-    matches = pat.findall(text)
-    dates = []
-    for m in matches:
-        d_str, m_str, y_str = m
+    matches = list(pat.finditer(text))
+    dates = []  # (datetime, match_object) đã sắp theo thời gian
+    for mo in matches:
+        d_str, m_str, y_str = mo.group(1), mo.group(2), mo.group(3)
         d = int(d_str) if d_str else current_day
         m_val = int(m_str) if m_str else current_month
         y = int(y_str) if y_str else current_year
         if y < 100:
             y += 2000
-        
+
         try:
             dt = datetime(y, m_val, d, tzinfo=timezone.utc)
-            dates.append(dt)
+            dates.append((dt, mo))
         except ValueError:
             pass
-            
+
     if not dates:
         return None, None, text
 
-    dates.sort()
+    dates.sort(key=lambda x: x[0])
 
-    if dates[-1].date() > now_utc.date():
+    if dates[-1][0].date() > now_utc.date():
         return None, None, text
 
-    if len(dates) == 1:
-        d1 = dates[0]
-        min_dt = d1
-        max_dt = d1.replace(hour=23, minute=59, second=59)
+    first_dt, first_mo = dates[0]
+    last_dt = dates[-1][0]
+
+    # "Từ/Kể từ/Bắt đầu từ/Sau <ngày>" là mốc MỞ: khoảng [ngày, hiện tại],
+    # không phải chỉ đúng một ngày. Trước đây một mốc đơn bị co về [ngày, 23:59]
+    # cùng ngày, làm lọt mất mọi bài đăng sau đó (chính là evidence cần nhất).
+    prefix = text[: first_mo.start()].rstrip()
+    open_ended = bool(
+        re.search(r"(?i)(k[ểe]\s+t[ừu]|b[ắa]t\s+đ[ầa]u\s+t[ừu]|t[ừu]|sau)\s*$", prefix)
+    )
+
+    min_dt = first_dt
+    if open_ended:
+        max_dt = now_utc
+    elif len(dates) == 1:
+        max_dt = first_dt.replace(hour=23, minute=59, second=59)
     else:
-        d1 = dates[0]
-        d2 = dates[-1]
-        min_dt = d1
-        max_dt = d2.replace(hour=23, minute=59, second=59)
-        
+        max_dt = last_dt.replace(hour=23, minute=59, second=59)
+
+    # Bỏ chuỗi ngày khỏi text truy vấn, đồng thời dọn liên từ thời gian mồ côi
+    # còn sót ở đầu ("Từ ,", "Kể từ ...") để query không bị cụt như "Từ , ...".
     cleaned_text = pat.sub("", text)
     cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
-    
+    cleaned_text = re.sub(
+        r"(?i)^(k[ểe]\s+t[ừu]|b[ắa]t\s+đ[ầa]u\s+t[ừu]|t[ừu]|sau|ng[àa]y)\b[\s,\.]*",
+        "",
+        cleaned_text,
+    )
+    cleaned_text = re.sub(r"^[\s,\.;:–—-]+", "", cleaned_text).strip()
+
     return min_dt.isoformat(), max_dt.isoformat(), cleaned_text
 
 
@@ -1869,6 +1886,7 @@ class FusionClaimVerifier:
                         f" | rrf={r.rrf_score:.6f}"
                         f" | recency={r.recency_score:.6f}"
                         f" | cyclicity={r.cyclicity_score:.6f}"
+                        f" | cosine={r.cosine_similarity:.6f}"
                         + (f" | source={source_name!r}" if source_name else "")
                         + (f" | title={title!r}" if title else "")
                         + (f" | url={url!r}" if url else "")
@@ -1876,7 +1894,7 @@ class FusionClaimVerifier:
 
             logger.info(
                 "[fusion_inference] retrieval_features_np shape="
-                f"{retrieval_features_np.shape} | rows=[score, rrf, recency, cyclicity]"
+                f"{retrieval_features_np.shape} | cols=[score, rrf, recency, cyclicity, cosine]"
             )
             logger.info(
                 "[fusion_inference] retrieval_features_np="

@@ -9,12 +9,11 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
-import torch
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
-from transformers import AutoModel, AutoTokenizer
+from sentence_transformers import SentenceTransformer
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
@@ -1143,14 +1142,17 @@ async def main(args):
     # Load model 1 lần để dùng chung cho các batch
     # ---------------------------------------------------------------------------
     logging.info("Đang khởi tạo model embedding trên CPU...")
-    tokenizer = None
-    model = None
+    embedder = None
     try:
         model_name = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-        model.eval()
-        logging.info(f"Đã tải model: {model_name}")
+        # Dùng SentenceTransformer để chạy ĐÚNG pipeline của model
+        # (CLS pooling + Normalize theo modules.json/1_Pooling), giống hệt
+        # query-time trong fusion_inference._encode_query. Trước đây file này
+        # nạp AutoModel thô rồi mean-pool tay (out.last_hidden_state.mean) và
+        # bỏ normalize → vector document lệch pha với vector query, làm cosine
+        # gần như vô nghĩa. Xem so sánh thực nghiệm trong lịch sử điều tra.
+        embedder = SentenceTransformer(model_name, device="cpu")
+        logging.info(f"Đã tải model embedding (SentenceTransformer): {model_name}")
     except Exception as e:
         logging.error(f"Không thể tải model embedding: {e}")
 
@@ -1194,23 +1196,19 @@ async def main(args):
             )
 
             # Bước 2: Tính embedding từng chunk riêng lẻ
-            if tokenizer is not None and model is not None:
-                chunk_embeddings = []
-                for chunk in chunk_texts:
-                    try:
-                        enc = tokenizer(
-                            chunk,
-                            return_tensors="pt",
-                            truncation=True,
-                            max_length=2048,
-                        )
-                        with torch.no_grad():
-                            out = model(**enc)
-                        emb = out.last_hidden_state.mean(dim=1)[0].tolist()
-                        chunk_embeddings.append(emb)
-                    except Exception as e:
-                        logging.error(f"Lỗi encode chunk: {e}")
-                        chunk_embeddings.append([])
+            if embedder is not None:
+                try:
+                    vecs = embedder.encode(
+                        chunk_texts,
+                        normalize_embeddings=True,
+                        batch_size=32,
+                        show_progress_bar=False,
+                        convert_to_numpy=True,
+                    )
+                    chunk_embeddings = [v.tolist() for v in vecs]
+                except Exception as e:
+                    logging.error(f"Lỗi encode chunk: {e}")
+                    chunk_embeddings = [[]] * len(chunk_texts)
             else:
                 chunk_embeddings = [[]] * len(chunk_texts)
 

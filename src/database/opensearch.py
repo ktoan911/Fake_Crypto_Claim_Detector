@@ -91,7 +91,11 @@ class OpenSearchKB:
                         "dimension": self.embedding_dim,
                         "method": {
                             "name": "hnsw",
-                            "engine": "nmslib",
+                            # lucene hỗ trợ filtered-kNN (lọc + kNN cùng lúc);
+                            # nmslib thì không -> query có filter ngày bị 400 rồi
+                            # rơi về script_score brute-force. Vector đã được
+                            # normalize khi index (xem crawler) nên cosinesimil chuẩn.
+                            "engine": "lucene",
                             "space_type": "cosinesimil",
                             "parameters": {
                                 "ef_construction": 256,
