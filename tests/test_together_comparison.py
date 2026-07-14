@@ -53,9 +53,10 @@ _DEFAULT_RETRIEVER_MODEL = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Emb
 
 # Danh sách model Together mặc định để đối chứng (có thể override bằng --together_models)
 _DEFAULT_TOGETHER_MODELS = [
-    "Qwen/Qwen3.6-Plus",
+    "openai/gpt-oss-120b",
+    "deepseek-ai/DeepSeek-V4-Pro",
     "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    "deepseek-ai/DeepSeek-V3",
+    ""
 ]
 
 
@@ -109,7 +110,12 @@ def parse_letter_prediction(text: str) -> int:
 # Data loading
 # ---------------------------------------------------------------------------
 def format_evidence(evidence_list) -> str:
-    """Ghép evidence thành chuỗi đánh số như LLMScorer nội bộ (1. ...\\n2. ...)."""
+    """Ghép evidence thành chuỗi đánh số như LLMScorer nội bộ (1. ...\\n2. ...).
+
+    Chỉ lấy `content`, KHÔNG chèn timestamp: LoRA và Together đều không được
+    biết thời gian bằng chứng. Chỉ fusion model nhận thông tin thời gian, và
+    qua feature recency (số) chứ không phải qua text.
+    """
     parts = []
     for ev in evidence_list:
         if isinstance(ev, dict):
@@ -132,6 +138,7 @@ def load_dataset(path, limit=None):
 
     texts = [d["claim"] for d in data]
     labels = [normalize_label_to_id(d["label"]) for d in data]
+    # gold evidence text thuần — dùng chung cho cả Together và LoRA (không timestamp)
     gold_evidence_str = [format_evidence(d.get("evidence", [])) for d in data]
     raw_evidence = [d.get("evidence", []) for d in data]
     return texts, labels, gold_evidence_str, raw_evidence
@@ -280,29 +287,22 @@ def run_local_pipeline(args, texts, labels, gold_evidence_str, raw_evidence):
         ]
         tensor_inter = torch.tensor(np.array(_filled, dtype=np.float32)).to(device)
 
-    # LLM logits (retrieval & gold)
-    logger.info("[Local] LLM inference...")
+    # LLM logits — chỉ chế độ GOLD (LLM đọc gold evidence).
+    # Retrieval vẫn chạy ở trên nhưng chỉ để tạo feature cho fusion.
+    logger.info("[Local] LLM inference (gold only)...")
     llm_bs = int(os.getenv("LLM_INFER_BATCH_SIZE", "16"))
-    logits_ret, logits_gold = [], []
+    logits_gold = []
     for i in tqdm(range(0, len(texts), llm_bs), desc="LLM"):
         bt = texts[i : i + llm_bs]
         bg = gold_evidence_str[i : i + llm_bs]
-        br = [ev[:3] for ev in all_retrieved[i : i + llm_bs]]
-        logits_ret.append(llm.score_logits(bt, br))
         logits_gold.append(llm.score_logits(bt, bg))
-    tensor_logits_ret = torch.cat(logits_ret, dim=0).to(device)
     tensor_logits_gold = torch.cat(logits_gold, dim=0).to(device)
 
     results = {}
-    results["LoRA + Retrieval"] = torch.argmax(tensor_logits_ret, dim=1).cpu().numpy()
     results["LoRA + Gold"] = torch.argmax(tensor_logits_gold, dim=1).cpu().numpy()
 
     with torch.no_grad():
         encoded = retrieval_encoder(tensor_features, tensor_inter)
-        out_ret = fusion_layer(tensor_logits_ret, encoded)
-        results["Fusion + Retrieval"] = (
-            torch.argmax(out_ret.final_probs, dim=1).cpu().numpy()
-        )
         out_gold = fusion_layer(tensor_logits_gold, encoded)
         results["Fusion + Gold"] = (
             torch.argmax(out_gold.final_probs, dim=1).cpu().numpy()
@@ -374,7 +374,7 @@ def main():
 
     results_summary = []
 
-    # 2. Together AI models (zero-shot, gold evidence)
+    # 2. Together AI models (zero-shot, gold evidence — KHÔNG timestamp, như LoRA)
     if not args.skip_together:
         for model_name in args.together_models:
             preds = eval_together_model(
