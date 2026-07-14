@@ -56,7 +56,6 @@ _DEFAULT_TOGETHER_MODELS = [
     "openai/gpt-oss-120b",
     "deepseek-ai/DeepSeek-V4-Pro",
     "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    ""
 ]
 
 
@@ -377,6 +376,9 @@ def main():
     # 2. Together AI models (zero-shot, gold evidence — KHÔNG timestamp, như LoRA)
     if not args.skip_together:
         for model_name in args.together_models:
+            model_name = str(model_name).strip()
+            if not model_name:
+                continue  # bỏ qua tên model rỗng
             preds = eval_together_model(
                 model_name,
                 texts,
