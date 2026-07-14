@@ -126,14 +126,47 @@ def format_evidence(evidence_list) -> str:
     return "\n".join(f"{i + 1}. {p}" for i, p in enumerate(parts))
 
 
-def load_dataset(path, limit=None):
+def _balanced_subset(data, limit):
+    """Lấy `limit` mẫu cân bằng nhất giữa 3 nhãn (round-robin theo từng nhãn).
+
+    Nếu một nhãn thiếu, phần thiếu được bù từ các nhãn còn dư → vẫn đủ `limit`
+    mẫu. Deterministic: trong mỗi nhãn lấy theo thứ tự gốc, không random.
+    """
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for d in data:
+        groups[normalize_label_to_id(d["label"])].append(d)
+
+    order = sorted(groups.keys())
+    cursors = {k: 0 for k in order}
+    selected = []
+    while len(selected) < limit:
+        progressed = False
+        for k in order:
+            if len(selected) >= limit:
+                break
+            if cursors[k] < len(groups[k]):
+                selected.append(groups[k][cursors[k]])
+                cursors[k] += 1
+                progressed = True
+        if not progressed:
+            break  # tất cả nhãn đã hết mẫu
+    return selected
+
+
+def load_dataset(path, limit=None, balanced=True):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, dict):
         data = [data]
     if limit:
-        data = data[:limit]
-        logger.info(f"Limited to {limit} samples")
+        if balanced:
+            data = _balanced_subset(data, limit)
+            logger.info(f"Balanced-sampled {len(data)} samples across labels")
+        else:
+            data = data[:limit]
+            logger.info(f"Took first {len(data)} samples (no balancing)")
 
     texts = [d["claim"] for d in data]
     labels = [normalize_label_to_id(d["label"]) for d in data]
@@ -329,6 +362,11 @@ def main():
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
+        "--no_balance",
+        action="store_true",
+        help="Lấy N câu đầu thay vì lấy mẫu cân bằng 3 nhãn (mặc định: cân bằng)",
+    )
+    parser.add_argument(
         "--together_models",
         nargs="+",
         default=_DEFAULT_TOGETHER_MODELS,
@@ -367,7 +405,9 @@ def main():
 
     # 1. Load data
     logger.info(f"Loading data from {args.data}...")
-    texts, labels, gold_evidence_str, raw_evidence = load_dataset(args.data, args.limit)
+    texts, labels, gold_evidence_str, raw_evidence = load_dataset(
+        args.data, args.limit, balanced=not args.no_balance
+    )
     logger.info(f"Loaded {len(texts)} samples. Label dist: "
                 f"A={labels.count(0)} B={labels.count(1)} C={labels.count(2)}")
 
